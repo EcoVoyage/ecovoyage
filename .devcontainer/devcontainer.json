@@ -1,0 +1,34 @@
+{
+	"name": "ecovoyage",
+	"containerEnv": {
+		"TZ": "Europe/Vienna",
+		"LOCAL_WORKSPACE_FOLDER": "${localWorkspaceFolder}",
+		"CONTAINER_WORKSPACE_FOLDER": "${containerWorkspaceFolder}",
+	},
+	"build": {
+		"dockerfile": "../Dockerfile",
+		"context": "../",
+		"args": {
+			"CONTAINER_WORKSPACE_FOLDER": "${containerWorkspaceFolder}",
+		},
+		"cacheFrom": [
+			"type=registry,ref=docker.io/ecovoyage/devel:latest"
+		]
+	},
+	"extensions": [	"ms-python.python", 
+				   	"ms-toolsai.jupyter",
+				   	"ms-azuretools.vscode-docker",
+					"ms-vscode.makefile-tools",
+				   	"GitHub.copilot",
+					"GitHub.copilot-chat",
+
+				],
+	"remoteUser": "root",
+	"settings": { 
+		"terminal.integrated.shell.linux": "/bin/bash",
+		"files.autoSave": "afterDelay",
+		"jupyter.magicCommandsAsComments": true,
+		"python.pythonPath": "/opt/conda/bin/python",
+		"python.defaultInterpreterPath": "/opt/conda/bin/python",	
+	  },
+}

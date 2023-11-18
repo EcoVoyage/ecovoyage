@@ -1,0 +1,24 @@
+name: base
+category: spatial
+channels:
+  - conda-forge
+  - default
+dependencies:
+  - shapely
+  - contextily
+  - pyproj
+  - geopandas
+  - descartes
+  - geojson
+  - rasterio
+  - gdal
+  - glob2
+  - ipyleaflet
+  - earthpy
+  - cartopy
+  - rioxarray
+  - sparqlwrapper
+  - contextily
+  - basemap
+  - basemap-data
+  - basemap-data-hires

@@ -1,0 +1,19 @@
+name: base
+category: ai
+channels:
+  - conda-forge
+  - default
+dependencies:
+  - langchain
+  - faiss-cpu
+  - pytorch
+  - tensorflow
+  - diffusers
+  - sentence-transformers
+  - pydantic
+  - lxml
+  - openai
+  - tiktoken
+  - elasticsearch
+  - gymnasium
+  - transformers[agents]

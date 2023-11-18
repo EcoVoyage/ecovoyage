@@ -1,0 +1,19 @@
+name: base
+category: core
+channels:
+  - conda-forge
+  - default
+dependencies:
+  - python
+  - pandas
+  - numpy
+  - tqdm
+  - matplotlib
+  - pytest
+  - black
+  - coverage
+  - pytest-cov
+  - flake8
+  - tox
+  - GitPython
+  - termcolor
