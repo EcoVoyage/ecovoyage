@@ -10,3 +10,4 @@ dependencies:
   - jupyter-ai
   - bash_kernel
   - pytest-notebook
+  - ghp-import
