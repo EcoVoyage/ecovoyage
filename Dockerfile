@@ -2,6 +2,7 @@ FROM docker.io/mambaorg/micromamba:1.5-bullseye AS base
 ARG NEW_MAMBA_USER=jovian
 ARG NEW_MAMBA_USER_ID=1000
 ARG NEW_MAMBA_USER_GID=1000
+ARG MAMBA_DOCKERFILE_ACTIVATE=1 
 USER root
 
 RUN if grep -q '^ID=alpine$' /etc/os-release; then \
@@ -30,42 +31,45 @@ USER $MAMBA_USER
 
 
 FROM base AS core
-
-COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_core.yaml /tmp/env.yaml
-RUN micromamba install -y -n base -f /tmp/env.yaml && micromamba clean --all --yes
-
-
-FROM base AS jupyter
-
-COPY --from=core /opt/conda /opt
-COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_jupyter.yaml /tmp/env.yaml
-RUN micromamba install -y -n base -f /tmp/env.yaml && micromamba clean --all --yes
+#ARG MAMBA_DOCKERFILE_ACTIVATE=1 
+COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_core.yaml /tmp/env_core.yaml
+RUN micromamba install -y -f /tmp/env_core.yaml && micromamba clean --all --yes
 
 
-FROM base AS ai
-
-COPY --from=jupyter /opt/conda /opt
-COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_ai.yaml /tmp/env.yaml
-RUN micromamba install -y -n base -f /tmp/env.yaml && micromamba clean --all --yes
-
-
-FROM base AS spatial
-
-COPY --from=ai /opt/conda /opt
-COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_spatial.yaml /tmp/env.yaml
-RUN micromamba install -y -n base -f /tmp/env.yaml && micromamba clean --all --yes
+FROM core AS jupyter
+#ARG MAMBA_DOCKERFILE_ACTIVATE=1 
+#COPY --from=core /opt/conda /opt/conda
+COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_jupyter.yaml /tmp/env_jupyter.yaml
+RUN micromamba install -y -f /tmp/env_jupyter.yaml && micromamba clean --all --yes
 
 
-FROM base AS testing
+FROM jupyter AS ai
+#ARG MAMBA_DOCKERFILE_ACTIVATE=1 
+#COPY --from=jupyter /opt/conda /opt/conda
+COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_ai.yaml /tmp/env_ai.yaml 
+RUN micromamba install -y -f /tmp/env_ai.yaml && micromamba clean --all --yes
 
-COPY --from=spatial /opt/conda /opt
-COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_spatial.yaml /tmp/env.yaml
-RUN micromamba install -y -n base -f /tmp/env.yaml && micromamba clean --all --yes
+
+FROM ai AS spatial
+#ARG MAMBA_DOCKERFILE_ACTIVATE=1 
+#COPY --from=ai /opt/conda /opt/conda
+COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_spatial.yaml /tmp/env_spatial.yaml 
+RUN micromamba install -y  -f /tmp/env_spatial.yaml && micromamba clean --all --yes
 
 
-FROM base as devel
+FROM spatial AS testing
+#ARG MAMBA_DOCKERFILE_ACTIVATE=1 
+#COPY --from=spatial /opt/conda /opt/conda
+COPY --chown=$MAMBA_USER:$MAMBA_USER env/env_testing.yaml /tmp/env_testing.yaml
+RUN micromamba install -y -f /tmp/env_testing.yaml && micromamba clean --all --yes
 
-COPY --from=testing /opt/conda /opt
+
+FROM testing as devel
+#ARG MAMBA_DOCKERFILE_ACTIVATE=1 
+
+ARG DOCKER_GID=999
+
+#COPY --from=testing /opt/conda /opt/conda
 USER root
 RUN apt-get update && apt-get install -y build-essential openssh-client rsync sudo git apt-transport-https vim \
     ca-certificates curl gnupg lsb-release software-properties-common && \
@@ -83,6 +87,6 @@ RUN apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugi
 
 
 RUN usermod -aG sudo $MAMBA_USER && echo 'jovian ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
-RUN groupmod -g 965 docker && sudo usermod -aG docker jovian
+RUN groupmod -g ${DOCKER_GID}  docker && sudo usermod -aG docker jovian
 
 USER $MAMBA_USER

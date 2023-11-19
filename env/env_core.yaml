@@ -4,7 +4,7 @@ channels:
   - conda-forge
   - default
 dependencies:
-  - python
+  - python=3.11
   - pandas
   - numpy
   - tqdm

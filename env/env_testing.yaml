@@ -3,3 +3,5 @@ category: testing
 channels:
   - conda-forge
   - default
+dependencies:
+  - ansible
