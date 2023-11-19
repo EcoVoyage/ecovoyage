@@ -67,5 +67,22 @@ FROM base as devel
 
 COPY --from=testing /opt/conda /opt
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-client rsync sudo git && rm -rf /var/lib/apt /var/lib/dpkg /var/lib/cache /var/lib/log
+RUN apt-get update && apt-get install -y build-essential openssh-client rsync sudo git apt-transport-https vim \
+    ca-certificates curl gnupg lsb-release software-properties-common && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN touch /var/lib/dpkg/status && install -m 0755 -d /etc/apt/keyrings
+RUN curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
+    chmod a+r /etc/apt/keyrings/docker.gpg
+RUN echo \
+  "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+  "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && apt-get update
+RUN apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+
+RUN usermod -aG sudo $MAMBA_USER && echo 'jovian ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+RUN groupmod -g 965 docker && sudo usermod -aG docker jovian
+
 USER $MAMBA_USER

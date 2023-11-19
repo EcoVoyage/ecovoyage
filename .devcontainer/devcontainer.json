@@ -23,7 +23,7 @@
 					"GitHub.copilot-chat",
 
 				],
-	"remoteUser": "root",
+	"remoteUser": "jovian",
 	"settings": { 
 		"terminal.integrated.shell.linux": "/bin/bash",
 		"files.autoSave": "afterDelay",
@@ -31,4 +31,7 @@
 		"python.pythonPath": "/opt/conda/bin/python",
 		"python.defaultInterpreterPath": "/opt/conda/bin/python",	
 	  },
+	"mounts": [
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+    ]
 }

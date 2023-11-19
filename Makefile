@@ -1,4 +1,5 @@
 # Variables
+SHELL := /bin/bash
 ORGANIZATION := ecovoyage
 DEFAULT_TAG := latest
 DATE_TAG := $(shell date +%Y%m%d)
@@ -7,8 +8,6 @@ STAGES := base core jupyter ai spatial testing devel
 # Default Docker Buildx builder
 BUILDER := default
 
-# Path to the Docker Bake template and output file
-BAKE_TEMPLATE := docker-bake.template.hcl
 BAKE_FILE := docker-bake.hcl
 
 # Build task
