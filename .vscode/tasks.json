@@ -5,7 +5,7 @@
             "label": "Build Docker Images",
             "type": "shell",
             "command": "make",
-            "args": ["build"],
+            "args": ["docker-build"],
             "group": {
                 "kind": "build",
                 "isDefault": true
@@ -20,7 +20,7 @@
             "label": "Push Docker Images",
             "type": "shell",
             "command": "make",
-            "args": ["push"],
+            "args": ["docker-push"],
             "presentation": {
                 "reveal": "always",
                 "panel": "new"

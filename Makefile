@@ -13,7 +13,8 @@ BAKE_TEMPLATE := docker-bake.template.hcl
 BAKE_FILE := docker-bake.hcl
 
 # Build task
-build:
+.PHONY: docker-build
+docker-build:
 	# Generate the actual docker-bake.hcl from the template
 	sed "s/ORG_PLACEHOLDER/$(ORGANIZATION)/g; s/DEFAULT_TAG_PLACEHOLDER/$(DEFAULT_TAG)/g; s/DATE_TAG_PLACEHOLDER/$(DATE_TAG)/g" $(BAKE_TEMPLATE) > $(BAKE_FILE)
 
@@ -24,9 +25,8 @@ build:
 	DOCKER_BUILDKIT=1 docker buildx bake -f $(BAKE_FILE)
 
 # Push task
-push:
+.PHONY: docker-push
+docker-push:
 	@$(foreach stage,$(STAGES), \
 		docker push $(ORGANIZATION)/$(stage):$(DEFAULT_TAG); \
 		docker push $(ORGANIZATION)/$(stage):$(DATE_TAG);)
-
-.PHONY: build push
