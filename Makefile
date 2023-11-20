@@ -12,6 +12,9 @@ STAGES := base core jupyter ai spatial testing devel
 BAKE_TEMPLATE := docker-bake.template.hcl
 BAKE_FILE := docker-bake.hcl
 
+# Build
+BUILD_DIR = _build/html
+
 # Build task
 .PHONY: docker-build
 docker-build:
@@ -30,3 +33,24 @@ docker-push:
 	@$(foreach stage,$(STAGES), \
 		docker push $(ORGANIZATION)/$(stage):$(DEFAULT_TAG); \
 		docker push $(ORGANIZATION)/$(stage):$(DATE_TAG);)
+
+
+# BOOK
+
+.PHONY: book-build
+book-build:
+	jupyter-book build .
+
+.PHONY: book-push
+book-push:
+	# Ensure the build directory exists
+	@if [ ! -d "$(BUILD_DIR)" ]; then \
+		echo "Build directory $(BUILD_DIR) does not exist. Build the site first."; \
+		exit 1; \
+	fi
+
+	# Use ghp-import to deploy to gh-pages
+	ghp-import -n -p -f $(BUILD_DIR)
+
+	# Notify completion
+	@echo "Deployment to gh-pages branch complete."

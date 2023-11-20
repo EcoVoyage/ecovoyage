@@ -1,0 +1,24 @@
+# Table of contents
+# Learn more at https://jupyterbook.org/customize/toc.html
+
+format: jb-book
+root: README.md
+parts:
+- caption: AI
+  chapters:
+  - glob: parts/ai/*
+- caption: Issues
+  chapters:
+  - glob: parts/issues/*
+- caption: DevOps
+  chapters:
+  - glob: parts/devops/*
+- caption: Jupyter
+  chapters:
+  - glob: parts/jupyter/*
+- caption: Notebooks
+  chapters:
+  - glob: parts/notebooks/*
+- caption: Python
+  chapters:
+  - glob: parts/python/*
