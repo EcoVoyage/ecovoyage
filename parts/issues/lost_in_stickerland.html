@@ -1,0 +1,732 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="generator" content="Docutils 0.17.1: http://docutils.sourceforge.net/" />
+
+    <title>Lost in Stickerland &#8212; Digital Whisperings</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=365ca57ee442770a23c6" rel="stylesheet" />
+<link href="../../_static/styles/bootstrap.css?digest=365ca57ee442770a23c6" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=365ca57ee442770a23c6" rel="stylesheet" />
+
+  
+  <link href="../../_static/vendor/fontawesome/6.1.2/css/all.min.css?digest=365ca57ee442770a23c6" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="../../_static/vendor/fontawesome/6.1.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../../_static/vendor/fontawesome/6.1.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../../_static/vendor/fontawesome/6.1.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+    <link rel="stylesheet" href="../../_static/styles/sphinx-book-theme.css?digest=14f4ca6b54d191a8c7657f6c759bf11a5fb86285" type="text/css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/mystnb.4510f1fc1dee50b3e5859aac5469c37c29e427902b24a333a5f9fcb2f0b3ac41.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/sphinx-thebe.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/design-style.4045f2051d55cab465a707391d5b2007.min.css" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=365ca57ee442770a23c6" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=365ca57ee442770a23c6" />
+  <script src="../../_static/vendor/fontawesome/6.1.2/js/all.min.js?digest=365ca57ee442770a23c6"></script>
+
+    <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+    <script src="../../_static/jquery.js"></script>
+    <script src="../../_static/underscore.js"></script>
+    <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+    <script src="../../_static/doctools.js"></script>
+    <script src="../../_static/clipboard.min.js"></script>
+    <script src="../../_static/copybutton.js"></script>
+    <script src="../../_static/scripts/sphinx-book-theme.js?digest=5a5c038af52cf7bc1a1ec88eea08e6366ee68824"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="../../_static/design-tabs.js"></script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"
+const thebe_selector = ".thebe,.cell"
+const thebe_selector_input = "pre"
+const thebe_selector_output = ".output, .cell_output"
+</script>
+    <script async="async" src="../../_static/sphinx-thebe.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'parts/issues/lost_in_stickerland';</script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="GeoNode Meets Docker" href="../devops/geonode_meets_docker.html" />
+    <link rel="prev" title="Watt’s the Cost?" href="../ai/watts_the_cost.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>
+    Back to top
+  </button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          name="__primary"
+          id="__primary"/>
+  <label class="overlay overlay-primary" for="__primary"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          name="__secondary"
+          id="__secondary"/>
+  <label class="overlay overlay-secondary" for="__secondary"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search this book..."
+         aria-label="Search this book..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+  
+    <nav class="bd-header navbar navbar-expand-lg bd-navbar">
+    </nav>
+  
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+  
+
+<a class="navbar-brand logo" href="../../README.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/logo.png" class="logo__image only-light" alt="Digital Whisperings - Home"/>
+    <script>document.write(`<img src="../../_static/logo.png" class="logo__image only-dark" alt="Digital Whisperings - Home"/>`);</script>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item"><nav class="bd-links" id="bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">AI</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../ai/from_paris_to_vienna.html">From Paris to Vienna</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ai/habsburg_hysteria.html">Habsburg Hysteria</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ai/naughty_bots_beware.html">Naughty Bots Beware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ai/the_adventures_of_sir_fact-a-lot.html">The Adventures of Sir Fact-a-Lot</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ai/the_art_of_inquerey.html">The Art of Inquiry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ai/the_mystery_of%20_haus_%20oesterreich.html">The Mystery of Haus Österreich</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ai/watts_the_cost.html">Watt’s the Cost?</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Issues</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Lost in Stickerland</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">DevOps</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../devops/geonode_meets_docker.html">GeoNode Meets Docker</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devops/github_cloudflare_love.html">When GitHub Pages Met Cloudflare</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Jupyter</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../jupyter/github_page_ebp.html">Creating a GitHub Page with the Executable Book Project</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../jupyter/notebooks_go_lite.html">When Notebooks Go Lite</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Notebooks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../notebooks/altair_showcase.html">Altair Showcase</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../notebooks/altair_test.html">Altair Test</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Python</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python/face_it.html">Face It, You Need This</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><label class="sidebar-toggle primary-toggle btn btn-sm" for="__primary" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</label></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/atrawog/mybook" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/atrawog/mybook/issues/new?title=Issue%20on%20page%20%2Fparts/issues/lost_in_stickerland.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../../_sources/parts/issues/lost_in_stickerland.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm navbar-btn theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="theme-switch nav-link" data-mode="light"><i class="fa-solid fa-sun fa-lg"></i></span>
+    <span class="theme-switch nav-link" data-mode="dark"><i class="fa-solid fa-moon fa-lg"></i></span>
+    <span class="theme-switch nav-link" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg"></i></span>
+  </button>
+`);
+</script>
+
+<script>
+document.write(`
+  <button class="btn btn-sm navbar-btn search-button search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+  </button>
+`);
+</script>
+<label class="sidebar-toggle secondary-toggle btn btn-sm" for="__secondary"title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</label>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Lost in Stickerland</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#when-custom-matrix-sticker-packs-lead-to-uncharted-territory">When Custom Matrix Sticker Packs Lead to Uncharted Territory</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#matrix-sticker-pack-creation-with-maunium-and-hosting-on-github-pages">Matrix Sticker Pack Creation with Maunium and Hosting on GitHub Pages</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-create-a-github-repository">Step 1: Create a GitHub Repository</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-clone-the-repository-and-set-up-github-pages">Step 2: Clone the Repository and Set Up GitHub Pages</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-create-the-sticker-pack-with-maunium-sticker-pack-builder">Step 3: Create the Sticker Pack with Maunium Sticker Pack Builder</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-4-add-the-sticker-pack-to-your-github-repository">Step 4: Add the Sticker Pack to Your GitHub Repository</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-share-the-sticker-pack">Step 5: Share the Sticker Pack</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article" role="main">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="lost-in-stickerland">
+<h1>Lost in Stickerland<a class="headerlink" href="#lost-in-stickerland" title="Permalink to this heading">#</a></h1>
+<section id="when-custom-matrix-sticker-packs-lead-to-uncharted-territory">
+<h2>When Custom Matrix Sticker Packs Lead to Uncharted Territory<a class="headerlink" href="#when-custom-matrix-sticker-packs-lead-to-uncharted-territory" title="Permalink to this heading">#</a></h2>
+<blockquote>
+<div><p>Please write me a README with instructions how to create a Matrix sticker pack with Maunium and host it on a GitHub page.</p>
+</div></blockquote>
+<section id="matrix-sticker-pack-creation-with-maunium-and-hosting-on-github-pages">
+<h3>Matrix Sticker Pack Creation with Maunium and Hosting on GitHub Pages<a class="headerlink" href="#matrix-sticker-pack-creation-with-maunium-and-hosting-on-github-pages" title="Permalink to this heading">#</a></h3>
+<p>This README provides step-by-step instructions on how to create a custom Matrix sticker pack using the Maunium Sticker Pack Builder and host it on GitHub Pages.</p>
+<section id="prerequisites">
+<h4>Prerequisites<a class="headerlink" href="#prerequisites" title="Permalink to this heading">#</a></h4>
+<ol class="arabic simple">
+<li><p><a class="reference external" href="https://git-scm.com/downloads">Git</a> and <a class="reference external" href="https://github.com/join">GitHub account</a></p></li>
+<li><p><a class="reference external" href="https://nodejs.org/en/download/">Node.js</a> installed on your local machine</p></li>
+<li><p>Image files for your stickers in PNG or WEBP format, with a transparent background</p></li>
+<li><p>An active Matrix account (e.g., Element)</p></li>
+</ol>
+</section>
+<section id="step-1-create-a-github-repository">
+<h4>Step 1: Create a GitHub Repository<a class="headerlink" href="#step-1-create-a-github-repository" title="Permalink to this heading">#</a></h4>
+<ol class="arabic simple">
+<li><p>Log in to your GitHub account</p></li>
+<li><p>Click on the “+” icon in the upper-right corner and select “New repository”</p></li>
+<li><p>Name your repository (e.g., <code class="docutils literal notranslate"><span class="pre">matrix-sticker-pack</span></code>)</p></li>
+<li><p>Choose the repository visibility (public or private)</p></li>
+<li><p>Check the “Add a README file” option</p></li>
+<li><p>Click “Create repository”</p></li>
+</ol>
+</section>
+<section id="step-2-clone-the-repository-and-set-up-github-pages">
+<h4>Step 2: Clone the Repository and Set Up GitHub Pages<a class="headerlink" href="#step-2-clone-the-repository-and-set-up-github-pages" title="Permalink to this heading">#</a></h4>
+<ol class="arabic simple">
+<li><p>Clone the repository to your local machine by running:</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">git</span> <span class="n">clone</span> <span class="n">https</span><span class="p">:</span><span class="o">//</span><span class="n">github</span><span class="o">.</span><span class="n">com</span><span class="o">/&lt;</span><span class="n">your</span><span class="o">-</span><span class="n">username</span><span class="o">&gt;/&lt;</span><span class="n">repository</span><span class="o">-</span><span class="n">name</span><span class="o">&gt;.</span><span class="n">git</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Navigate to the repository folder:</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">cd</span> <span class="o">&lt;</span><span class="n">repository</span><span class="o">-</span><span class="n">name</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>Create a new branch named <code class="docutils literal notranslate"><span class="pre">gh-pages</span></code>:</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">git</span> <span class="n">checkout</span> <span class="o">-</span><span class="n">b</span> <span class="n">gh</span><span class="o">-</span><span class="n">pages</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="4">
+<li><p>Push the new branch to GitHub:</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">git</span> <span class="n">push</span> <span class="o">-</span><span class="n">u</span> <span class="n">origin</span> <span class="n">gh</span><span class="o">-</span><span class="n">pages</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="5">
+<li><p>Go to your repository settings on GitHub</p></li>
+<li><p>Scroll down to the “GitHub Pages” section</p></li>
+<li><p>Under “Source”, select the <code class="docutils literal notranslate"><span class="pre">gh-pages</span></code> branch and click “Save”</p></li>
+</ol>
+<p>Your GitHub Pages site will be available at <code class="docutils literal notranslate"><span class="pre">https://&lt;your-username&gt;.github.io/&lt;repository-name&gt;/</span></code>.</p>
+</section>
+<section id="step-3-create-the-sticker-pack-with-maunium-sticker-pack-builder">
+<h4>Step 3: Create the Sticker Pack with Maunium Sticker Pack Builder<a class="headerlink" href="#step-3-create-the-sticker-pack-with-maunium-sticker-pack-builder" title="Permalink to this heading">#</a></h4>
+<ol class="arabic simple">
+<li><p>Go to the <a class="reference external" href="https://sticker-importer.maunium.net/builder">Maunium Sticker Pack Builder</a></p></li>
+<li><p>Click “Add Sticker” and select the image files for your stickers</p></li>
+<li><p>For each sticker, set a unique “Sticker ID” (e.g., <code class="docutils literal notranslate"><span class="pre">sticker1</span></code>)</p></li>
+<li><p>Enter a “Pack name” and a “Pack ID” (e.g., <code class="docutils literal notranslate"><span class="pre">MyStickerPack</span></code>)</p></li>
+<li><p>Click “Export” and download the generated <code class="docutils literal notranslate"><span class="pre">.mcfg</span></code> file (e.g., <code class="docutils literal notranslate"><span class="pre">MyStickerPack.mcfg</span></code>)</p></li>
+</ol>
+</section>
+<section id="step-4-add-the-sticker-pack-to-your-github-repository">
+<h4>Step 4: Add the Sticker Pack to Your GitHub Repository<a class="headerlink" href="#step-4-add-the-sticker-pack-to-your-github-repository" title="Permalink to this heading">#</a></h4>
+<ol class="arabic simple">
+<li><p>Copy the downloaded <code class="docutils literal notranslate"><span class="pre">.mcfg</span></code> file and your sticker image files to your cloned repository folder</p></li>
+<li><p>Add the files to Git:</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">git</span> <span class="n">add</span> <span class="n">MyStickerPack</span><span class="o">.</span><span class="n">mcfg</span> <span class="o">&lt;</span><span class="n">sticker</span><span class="o">-</span><span class="n">image</span><span class="o">-</span><span class="n">files</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>Commit the changes:</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">git</span> <span class="n">commit</span> <span class="o">-</span><span class="n">m</span> <span class="s2">&quot;Add sticker pack files&quot;</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="4">
+<li><p>Push the changes to the <code class="docutils literal notranslate"><span class="pre">gh-pages</span></code> branch:</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">git</span> <span class="n">push</span>
+</pre></div>
+</div>
+<p>The sticker pack files are now available on your GitHub Pages site.</p>
+</section>
+<section id="step-5-share-the-sticker-pack">
+<h4>Step 5: Share the Sticker Pack<a class="headerlink" href="#step-5-share-the-sticker-pack" title="Permalink to this heading">#</a></h4>
+<ol class="arabic simple">
+<li><p>In your Matrix client (e.g., Element), open a chat with someone you’d like to share the sticker pack with</p></li>
+<li><p>Send the link to your sticker pack <code class="docutils literal notranslate"><span class="pre">.mcfg</span></code> file:</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">https</span><span class="p">:</span><span class="o">//&lt;</span><span class="n">your</span><span class="o">-</span><span class="n">username</span><span class="o">&gt;.</span><span class="n">github</span><span class="o">.</span><span class="n">io</span><span class="o">/&lt;</span><span class="n">repository</span><span class="o">-</span><span class="n">name</span><span class="o">&gt;/</span><span class="n">MyStickerPack</span><span class="o">.</span><span class="n">mcfg</span>
+</pre></div>
+</div>
+<p>The recipient can now import the sticker pack into their Matrix client.</p>
+</section>
+<section id="conclusion">
+<h4>Conclusion<a class="headerlink" href="#conclusion" title="Permalink to this heading">#</a></h4>
+<p>You’ve successfully created a custom Matrix sticker pack with the Maunium Sticker Pack Builder and hosted it on GitHub Pages. Share the pack with your friends and enjoy using your new stickers in Matrix conversations!</p>
+<blockquote>
+<div><p>Thanks a lot. Is there a way to import the created sticker pack into the web version of element?</p>
+</div></blockquote>
+<p>Yes, you can import the created sticker pack into the web version of Element. Follow these steps:</p>
+<ol class="arabic simple">
+<li><p>Open the Element web app and log in to your account.</p></li>
+<li><p>Click on the sticker picker icon (smiley face) in the bottom right corner of the message input area in any chat room.</p></li>
+<li><p>Click on the gear icon in the top right corner of the sticker picker panel to open the “Sticker Packs” settings.</p></li>
+<li><p>Click on the “Add” button at the bottom of the panel.</p></li>
+<li><p>In the “Add Sticker Pack” dialog, paste the URL of your sticker pack <code class="docutils literal notranslate"><span class="pre">.mcfg</span></code> file:</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">https</span><span class="p">:</span><span class="o">//&lt;</span><span class="n">your</span><span class="o">-</span><span class="n">username</span><span class="o">&gt;.</span><span class="n">github</span><span class="o">.</span><span class="n">io</span><span class="o">/&lt;</span><span class="n">repository</span><span class="o">-</span><span class="n">name</span><span class="o">&gt;/</span><span class="n">MyStickerPack</span><span class="o">.</span><span class="n">mcfg</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="6">
+<li><p>Click “Add Sticker Pack.”</p></li>
+</ol>
+<p>Your custom sticker pack should now be available in the sticker picker panel, and you can use the stickers in your conversations.</p>
+<blockquote>
+<div><p>When I click the sticker picker I get an empty sticker page and the following error in my chrome console…</p>
+</div></blockquote>
+<p>It seems like you’re experiencing an issue with the Element web app related to the sticker picker. This error may be caused by a missing configuration or a bug in the application. Here are some steps to try and resolve the issue:</p>
+<ol class="arabic simple">
+<li><p>Clear your browser cache and reload the Element web app. This will ensure you’re running the latest version of the app and may resolve any issues related to cached data.</p></li>
+<li><p>Check if the issue persists across different browsers (e.g., Firefox, Safari) or in a private/incognito browsing session. This will help determine if the issue is specific to your current browser session or a more general issue with the Element web app.</p></li>
+<li><p>Make sure your Matrix homeserver has the integration manager configured correctly. The integration manager is responsible for handling sticker packs and other integrations. If you’re using the default <a class="reference external" href="http://matrix.org">matrix.org</a> homeserver, the integration manager should be pre-configured. However, if you’re using a custom homeserver, you might need to configure the integration manager yourself. You can find more information about setting up an integration manager in the <a class="reference external" href="https://matrix-org.github.io/matrix-doc/latest/client-server-api/#widgets">Matrix documentation</a>.</p></li>
+<li><p>If the issue persists, consider reporting the bug to the Element team. You can do this by opening the Element web app, clicking on your avatar in the top left corner, selecting “Settings,” navigating to the “Help &amp; About” tab, and clicking “Report a bug.” Provide as much information as possible about the issue, including the error message and steps to reproduce the problem.</p></li>
+</ol>
+<p>In the meantime, you can try using the Element desktop app or a mobile app (available for Android and iOS) to import and use your custom sticker pack. The error you encountered might not occur in these other platforms.</p>
+<blockquote>
+<div><p>Can you tell me the correct integration manager configuration when using <a class="reference external" href="http://gitter.im">gitter.im</a> as a home server instead of <a class="reference external" href="http://matrix.org">matrix.org</a>?</p>
+</div></blockquote>
+<p><a class="reference external" href="http://Gitter.im">Gitter.im</a> does not have a built-in integration manager like <a class="reference external" href="http://matrix.org">matrix.org</a>. To use an integration manager with <a class="reference external" href="http://Gitter.im">Gitter.im</a>, you will need to set up your own integration manager or use a third-party one.</p>
+<p>Here’s how to set up and use the Dimension integration manager with a <a class="reference external" href="http://Gitter.im">Gitter.im</a> homeserver:</p>
+<ol class="arabic simple">
+<li><p>First, you need to have a self-hosted instance of the Dimension integration manager running. You can follow the instructions on the <a class="reference external" href="https://github.com/turt2live/matrix-dimension">Dimension GitHub page</a> to set up your own instance.</p></li>
+<li><p>After setting up your Dimension instance, open the Element web app and log in with your <a class="reference external" href="http://Gitter.im">Gitter.im</a> account.</p></li>
+<li><p>Click on your avatar in the top left corner, then select “Settings.”</p></li>
+<li><p>Navigate to the “Advanced” tab. Here, you will find a section called “Integration Manager.”</p></li>
+<li><p>Click the “Add” button next to “Integration Managers” and enter the URL of your self-hosted Dimension instance, then click “Add Integration Manager.”</p></li>
+<li><p>You should now see your Dimension instance listed as an available integration manager. Click the “Set as default” button to make it the default integration manager for your <a class="reference external" href="http://Gitter.im">Gitter.im</a> account.</p></li>
+</ol>
+<p>Now, you should be able to use the sticker picker and other integrations provided by the Dimension integration manager with your <a class="reference external" href="http://Gitter.im">Gitter.im</a> homeserver.</p>
+<p>Keep in mind that the integration manager configuration is specific to the Element client you are using. If you switch between the web, desktop, or mobile versions of Element, you will need to configure the integration manager for each client separately.</p>
+<blockquote>
+<div><p>Can I use <a class="reference external" href="http://vector.im">vector.im</a> as integration manager?</p>
+</div></blockquote>
+<p>Yes, you can use the <a class="reference external" href="http://vector.im">vector.im</a> integration manager (also known as Scalar or Element Integrations) with a custom homeserver. Here’s how to configure it:</p>
+<ol class="arabic simple">
+<li><p>Open the Element web app and log in with your custom homeserver account.</p></li>
+<li><p>Click on your avatar in the top left corner, then select “Settings.”</p></li>
+<li><p>Navigate to the “Advanced” tab. Here, you will find a section called “Integration Manager.”</p></li>
+<li><p>Click the “Add” button next to “Integration Managers” and enter the URL of the <a class="reference external" href="http://vector.im">vector.im</a> integration manager, which is typically <code class="docutils literal notranslate"><span class="pre">https://scalar.vector.im</span></code>.</p></li>
+<li><p>Click “Add Integration Manager.”</p></li>
+<li><p>You should now see the <a class="reference external" href="http://vector.im">vector.im</a> (Scalar) instance listed as an available integration manager. Click the “Set as default” button to make it the default integration manager for your custom homeserver account.</p></li>
+</ol>
+<p>Now, you should be able to use the sticker picker and other integrations provided by the <a class="reference external" href="http://vector.im">vector.im</a> integration manager with your custom homeserver.</p>
+<p>Please note that using the <a class="reference external" href="http://vector.im">vector.im</a> integration manager with a custom homeserver might not always provide full functionality, as certain features might be limited to the <a class="reference external" href="http://matrix.org">matrix.org</a> homeserver or require additional configuration on your custom homeserver. However, for basic integrations like sticker packs, the <a class="reference external" href="http://vector.im">vector.im</a> integration manager should work well.</p>
+<blockquote>
+<div><p>I have set the integration manager to <a class="reference external" href="http://scalar.vector.im">scalar.vector.im</a>. But I’m still experiencingthe issue both on the Element web app and on Element Desktop.</p>
+</div></blockquote>
+<p>I apologize for the inconvenience you’re experiencing. It seems the issue may be related to a bug or a problem with the specific homeserver configuration. The best course of action in this situation is to report the issue to the Element and <a class="reference external" href="http://Gitter.im">Gitter.im</a> teams.</p>
+<p>To report the issue to the Element team:</p>
+<ol class="arabic simple">
+<li><p>Open the Element web app or Element Desktop.</p></li>
+<li><p>Click on your avatar in the top left corner, then select “Settings.”</p></li>
+<li><p>Navigate to the “Help &amp; About” tab.</p></li>
+<li><p>Click “Report a bug” and provide as much information as possible about the issue, including the error message and steps to reproduce the problem.</p></li>
+</ol>
+<p>To report the issue to the <a class="reference external" href="http://Gitter.im">Gitter.im</a> team, you can create an issue on their GitHub repository:</p>
+<ol class="arabic simple">
+<li><p>Visit the <a class="reference external" href="https://github.com/gitterHQ/gitter">Gitter.im GitHub repository</a>.</p></li>
+<li><p>Click on the “Issues” tab.</p></li>
+<li><p>Click the “New issue” button.</p></li>
+<li><p>Provide a detailed description of the issue, including the error message and steps to reproduce the problem.</p></li>
+</ol>
+<p>While waiting for a response from the Element or <a class="reference external" href="http://Gitter.im">Gitter.im</a> team, you can try using a different Matrix client that supports sticker packs, such as <a class="reference external" href="https://github.com/Nheko-Reborn/nheko">Nheko Reborn</a> or <a class="reference external" href="https://github.com/quotient-im/Quaternion">Quaternion</a>, to see if the issue persists in those clients. Alternatively, you can consider creating a new account on a different Matrix homeserver, such as <a class="reference external" href="http://matrix.org">matrix.org</a>, to see if the sticker pack functionality works as expected there.</p>
+</section>
+</section>
+</section>
+</section>
+
+    <script type="text/x-thebe-config">
+    {
+        requestKernel: true,
+        binderOptions: {
+            repo: "binder-examples/jupyter-stacks-datascience",
+            ref: "master",
+        },
+        codeMirrorConfig: {
+            theme: "abcdef",
+            mode: "python"
+        },
+        kernelOptions: {
+            name: "python3",
+            path: "./parts/issues"
+        },
+        predefinedOutput: true
+    }
+    </script>
+    <script>kernelName = 'python3'</script>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer">
+                  <!-- Previous / next buttons -->
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../ai/watts_the_cost.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Watt’s the Cost?</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../devops/geonode_meets_docker.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">GeoNode Meets Docker</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#when-custom-matrix-sticker-packs-lead-to-uncharted-territory">When Custom Matrix Sticker Packs Lead to Uncharted Territory</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#matrix-sticker-pack-creation-with-maunium-and-hosting-on-github-pages">Matrix Sticker Pack Creation with Maunium and Hosting on GitHub Pages</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-create-a-github-repository">Step 1: Create a GitHub Repository</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-clone-the-repository-and-set-up-github-pages">Step 2: Clone the Repository and Set Up GitHub Pages</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-create-the-sticker-pack-with-maunium-sticker-pack-builder">Step 3: Create the Sticker Pack with Maunium Sticker Pack Builder</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-4-add-the-sticker-pack-to-your-github-repository">Step 4: Add the Sticker Pack to Your GitHub Repository</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-share-the-sticker-pack">Step 5: Share the Sticker Pack</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By Andreas Trawoeger
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+  <p class="copyright">
+    
+      © Copyright 2022.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="../../_static/scripts/bootstrap.js?digest=365ca57ee442770a23c6"></script>
+<script src="../../_static/scripts/pydata-sphinx-theme.js?digest=365ca57ee442770a23c6"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
