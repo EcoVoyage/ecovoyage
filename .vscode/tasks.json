@@ -26,6 +26,32 @@
                 "panel": "new"
             },
             "problemMatcher": []
+        },
+        {
+            "label": "Build Book",
+            "type": "shell",
+            "command": "make",
+            "args": ["book-build"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Push Book",
+            "type": "shell",
+            "command": "make",
+            "args": ["book-push"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "problemMatcher": []
         }
     ]
 }
