@@ -1,0 +1,52 @@
+services:
+  traefik:
+    image: traefik:latest
+    env_file:
+      - config/config.env
+      - config/secrets.env
+      - config/container.env
+    command:
+      - "--log.level=DEBUG"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entryPoint.permanent=true"
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.email=atrawog@gmail.com"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+      # - "--certificatesresolvers.myresolver.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./letsencrypt:/letsencrypt"
+    restart: unless-stopped
+
+  gurum:
+    image: ghcr.io/atrawog/guru-meditation:latest
+    env_file:
+      - config/config.env
+      - config/secrets.env
+      - config/container.env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.lab.rule=Host(`lab.ecovoyage.org`)"
+      - "traefik.http.routers.lab.entrypoints=websecure"
+      - "traefik.http.routers.lab.tls=true"
+      - "traefik.http.routers.lab.tls.certresolver=myresolver"
+      - "traefik.http.routers.lab.service=lab"
+      - "traefik.http.services.lab.loadbalancer.server.port=8001"
+      - "traefik.http.routers.otp.rule=Host(`otp.ecovoyage.org`)"
+      - "traefik.http.routers.otp.entrypoints=websecure"
+      - "traefik.http.routers.otp.tls=true"
+      - "traefik.http.routers.otp.tls.certresolver=myresolver"
+      - "traefik.http.routers.otp.service=otp"
+      - "traefik.http.services.otp.loadbalancer.server.port=8080"      
+    restart: unless-stopped
+    volumes:
+      - "${PWD}:/workspace"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"

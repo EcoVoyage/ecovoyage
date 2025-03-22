@@ -1,0 +1,82 @@
+{
+    "name": "ecovoyage",
+    "build": {
+        "dockerfile": "Containerfile"
+    },
+    "runArgs": [
+        "--gpus=all",
+        "--env-file=config.env",
+        "--env-file=secrets.env",
+        "--hostname=gurum" 
+    ],
+    "forwardPorts": [3000,3001,8000,8001,8010,8011],
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "terminal.integrated.shell.linux": "/usr/sbin/bash"
+                "python.analysis.indexing": false,
+                "python.analysis.diagnosticMode": "openFilesOnly",
+                "python.analysis.exclude": [
+                    "**/.git/**",
+                    "**/.pixi/**",
+                    "**/_build/**",
+                    "**/_jupyter/**",
+                    "**/data/**",
+                    "**/media/**"
+                ],
+                "files.watcherExclude": {
+                    "**/.git/**": true,
+                    "**/.pixi/**": true,
+                    "**/_build/**": true,
+                    "**/_jupyter/**": true,
+                    "**/data/**": true,
+                    "**/media/**": true
+                  }
+            }
+        }
+    },
+    "extensions": [
+        // "continue.continue",
+        "executablebookproject.myst-highlight",
+        "github.copilot",
+        "github.copilot-chat",
+        "github.remotehub",
+        "ms-kubernetes-tools.vscode-kubernetes-tools",
+        "ms-python.debugpy",
+        "ms-python.isort",
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-toolsai.jupyter-hub",
+        "ms-toolsai.jupyter-keymap",
+        "ms-toolsai.jupyter-renderers",
+        "ms-toolsai.vscode-jupyter-cell-tags",
+        "ms-toolsai.vscode-jupyter-slideshow",
+        "ms-vscode-remote.remote-containers",
+        "ms-vscode-remote.remote-ssh",
+        "ms-vscode-remote.remote-ssh-edit",
+        "ms-vscode-remote.remote-wsl",
+        "ms-vscode-remote.vscode-remote-extensionpack",
+        "ms-vscode.remote-explorer",
+        "ms-vscode.remote-repositories",
+        "ms-vscode.remote-server",
+        "ms-azuretools.vscode-docker",
+        "streetsidesoftware.code-spell-checker",
+        "streetsidesoftware.code-spell-checker-german",
+        "ms-python.vscode-pylance",
+        "saoudrizwan.claude-dev"
+    ]
+    "remoteUser": "gm",
+    "workspaceFolder": "/workspace",
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/workspace,type=bind",
+        "source=${env:SSH_AUTH_SOCK},target=/ssh-agent,type=bind",
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
+        "source=/run/user/1000/bus,target=/run/user/1000/bus,type=bind"
+    ],
+    "postCreateCommand": "/usr/local/bin/postcreate.sh",
+    "updateRemoteUserUID": true,
+    "containerEnv": {
+        "SSH_AUTH_SOCK": "/ssh-agent",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"
+    }
+}

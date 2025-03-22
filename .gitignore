@@ -1,4 +1,4 @@
-*
 !.gitignore
 .stfolder/
 .Trash-1000/
+secrets.env
