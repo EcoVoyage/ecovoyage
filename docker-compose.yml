@@ -2,9 +2,8 @@ services:
   traefik:
     image: traefik:latest
     env_file:
-      - config/config.env
-      - config/secrets.env
-      - config/container.env
+      - config.env
+      - secrets.env
     command:
       - "--log.level=DEBUG"
       - "--providers.docker=true"
@@ -16,37 +15,41 @@ services:
       - "--entrypoints.web.http.redirections.entryPoint.permanent=true"
       - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
       - "--certificatesresolvers.myresolver.acme.email=atrawog@gmail.com"
-      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
-      # - "--certificatesresolvers.myresolver.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory"
+      # - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.myresolver.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory"
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - "./letsencrypt:/letsencrypt"
+      - "letsencrypt:/letsencrypt"
+      - "jupyter:/workspace/.jupyter"
     restart: unless-stopped
 
   gurum:
     image: ghcr.io/atrawog/guru-meditation:latest
     env_file:
-      - config/config.env
-      - config/secrets.env
-      - config/container.env
+      - config.env
+      - secrets.env
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.lab.rule=Host(`lab.ecovoyage.org`)"
+      - "traefik.http.routers.lab.rule=Host(`lab.atrawog.org`)"
       - "traefik.http.routers.lab.entrypoints=websecure"
       - "traefik.http.routers.lab.tls=true"
       - "traefik.http.routers.lab.tls.certresolver=myresolver"
       - "traefik.http.routers.lab.service=lab"
-      - "traefik.http.services.lab.loadbalancer.server.port=8001"
-      - "traefik.http.routers.otp.rule=Host(`otp.ecovoyage.org`)"
-      - "traefik.http.routers.otp.entrypoints=websecure"
-      - "traefik.http.routers.otp.tls=true"
-      - "traefik.http.routers.otp.tls.certresolver=myresolver"
-      - "traefik.http.routers.otp.service=otp"
-      - "traefik.http.services.otp.loadbalancer.server.port=8080"      
+      - "traefik.http.services.lab.loadbalancer.server.port=8010"
+      - "traefik.http.routers.ow.rule=Host(`ow.atrawog.org`)"
+      - "traefik.http.routers.ow.entrypoints=websecure"
+      - "traefik.http.routers.ow.tls=true"
+      - "traefik.http.routers.ow.tls.certresolver=myresolver"
+      - "traefik.http.routers.ow.service=otp"
+      - "traefik.http.services.ow.loadbalancer.server.port=3000"     
     restart: unless-stopped
     volumes:
       - "${PWD}:/workspace"
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
+
+volumes:
+  letsencrypt:
+  jupyter:
