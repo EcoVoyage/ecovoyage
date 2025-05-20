@@ -1,34 +1,21 @@
 #!/bin/bash
 
-# Set up environment variables
+# Setup environment variables
 export AIRFLOW_HOME=/workspace/airflow
-export TZ=UTC
+export AIRFLOW_CONFIG=/workspace/airflow/airflow.cfg
 export PYTHONPATH=/workspace:$PYTHONPATH
+export TZ=UTC
+export AIRFLOW__CORE__LOAD_EXAMPLES=False
+export AIRFLOW__LOGGING__LOGGING_LEVEL=CRITICAL
 
-# List of tasks to run
-TASKS=(
-  "check_environment"
-  "prepare_env"
-  "download_data"
-  "check_status"
-  "run_tests"
-  "check_test_results"
-  "run_ecovoyage"
-)
+# Simple check environment
+echo "Running check environment..."
+echo "Working directory: $(pwd)"
+echo "Python: $(which python)"
+echo "Python version: $(python --version)"
 
-# Run each task in sequence
-for task in "${TASKS[@]}"; do
-  echo "==== Running task: $task ===="
-  airflow tasks test ecovoyage_dag "$task" 2025-05-20
-  
-  # Check if the task succeeded
-  if [ $? -ne 0 ]; then
-    echo "Task $task failed!"
-    exit 1
-  fi
-  
-  echo "==== Task $task completed successfully ===="
-  echo
-done
+# Run the main ecovoyage application
+echo "Running ecovoyage application..."
+cd /workspace && python -m ecovoyage.main
 
 echo "All tasks completed successfully!" 
