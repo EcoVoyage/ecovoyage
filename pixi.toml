@@ -12,13 +12,29 @@ run = "python -m ecovoyage.main"
 download = "python -m ecovoyage.main --download"
 install = "python -m pip install -e ."
 activate = "echo 'Development environment activated with editable install'"
+# Airflow tasks
+airflow-install-deps = "pip install flask-session==0.4.0 werkzeug==2.2.3"
+airflow-migrate = "AIRFLOW_HOME=/workspace/airflow TZ=UTC airflow db migrate"
+airflow-standalone = "AIRFLOW_HOME=/workspace/airflow TZ=UTC airflow standalone"
+airflow-api-server = "AIRFLOW_HOME=/workspace/airflow TZ=UTC airflow api-server --port 8080"
+airflow-scheduler = "AIRFLOW_HOME=/workspace/airflow TZ=UTC airflow scheduler"
+airflow-dag-processor = "AIRFLOW_HOME=/workspace/airflow TZ=UTC airflow dag-processor"
+airflow-triggerer = "AIRFLOW_HOME=/workspace/airflow TZ=UTC airflow triggerer"
+airflow-setup = "mkdir -p /workspace/airflow && pip install flask-session==0.4.0 werkzeug==2.2.3 && AIRFLOW_HOME=/workspace/airflow TZ=UTC airflow db migrate"
+airflow-test-ecovoyage = "AIRFLOW_HOME=/workspace/airflow TZ=UTC PYTHONPATH=/workspace:$PYTHONPATH airflow tasks test ecovoyage_dag check_environment 2025-05-20"
+airflow-test-ecovoyage-all = "chmod +x /workspace/run_ecovoyage_tasks.sh && /workspace/run_ecovoyage_tasks.sh"
 
 [activation]
 scripts = ["python -m pip install -e ."]
 
 [dependencies]
-python = ">=3.13.3,<3.14"
+python = ">=3.12,<3.13"
 pytest = ">=7.0.0"
 setuptools = ">=68.0.0"
 pip = ">=23.0.0"
 requests = ">=2.31.0"
+apache-airflow = ">=3.0.0,<3.1.0"
+apache-airflow-providers-http = ">=4.1.0"
+apache-airflow-providers-sqlite = ">=3.4.0"
+tzdata = ">=2023.3"
+flask-appbuilder = ">=4.3.0"

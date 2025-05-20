@@ -1,0 +1,4 @@
+!.gitignore
+airflow.db
+airflow-webserver.pid
+logs/

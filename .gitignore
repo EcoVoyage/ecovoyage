@@ -6,3 +6,5 @@ secrets.env
 # pixi environments
 .pixi
 *.egg-info
+__pycache__/
+test_reports/
