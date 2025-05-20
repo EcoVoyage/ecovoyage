@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecovoyage"
+version = "0.1.0"
+description = "Planning eco-friendly travel"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "atrawog", email = "atrawog@gmail.com"}
+]
+
+[tool.setuptools]
+packages = ["ecovoyage"]
+package-dir = {"" = "src"} 

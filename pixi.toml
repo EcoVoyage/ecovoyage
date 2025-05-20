@@ -7,12 +7,12 @@ version = "0.1.0"
 
 [tasks]
 python = "python"
-install-dev = "pip install -e ."
-test = "pip install -e . && PYTHONPATH=/workspace python -m unittest discover -s src/ecovoyage/tests"
-test-all = "pip install -e . && PYTHONPATH=/workspace python -m unittest discover -s src/ecovoyage/tests && AIRFLOW_HOME=/workspace/airflow PYTHONPATH=/workspace:$PYTHONPATH TZ=UTC AIRFLOW__LOGGING__LOGGING_LEVEL=CRITICAL pixi run airflow-test-ecovoyage && pixi run airflow-test-ecovoyage-all"
+install-dev = "pip install -e . --config-settings editable_mode=compat --use-pep517"
+test = "pip install -e . --config-settings editable_mode=compat --use-pep517 && PYTHONPATH=/workspace python -m unittest discover -s src/ecovoyage/tests"
+test-all = "pip install -e . --config-settings editable_mode=compat --use-pep517 && PYTHONPATH=/workspace python -m unittest discover -s src/ecovoyage/tests && AIRFLOW_HOME=/workspace/airflow PYTHONPATH=/workspace:$PYTHONPATH TZ=UTC AIRFLOW__LOGGING__LOGGING_LEVEL=CRITICAL pixi run airflow-test-ecovoyage && pixi run airflow-test-ecovoyage-all"
 run = "python -m ecovoyage.main"
 download = "python -m ecovoyage.main --download"
-install = "python -m pip install -e ."
+install = "python -m pip install -e . --config-settings editable_mode=compat --use-pep517"
 activate = "echo 'Development environment activated with editable install'"
 # Airflow tasks
 airflow-install-deps = "pip install flask-session==0.4.0 werkzeug==2.2.3"
@@ -27,7 +27,7 @@ airflow-test-ecovoyage = "AIRFLOW_HOME=/workspace/airflow TZ=UTC PYTHONPATH=/wor
 airflow-test-ecovoyage-all = "chmod +x /workspace/run_ecovoyage_tasks.sh && /workspace/run_ecovoyage_tasks.sh"
 
 [activation]
-scripts = ["python -m pip install -e ."]
+scripts = ["/workspace/activate_script.sh"]
 
 [dependencies]
 python = ">=3.12,<3.13"
@@ -40,3 +40,4 @@ apache-airflow-providers-http = ">=4.1.0"
 apache-airflow-providers-sqlite = ">=3.4.0"
 tzdata = ">=2023.3"
 flask-appbuilder = ">=4.3.0"
+pandas = ">=2.0.0"
