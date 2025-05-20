@@ -1,0 +1,27 @@
+{
+    "name": "ecovoyage",
+    "build": {
+        "dockerfile": "Containerfile"
+    },
+    "runArgs": [
+        // "--gpus=all",
+        "--env-file=config.env",
+        "--env-file=secrets.env",
+        "--hostname=ecovoyage" 
+    ],
+
+    "remoteUser": "gm",
+    "workspaceFolder": "/workspace",
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/workspace,type=bind",
+        "source=${env:SSH_AUTH_SOCK},target=/ssh-agent,type=bind",
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
+        "source=/run/user/1000/bus,target=/run/user/1000/bus,type=bind"
+    ],
+    "postCreateCommand": "/usr/local/bin/postcreate.sh",
+    "updateRemoteUserUID": true,
+    "containerEnv": {
+        "SSH_AUTH_SOCK": "/ssh-agent",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"
+    }
+}
