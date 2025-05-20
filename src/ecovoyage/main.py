@@ -5,6 +5,7 @@ import requests
 import os
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from ecovoyage.dag import run_download_dag
 
 
 def validate_directories(feeds):
@@ -96,7 +97,7 @@ def download(url, local_path):
         return False
 
 
-def download_feeds():
+def download_feeds(max_workers=3):
     """Download and update GTFS and OSM feeds"""
     # CONFIGURATION
     FEEDS = [
@@ -144,41 +145,24 @@ def download_feeds():
         },
     ]
 
-    validate_directories(FEEDS)  # This runs first to ensure directories exist
-    
-    updated = 0
-    skipped = 0
-    errors = 0
-
-    for feed in FEEDS:
-        print(f"\nChecking {feed['url']}")
-        try:
-            if check_feed_update(feed['url'], feed['local_path']):
-                if download(feed['url'], feed['local_path']):
-                    updated += 1
-                else:
-                    errors += 1
-            else:
-                skipped += 1
-        except Exception as e:
-            print(f"Unexpected error processing feed: {e}")
-            errors += 1
-
-    print(f"\n📋 Results: {updated} updated, {skipped} current, {errors} errors")
+    # Run DAG-based download
+    run_download_dag(FEEDS, max_workers=max_workers)
 
 
 def main():
     """Run the main function of the EcoVoyage package."""
     parser = argparse.ArgumentParser(description='EcoVoyage - Planning eco-friendly travel')
     parser.add_argument('--download', action='store_true', help='Download and update GTFS and OSM feeds')
+    parser.add_argument('--workers', type=int, default=3, help='Number of concurrent downloads (default: 3)')
     
     args = parser.parse_args()
     
     if args.download:
-        download_feeds()
+        download_feeds(max_workers=args.workers)
     else:
         print("EcoVoyage - Planning eco-friendly travel")
         print("Use --download to update GTFS and OSM feeds")
+        print("Use --workers to set number of concurrent downloads")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,8 @@ install-dev = "pip install -e . --config-settings editable_mode=compat --use-pep
 test = "pip install -e . --config-settings editable_mode=compat --use-pep517 && PYTHONPATH=/workspace python -m unittest discover -s src/ecovoyage/tests"
 test-all = "pip install -e . --config-settings editable_mode=compat --use-pep517 && PYTHONPATH=/workspace python -m unittest discover -s src/ecovoyage/tests && chmod +x /workspace/run_ecovoyage_tasks.sh && /workspace/run_ecovoyage_tasks.sh"
 run = "python -m ecovoyage.main"
-download = "python -m ecovoyage.main --download"
+download = "python -m ecovoyage.main --download --workers 3"
+download-parallel = "python -m ecovoyage.main --download --workers"
 install = "python -m pip install -e . --config-settings editable_mode=compat --use-pep517"
 activate = "echo 'Development environment activated with editable install'"
 # Airflow tasks
