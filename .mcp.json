@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "marimo": {
+      "type": "http",
+      "url": "http://localhost:32718/mcp/server"
+    },
+    "airflow": {
+      "type": "http",
+      "url": "http://localhost:39999/mcp"
+    }
+  }
+}
