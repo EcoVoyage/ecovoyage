@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Runtime artifacts written by the versa notebook + its self-authored DAGs.
+# AIRFLOW_DAGS_DIR=/workspace/dags writes self-authored DAG files into dags/.
+# The 6 DAGs produce tile outputs under tiles/ and GTFS parquet under gtfs/.
+# All recoverable by re-running the notebook against a fresh image.
+dags/
+gtfs/
+tiles/
+
