@@ -13,9 +13,8 @@ def _():
     import requests
     from pathlib import Path
     import polars as pl
-    import folium
 
-    return Path, folium, mo, os, pl, requests, textwrap, time
+    return Path, mo, os, pl, requests, textwrap, time
 
 
 @app.cell
@@ -56,24 +55,57 @@ def _(airflow_public, martin, mo):
     # 127.0.0.1:<port> here.
     mo.md(
         f"""
-        # Austria — OSM + GTFS marimo demo (Pipeline 4 only)
+        # Austria — OSM + GTFS marimo demo (unified DuckDB)
 
-        Sibling to `osm-monaco-viz.py`, scoped to Austria and pared down to
-        a single tile-generation pipeline. This notebook **writes its own
-        Airflow DAGs** to `${{AIRFLOW_DAGS_DIR}}` (two DAGs — OSM+freestiler
-        and GTFS), **triggers** them via the Airflow REST API at
-        <{airflow_public}>, **polls until each succeeds**, then renders:
+        Sibling to `osm-monaco-viz.py`, scoped to Austria. This notebook
+        **writes its own Airflow DAGs** to `${{AIRFLOW_DAGS_DIR}}` (two
+        DAGs — `notebook_austria_pipeline` for the OSM+freestiler pipeline
+        and `notebook_austria_gtfs_pipeline` for the GTFS pipeline +
+        cross-dataset unification), **triggers** them via the Airflow REST
+        API at <{airflow_public}>, **polls until each succeeds**, then
+        renders the unified results.
 
-        - **Austria vector-tile map** — PMTiles produced by
-          `notebook_austria_pipeline` (PBF → quackosm GeoParquet →
-          freestiler's Rust tiling engine → PMTiles archive), served by
-          martin at <{martin}> as the `austria-duckdb-freestiler` source.
-        - **Transit map** — Austrian railway stops rendered as a folium
-          `FastMarkerCluster` (Leaflet.markercluster) on default
-          OpenStreetMap raster tiles. ~7.6k stops cluster at country
-          zoom and explode into individual markers on zoom-in. Produced
-          by `notebook_austria_gtfs_pipeline` from the transitous.org
-          `at_Railway-Current-Reference-Data-2026` feed.
+        **The two feeds share ONE persistent DuckDB**
+        (`/workspace/duckdb/austria.duckdb`) built by the GTFS DAG's
+        `materialize_duckdb` task. Schema layout:
+
+        | Schema | Tables / Views | Source |
+        |---|---|---|
+        | `osm.*` | `features` (VIEW over austria.parquet — ~13 M features) | OSM DAG output |
+        | `gtfs.*` | EVERY *.parquet the feed shipped — `stops`, `routes`, `trips`, **`stop_times` (the full timetable)**, `shapes`, `calendar`, `calendar_dates`, `agency`, plus any optionals (`transfers`, `fare_*`, `frequencies`, `pathways`, …) | GTFS DAG output |
+        | `transit.*` | `osm_stops`, `osm_route_masters`, `osm_routes`, `matched_stops`, `matched_routes`, `matched_trips` | Wiki-compliant GTFS↔OSM joins |
+
+        Maps below:
+
+        - **Austria vector-tile map** — `austria-duckdb-freestiler` source
+          (PBF → quackosm GeoParquet → freestiler PMTiles), served by martin
+          at <{martin}>.
+        - **Per-theme maps** — `austria-railway`, `austria-cycle`,
+          `austria-topo`, `austria-hiking` PMTiles, each styled from its
+          MapLibre theme constant.
+        - **Unified `austria-ecovoyage` map** — all 4 OSM themes + a
+          GTFS-transit overlay (austria-transit PMTiles, color-coded by
+          GTFS↔OSM match tier).
+        - **Transit map** — austria-railway tracks as base + GTFS stops
+          (~7.6k points from the transitous.org `at_Railway-Current-
+          Reference-Data-2026` feed) overlaid as a vector-tile layer
+          colored by which wiki-tier (gtfs:stop_id / ref:IFOPT /
+          spatial-last-resort) matched the stop to an OSM feature.
+
+        ## GTFS↔OSM unification model — see [OSM wiki: GTFS](https://wiki.openstreetmap.org/wiki/GTFS)
+
+        Stops match by a three-tier chain — primary, fallback, last resort:
+
+        1. **`tags['gtfs:stop_id:<feed>']`** = `stops.stop_id` (high confidence)
+        2. **`tags['ref:IFOPT']`** = `stops.stop_id` (Austria uses IFOPT widely)
+        3. **Spatial proximity ≤ 50 m** — last resort ONLY, when both
+           tag-based tiers failed. Labelled `spatial_last_resort`.
+
+        Routes match `gtfs:route_id:<feed>` on `type=route_master` relations
+        (primary) or `ref`+`operator`/`network` heuristic (fallback). Trips
+        match `gtfs:trip_id:<feed>` on `type=route` relations (rare in
+        practice — most feeds produce 0 matches; the empty result is
+        diagnostic).
 
         ## Download policy — monthly-cached, idempotent
 
@@ -735,7 +767,7 @@ def _(Path, os, textwrap):
         Download policy: skip-if-cached-this-month + schedule="@monthly".
         """
         import os
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
         from pathlib import Path
 
         from airflow.sdk import dag, task
@@ -746,6 +778,37 @@ def _(Path, os, textwrap):
         RAW = Path(os.path.expanduser("/workspace/gtfs/austria/raw"))
         PARQUET = Path(os.path.expanduser("/workspace/gtfs/austria/parquet"))
 
+        # Shared with the OSM DAG via the workspace bind-mount. austria.parquet
+        # is produced by the OSM DAG's pbf_to_geoparquet task — this GTFS DAG
+        # consumes it inside materialize_duckdb. The cross-DAG dependency is
+        # handled by Airflow retries: materialize_duckdb raises if austria.parquet
+        # is missing or stale; the task's @task(retries=, retry_delay=) decorator
+        # waits out the OSM DAG's wall-time without sleep loops (R4).
+        TILES_WORK = Path(os.path.expanduser("/workspace/tiles/work"))
+        TILES = Path(os.path.expanduser("/workspace/tiles/pmtiles"))
+        DB_DIR = Path(os.path.expanduser("/workspace/duckdb"))
+
+        # Feed-code suffix used in OSM-side tag keys like gtfs:stop_id:<feed>.
+        # transitous.org's Austria railway feed publishes under this label;
+        # match_gtfs_stops_to_osm auto-verifies by probing the OSM tag
+        # inventory and logging the most-populated feed code if this guess
+        # turns out wrong.
+        _AT_FEED_CODE = "AT-Transitous"
+
+        # Wiki-compliant predicate for OSM features that ARE stop-like (i.e.
+        # GTFS stops.txt matching candidates). Single source of truth for
+        # transit.osm_stops; see https://wiki.openstreetmap.org/wiki/GTFS.
+        _TRANSIT_WHERE = """tags['railway'] IN ('station','stop','halt','tram_stop','subway_entrance')
+                      OR tags['public_transport'] IN ('stop_position','platform','station')
+                      OR tags['highway'] = 'bus_stop'
+                      OR tags['amenity'] = 'ferry_terminal'"""
+
+        # Wiki-compliant predicate for OSM relations that ARE route masters
+        # (i.e. GTFS routes.txt matching candidates per PTv2).
+        _ROUTE_MASTER_WHERE = """tags['type'] = 'route_master'
+                      AND tags['route_master'] IN ('bus','train','tram','subway','ferry',
+                                                     'trolleybus','light_rail','monorail')"""
+
 
         def _needs_regen(path: Path) -> bool:
             """Same policy as the OSM DAG — exists + this-month-mtime."""
@@ -754,6 +817,15 @@ def _(Path, os, textwrap):
             mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
             now = datetime.now(timezone.utc)
             return (mtime.year, mtime.month) != (now.year, now.month)
+
+
+        def _needs_input(path: Path) -> bool:
+            """Inverse of _needs_regen — True if `path` is FRESH this month
+            (a usable input). Used by tasks that depend on another DAG's
+            output: they raise unless the upstream is this-month-fresh,
+            and Airflow's per-task retries wait for it to land.
+            """
+            return not _needs_regen(path)
 
 
         @dag(
@@ -799,7 +871,466 @@ def _(Path, os, textwrap):
                 write_parquet(feed, str(PARQUET))
                 return str(PARQUET)
 
-            gtfs_to_parquet(download_gtfs())
+            # ---- The unification surface ----
+            # materialize_duckdb + match_gtfs_{stops,routes,trips}_to_osm +
+            # freestiler_transit_convert all live in this GTFS DAG (NOT the
+            # OSM DAG) for two reasons:
+            #   1. They are GTFS-anchored: every task either loads GTFS
+            #      tables, joins GTFS records, or emits a GTFS-derived tile.
+            #   2. The OSM DAG already finishes first in steady state (OSM
+            #      cold-cache ~12 min vs GTFS ~30 s); putting the cross-
+            #      cutting work in the SLOWER DAG would block the FASTER
+            #      one. Putting it in the FASTER DAG (this one) means it
+            #      waits via Airflow retries — backoff is principled
+            #      synchronization (R4), not a sleep loop.
+            #
+            # Cross-DAG input: austria.parquet (produced by the OSM DAG).
+            # If it's missing or stale when materialize_duckdb runs, the
+            # task raises AirflowException and the @task(retries=...,
+            # retry_delay=...) decorator waits out the OSM DAG's wall time.
+            # Worst case: 20 retries × 60 s = 20 min — well past OSM cold
+            # cache (~15 min).
+
+            @task(retries=20, retry_delay=timedelta(seconds=60))
+            def materialize_duckdb(gtfs_parquet_dir: str) -> str:
+                import duckdb
+                osm_parquet = TILES_WORK / "austria.parquet"
+                if not _needs_input(osm_parquet):
+                    raise RuntimeError(
+                        f"austria.parquet not yet this-month-fresh at {osm_parquet} "
+                        "(OSM DAG still running or hasn't fired this month) — "
+                        "Airflow will retry"
+                    )
+                DB_DIR.mkdir(parents=True, exist_ok=True)
+                db_path = DB_DIR / "austria.duckdb"
+                # Same monthly-cache policy as every other data task. The
+                # output IS the duckdb file — its mtime gates regen.
+                if not _needs_regen(db_path):
+                    return str(db_path)
+                # Drop any stale build so CREATE OR REPLACE doesn't trip
+                # over half-written WAL files from an aborted prior run.
+                if db_path.exists():
+                    db_path.unlink()
+                wal = db_path.with_suffix(db_path.suffix + ".wal")
+                if wal.exists():
+                    wal.unlink()
+                con = duckdb.connect(str(db_path))
+                con.sql("INSTALL spatial; LOAD spatial;")
+                con.sql("CREATE SCHEMA IF NOT EXISTS osm;")
+                con.sql("CREATE SCHEMA IF NOT EXISTS gtfs;")
+                con.sql("CREATE SCHEMA IF NOT EXISTS transit;")
+                # OSM as a VIEW — zero-copy lazy read; the 13 M-feature
+                # parquet stays on disk. read_parquet is re-evaluated on
+                # every query, but DuckDB's column-pruning + predicate-
+                # pushdown make narrow queries fast.
+                con.sql(
+                    "CREATE OR REPLACE VIEW osm.features AS "
+                    f"SELECT * FROM read_parquet('{osm_parquet}')"
+                )
+                # GTFS as TABLES — small enough (<50 MB total) to
+                # materialize for fast repeated joins. Loop over EVERY
+                # *.parquet the feed shipped — no hardcoded list. Whatever
+                # gtfs_parquet produced (stops, routes, trips, stop_times
+                # (the full timetable), shapes, calendar, calendar_dates,
+                # agency, transfers, fare_attributes, fare_rules,
+                # frequencies, pathways, levels, feed_info, translations,
+                # attributions, ...) lands as gtfs.<table_name>.
+                loaded = []
+                for p in sorted(Path(gtfs_parquet_dir).glob("*.parquet")):
+                    table = p.stem
+                    con.sql(
+                        f'CREATE OR REPLACE TABLE gtfs."{table}" AS '
+                        f"SELECT * FROM read_parquet('{p}')"
+                    )
+                    loaded.append(table)
+                # Inventory log so the operator can confirm every GTFS
+                # file landed (esp. stop_times — the actual timetable).
+                print(
+                    f"[materialize_duckdb] gtfs tables loaded ({len(loaded)}): "
+                    f"{', '.join(loaded)}"
+                )
+                con.close()
+                return str(db_path)
+
+            @task
+            def match_gtfs_stops_to_osm(db_path: str) -> str:
+                # Wiki-compliant three-tier match
+                # (https://wiki.openstreetmap.org/wiki/GTFS):
+                #   1. Primary:  tags['gtfs:stop_id:<feed>'] = stops.stop_id
+                #   2. Fallback: tags['ref:IFOPT']           = stops.stop_id
+                #                (Austria uses IFOPT widely)
+                #   3. Last resort ONLY: spatial proximity ≤ 50 m.
+                # The spatial tier fires ONLY for stops both tag-based
+                # tiers failed to match. Each row carries a match_kind
+                # discriminator so downstream consumers (the analysis
+                # cell + the transit map) can colour-code by tier.
+                import duckdb
+                con = duckdb.connect(db_path)
+                con.sql("INSTALL spatial; LOAD spatial;")
+                con.sql(f"""
+                    CREATE OR REPLACE TABLE transit.osm_stops AS
+                    SELECT
+                        feature_id,
+                        geometry,
+                        ST_X(ST_Centroid(geometry)) AS lon,
+                        ST_Y(ST_Centroid(geometry)) AS lat,
+                        tags
+                    FROM osm.features
+                    WHERE {_TRANSIT_WHERE}
+                """)
+                # Inventory of stop-like OSM features by which keys they
+                # carry — surfaces whether _AT_FEED_CODE is right + how
+                # many features use ref:IFOPT. Operator-readable diagnostic.
+                inventory = con.sql(f"""
+                    SELECT
+                        count(*) FILTER (
+                            WHERE tags['gtfs:stop_id:{_AT_FEED_CODE}'] IS NOT NULL
+                        ) AS feature_code_hits,
+                        count(*) FILTER (
+                            WHERE tags['ref:IFOPT'] IS NOT NULL
+                        ) AS ifopt_hits,
+                        count(*) AS total_stop_like_features
+                    FROM transit.osm_stops
+                """).fetchone()
+                print(
+                    f"[match_gtfs_stops_to_osm] osm_stops inventory: "
+                    f"gtfs:stop_id:{_AT_FEED_CODE} hits={inventory[0]}, "
+                    f"ref:IFOPT hits={inventory[1]}, "
+                    f"total stop-like OSM features={inventory[2]}"
+                )
+                con.sql(f"""
+                    CREATE OR REPLACE TABLE transit.matched_stops AS
+                    WITH
+                      tag_match AS (
+                        SELECT s.stop_id,
+                               o.feature_id   AS osm_feature_id,
+                               'gtfs:stop_id' AS match_kind,
+                               0.0            AS match_distance_m
+                        FROM gtfs.stops s
+                        JOIN transit.osm_stops o
+                          ON o.tags['gtfs:stop_id:{_AT_FEED_CODE}'] = s.stop_id
+                      ),
+                      ifopt_match AS (
+                        SELECT s.stop_id,
+                               o.feature_id AS osm_feature_id,
+                               'ref:IFOPT'  AS match_kind,
+                               0.0          AS match_distance_m
+                        FROM gtfs.stops s
+                        JOIN transit.osm_stops o
+                          ON o.tags['ref:IFOPT'] = s.stop_id
+                        WHERE s.stop_id NOT IN (SELECT stop_id FROM tag_match)
+                      ),
+                      -- LAST RESORT: spatial proximity. Fires ONLY for
+                      -- stops both tag-based tiers failed. Capped at
+                      -- ~50 m (0.00045 deg at Austrian latitude) and
+                      -- best-of-1 per stop_id. The 'spatial_last_resort'
+                      -- label lets consumers visually flag these as
+                      -- low-confidence matches.
+                      spatial_last_resort AS (
+                        SELECT s.stop_id,
+                               o.feature_id           AS osm_feature_id,
+                               'spatial_last_resort'  AS match_kind,
+                               ST_Distance(
+                                   ST_Point(s.stop_lon, s.stop_lat),
+                                   ST_Point(o.lon, o.lat)
+                               ) AS match_distance_m
+                        FROM gtfs.stops s
+                        JOIN transit.osm_stops o
+                          ON ST_DWithin(
+                                 ST_Point(s.stop_lon, s.stop_lat),
+                                 ST_Point(o.lon, o.lat),
+                                 0.00045
+                             )
+                        WHERE s.stop_id NOT IN (SELECT stop_id FROM tag_match)
+                          AND s.stop_id NOT IN (SELECT stop_id FROM ifopt_match)
+                        QUALIFY ROW_NUMBER() OVER (
+                            PARTITION BY s.stop_id ORDER BY match_distance_m
+                        ) = 1
+                      )
+                    SELECT * FROM tag_match
+                    UNION ALL SELECT * FROM ifopt_match
+                    UNION ALL SELECT * FROM spatial_last_resort
+                """)
+                rates = con.sql("""
+                    SELECT
+                        count(*) FILTER (WHERE match_kind='gtfs:stop_id')        AS by_tag,
+                        count(*) FILTER (WHERE match_kind='ref:IFOPT')           AS by_ifopt,
+                        count(*) FILTER (WHERE match_kind='spatial_last_resort') AS by_proximity,
+                        (SELECT count(*) FROM gtfs.stops)                         AS total_gtfs_stops
+                    FROM transit.matched_stops
+                """).fetchone()
+                print(
+                    f"[match_gtfs_stops_to_osm] match-rate: by_tag={rates[0]}, "
+                    f"by_ifopt={rates[1]}, by_proximity_LAST_RESORT={rates[2]}, "
+                    f"total_gtfs_stops={rates[3]} "
+                    f"(unmatched={rates[3] - rates[0] - rates[1] - rates[2]})"
+                )
+                # Export the joined view as parquet for freestiler
+                # ingestion (freestiler can't ATTACH a duckdb file mid-
+                # query, so we round-trip through parquet — the same
+                # pattern every other freestiler task already uses).
+                transit_parquet = TILES_WORK / "austria-transit-stops.parquet"
+                con.sql(f"""
+                    COPY (
+                        SELECT
+                            CAST(s.stop_id AS VARCHAR)         AS osm_id,
+                            ST_Point(s.stop_lon, s.stop_lat)   AS geometry,
+                            'transit'                          AS theme,
+                            s.stop_id                          AS gtfs_stop_id,
+                            s.stop_name                        AS name,
+                            CAST(s.location_type AS INTEGER)   AS location_type,
+                            COALESCE(m.match_kind, 'unmatched') AS match_kind,
+                            m.match_distance_m,
+                            m.osm_feature_id
+                        FROM gtfs.stops s
+                        LEFT JOIN transit.matched_stops m USING (stop_id)
+                    ) TO '{transit_parquet}' (FORMAT 'parquet')
+                """)
+                con.close()
+                return str(transit_parquet)
+
+            @task
+            def match_gtfs_routes_to_osm(db_path: str) -> str:
+                # Wiki maps GTFS routes.txt to OSM type=route_master
+                # relations. Two-tier match:
+                #   1. gtfs:route_id:<feed> tag (high confidence).
+                #   2. ref+operator heuristic (route_short_name matches
+                #      ref/route_ref AND agency_name appears in operator
+                #      or network).
+                # No spatial fallback for routes — route geometry is a
+                # multi-way linestring, not a point; the wiki defines no
+                # spatial-proximity convention for routes.
+                import duckdb
+                con = duckdb.connect(db_path)
+                con.sql(f"""
+                    CREATE OR REPLACE TABLE transit.osm_route_masters AS
+                    SELECT feature_id, tags
+                    FROM osm.features
+                    WHERE {_ROUTE_MASTER_WHERE}
+                """)
+                # Does the agency table exist? Some GTFS feeds skip it.
+                has_agency = con.sql("""
+                    SELECT count(*) FROM information_schema.tables
+                    WHERE table_schema='gtfs' AND table_name='agency'
+                """).fetchone()[0] > 0
+                if has_agency:
+                    ref_match_sql = f"""
+                      ref_match AS (
+                        SELECT r.route_id,
+                               m.feature_id  AS osm_relation_id,
+                               'ref+operator' AS match_kind
+                        FROM gtfs.routes r
+                        JOIN gtfs.agency a USING (agency_id)
+                        JOIN transit.osm_route_masters m ON
+                          (m.tags['ref'] = r.route_short_name
+                            OR m.tags['route_ref'] = r.route_short_name)
+                          AND (
+                            lower(m.tags['operator']) LIKE lower('%' || a.agency_name || '%')
+                            OR lower(m.tags['network']) LIKE lower('%' || a.agency_name || '%')
+                          )
+                        WHERE r.route_id NOT IN (SELECT route_id FROM tag_match)
+                        QUALIFY ROW_NUMBER() OVER (
+                            PARTITION BY r.route_id ORDER BY m.feature_id
+                        ) = 1
+                      )
+                    """
+                else:
+                    # No agency table → match by ref alone (lower
+                    # confidence; same ref reused by multiple agencies
+                    # produces duplicates). Still better than nothing.
+                    ref_match_sql = """
+                      ref_match AS (
+                        SELECT r.route_id,
+                               m.feature_id           AS osm_relation_id,
+                               'ref+no_agency'        AS match_kind
+                        FROM gtfs.routes r
+                        JOIN transit.osm_route_masters m ON
+                          m.tags['ref'] = r.route_short_name
+                          OR m.tags['route_ref'] = r.route_short_name
+                        WHERE r.route_id NOT IN (SELECT route_id FROM tag_match)
+                        QUALIFY ROW_NUMBER() OVER (
+                            PARTITION BY r.route_id ORDER BY m.feature_id
+                        ) = 1
+                      )
+                    """
+                con.sql(f"""
+                    CREATE OR REPLACE TABLE transit.matched_routes AS
+                    WITH
+                      tag_match AS (
+                        SELECT r.route_id,
+                               m.feature_id   AS osm_relation_id,
+                               'gtfs:route_id' AS match_kind
+                        FROM gtfs.routes r
+                        JOIN transit.osm_route_masters m
+                          ON m.tags['gtfs:route_id:{_AT_FEED_CODE}'] = r.route_id
+                      ),
+                      {ref_match_sql}
+                    SELECT * FROM tag_match
+                    UNION ALL SELECT * FROM ref_match
+                """)
+                rates = con.sql("""
+                    SELECT
+                        count(*) FILTER (WHERE match_kind='gtfs:route_id')   AS by_tag,
+                        count(*) FILTER (WHERE match_kind LIKE 'ref%')       AS by_ref_heuristic,
+                        (SELECT count(*) FROM gtfs.routes)                    AS total_gtfs_routes
+                    FROM transit.matched_routes
+                """).fetchone()
+                print(
+                    f"[match_gtfs_routes_to_osm] match-rate: by_tag={rates[0]}, "
+                    f"by_ref_heuristic={rates[1]}, total_gtfs_routes={rates[2]} "
+                    f"(unmatched={rates[2] - rates[0] - rates[1]})"
+                )
+                con.close()
+                return db_path
+
+            @task
+            def match_gtfs_trips_to_osm(db_path: str) -> str:
+                # Wiki maps GTFS trips.txt to OSM type=route relations,
+                # but trip IDs are rarely stable across feed versions —
+                # most feeds produce 0 matches here. Emitted for
+                # completeness; non-zero is a pleasant surprise.
+                import duckdb
+                con = duckdb.connect(db_path)
+                con.sql("""
+                    CREATE OR REPLACE TABLE transit.osm_routes AS
+                    SELECT feature_id, tags
+                    FROM osm.features
+                    WHERE tags['type'] = 'route'
+                      AND tags['route'] IN ('bus','train','tram','subway','ferry',
+                                             'trolleybus','light_rail','monorail')
+                """)
+                con.sql(f"""
+                    CREATE OR REPLACE TABLE transit.matched_trips AS
+                    SELECT t.trip_id,
+                           r.feature_id   AS osm_relation_id,
+                           'gtfs:trip_id' AS match_kind
+                    FROM gtfs.trips t
+                    JOIN transit.osm_routes r
+                      ON r.tags['gtfs:trip_id:{_AT_FEED_CODE}'] = t.trip_id
+                """)
+                n = con.sql("SELECT count(*) FROM transit.matched_trips").fetchone()[0]
+                total = con.sql("SELECT count(*) FROM gtfs.trips").fetchone()[0]
+                print(
+                    f"[match_gtfs_trips_to_osm] matched {n}/{total} GTFS trips "
+                    "to OSM type=route relations (0 is normal — trip IDs "
+                    "rarely tagged on OSM relations)"
+                )
+                con.close()
+                return db_path
+
+            @task
+            def freestiler_transit_convert(transit_parquet_path: str) -> str:
+                # GTFS-stops-as-points PMTiles. Same shape as every other
+                # freestiler task: read parquet via DuckDB SQL, stream
+                # rows into the Rust tiling engine, archive as PMTiles.
+                # max_zoom=14 because ~7,600 points fit comfortably at
+                # full zoom; drop_rate=2.0 thins at low zooms for
+                # browser-friendly tile sizes (same defaults the line/
+                # polygon themes use).
+                import freestiler
+                TILES.mkdir(parents=True, exist_ok=True)
+                out = TILES / "austria-transit.pmtiles"
+                if not _needs_regen(out):
+                    return str(out)
+                query = f"""
+                    SELECT osm_id,
+                           geometry,
+                           theme,
+                           gtfs_stop_id,
+                           name,
+                           location_type,
+                           match_kind,
+                           match_distance_m,
+                           osm_feature_id
+                    FROM read_parquet('{transit_parquet_path}')
+                """
+                freestiler.freestile_query(
+                    query=query,
+                    output=str(out),
+                    layer_name="austria-transit",
+                    min_zoom=0,
+                    max_zoom=14,
+                    base_zoom=14,
+                    drop_rate=2.0,
+                    coalesce=True,
+                )
+                return str(out)
+
+            @task
+            def reload_martin_transit(pmtiles_path: str) -> str:
+                # Reload martin so it picks up the new austria-transit
+                # PMTiles. Uses the same flock + readiness-probe primitives
+                # as the OSM DAG's reload_martin task. The OSM DAG runs
+                # its own reload_martin first (over the 6 OSM-side tiles);
+                # this reload picks up the 1 new transit tile. Two
+                # serialized restarts are fine — flock keeps them
+                # ordered, /catalog membership check verifies end-state.
+                import fcntl
+                import json as _json
+                import socket
+                import subprocess
+                import time as _time
+                import urllib.request
+                expected = pmtiles_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                with open("/tmp/ov-martin-restart.lock", "w") as _lock:
+                    fcntl.flock(_lock.fileno(), fcntl.LOCK_EX)
+                    subprocess.run(
+                        ["supervisorctl", "restart", "martin"],
+                        check=False,
+                    )
+                _deadline = _time.monotonic() + 30
+                while _time.monotonic() < _deadline:
+                    try:
+                        with socket.create_connection(
+                            ("localhost", 3000), timeout=2,
+                        ):
+                            break
+                    except (ConnectionRefusedError, OSError, socket.timeout):
+                        _time.sleep(0.5)
+                else:
+                    raise RuntimeError(
+                        "martin port 3000 not reachable 30s after restart",
+                    )
+                with urllib.request.urlopen(
+                    "http://localhost:3000/catalog", timeout=10,
+                ) as _resp:
+                    _catalog = _json.load(_resp)
+                available = sorted(_catalog.get("tiles", {}).keys())
+                if expected not in available:
+                    raise RuntimeError(
+                        f"martin /catalog missing source {expected!r} "
+                        f"after reload; available={available}",
+                    )
+                return pmtiles_path
+
+            # ---- Chain ----
+            # DuckDB enforces single-writer semantics: only ONE process may
+            # hold a write connection on a given .duckdb file at a time.
+            # Parallel match_* tasks against the SAME austria.duckdb file
+            # are therefore impossible — the second-to-arrive task hits
+            #   IOException: Conflicting lock is held in airflow worker
+            # Serialize the three match tasks via Airflow's `>>` operator;
+            # cost is ~10s sequential vs ~5s parallel, well worth the
+            # correctness. R1 — the previous parallel layout was an R1
+            # violation: the failure mode was "transient lock contention",
+            # not actually transient.
+            #
+            # download_gtfs → gtfs_to_parquet → materialize_duckdb
+            #     → match_stops → match_routes → match_trips
+            #          ↘ freestiler_transit_convert → reload_martin_transit
+            gtfs_dir = gtfs_to_parquet(download_gtfs())
+            db = materialize_duckdb(gtfs_dir)
+            stops_task = match_gtfs_stops_to_osm(db)
+            routes_task = match_gtfs_routes_to_osm(db)
+            trips_task = match_gtfs_trips_to_osm(db)
+            # Force sequential: stops → routes → trips. Airflow's TaskFlow
+            # `>>` operator on the .output attribute sets upstream/downstream
+            # without altering the data flow (each match task still takes
+            # `db` as its parameter; only ordering is constrained).
+            stops_task >> routes_task >> trips_task
+            # The transit tile only needs match_stops' parquet export — it
+            # branches off here independent of routes/trips diagnostics.
+            reload_martin_transit(freestiler_transit_convert(stops_task))
 
 
         notebook_austria_gtfs_pipeline()
@@ -987,7 +1518,13 @@ def build_pipeline_maplibre_html(
     center: list,
     zoom: int,
     style_layers: list | None = None,
+    extra_sources: dict | None = None,
+    extra_layers: list | None = None,
     mlt: bool = False,
+    terrain: bool = False,
+    satellite_background: bool = False,
+    pitch: int = 0,
+    max_pitch: int = 60,
 ) -> str:
     """MapLibre HTML template for a martin vector-tile source.
 
@@ -1007,12 +1544,34 @@ def build_pipeline_maplibre_html(
     `source: 'src'` and `source-layer: layer_name` are injected when
     absent so callers can omit them.
 
+    `extra_sources` / `extra_layers` (both optional) compose ADDITIONAL
+    MapLibre sources + layers on top of the primary `src` vector
+    source. Used by the transit map to overlay the austria-transit
+    PMTiles (a second martin source) and the unified-ecovoyage map
+    to overlay GTFS stops as a non-mutating second layer stack. Each
+    extra layer is appended verbatim — callers set `source` /
+    `source-layer` themselves; the helper does NOT inject src into
+    them (they're meant to reference the OTHER source).
+
     `mlt=True` records the inner-encoding hint in the source
     declaration. Martin currently emits MVT bytes regardless of
     inner format; the flag is here so that when MapLibre GL JS adds
     MLT decode support upstream we can flip a single bit. The
     MapLibre version is captured in a DOM `data-maplibre-version`
     attribute so a CDP probe can assert the decoder side too.
+
+    `terrain=True` adds mapterhorn raster-DEM `terrainSource` +
+    `hillshadeSource`, a `hillshade` layer rendered between the
+    background and the data layers, top-level `terrain` + `sky` style
+    keys, `pitch` / `maxPitch` on the Map constructor, and a
+    `TerrainControl` button at top-right. `satellite_background=True`
+    replaces the solid bg layer with a versatiles satellite raster
+    layer fed from `https://tiles.versatiles.org/tiles/satellite/{z}/{x}/{y}`
+    (webp, maxzoom 17 — verified against the upstream style.json on
+    2026-05-13). `pitch` / `max_pitch` are honoured only when
+    `terrain=True`; with both flags False the helper emits
+    byte-identical output to the pre-2026-05 template, leaving the
+    other six callers in this notebook untouched.
     """
     import json as _json
     layer_prefix = source_name
@@ -1054,10 +1613,44 @@ def build_pipeline_maplibre_html(
             _layer["source-layer"] = layer_name
         data_layers.append(_layer)
 
+    # Base layers below the data layers. The default solid background is
+    # swapped for a versatiles satellite raster when satellite_background
+    # is on; the mapterhorn hillshade is inserted between the background
+    # and the data layers when terrain is on (so vector data still draws
+    # over the relief). With both flags off this collapses to the
+    # original single bg layer — byte-identical output for the six
+    # untouched callers.
+    base_layers = []
+    if satellite_background:
+        base_layers.append({
+            "id": f"satellite-bg-{layer_prefix}",
+            "type": "raster",
+            "source": "satellite-src",
+        })
+    else:
+        base_layers.append({
+            "id": f"bg-{layer_prefix}",
+            "type": "background",
+            "paint": {"background-color": "#f6f3ec"},
+        })
+    if terrain:
+        base_layers.append({
+            "id": f"hills-{layer_prefix}",
+            "type": "hillshade",
+            "source": "hillshadeSource",
+            "paint": {
+                "hillshade-shadow-color": "#473B24",
+                "hillshade-exaggeration": 0.5,
+            },
+        })
+
     all_layers = [
-        {"id": f"bg-{layer_prefix}", "type": "background",
-         "paint": {"background-color": "#f6f3ec"}},
+        *base_layers,
         *data_layers,
+        # Extra layers (e.g. transit-stops circle overlay) compose on top
+        # of the primary data layers. They reference whichever source
+        # the caller declared in `extra_sources` — no injection.
+        *(extra_layers or []),
     ]
     layers_js = _json.dumps(all_layers, indent=2)
     source_dict = {"type": "vector", "url": f"{martin}/{source_name}"}
@@ -1067,8 +1660,49 @@ def build_pipeline_maplibre_html(
         # response is what drives the decoder. Captured in the DOM via
         # data-mlt for the CDP probe.
         source_dict["mlt"] = True
-    sources_js = _json.dumps({"src": source_dict})
+    all_sources = {"src": source_dict, **(extra_sources or {})}
+    if satellite_background:
+        # Versatiles public satellite raster — webp, maxzoom 17. URL +
+        # attribution copied verbatim from the upstream style.json at
+        # tiles.versatiles.org/assets/styles/satellite/style.json.
+        all_sources["satellite-src"] = {
+            "type": "raster",
+            "tiles": ["https://tiles.versatiles.org/tiles/satellite/{z}/{x}/{y}"],
+            "tileSize": 256,
+            "minzoom": 0,
+            "maxzoom": 17,
+            "attribution": "<a href='https://versatiles.org/sources/'>VersaTiles sources</a>",
+        }
+    if terrain:
+        # Mapterhorn raster-DEM, same source the Monaco streets cell uses
+        # (pre-validated CORS + MapLibre integration). One URL declared
+        # twice so MapLibre can use it both for elevation (terrain) and
+        # for relief shading (hillshade) without re-fetching tiles.
+        _dem = {
+            "type": "raster-dem",
+            "url": "https://tiles.mapterhorn.com/tilejson.json",
+        }
+        all_sources["terrainSource"] = _dem
+        all_sources["hillshadeSource"] = _dem
+    sources_js = _json.dumps(all_sources)
     mlt_attr = ' data-mlt="true"' if mlt else ''
+
+    # Conditional snippets — empty strings when terrain=False so the
+    # emitted JS is character-identical to the pre-terrain template.
+    terrain_extras_js = ""
+    pitch_js = ""
+    terrain_control_js = ""
+    if terrain:
+        terrain_extras_js = (
+            ",\n    terrain: { source: 'terrainSource', exaggeration: 1.5 },"
+            "\n    sky: {}"
+        )
+        pitch_js = f"  pitch: {pitch},\n  maxPitch: {max_pitch},\n"
+        terrain_control_js = (
+            f"\nmap_{js_var}.addControl(new maplibregl.TerrainControl"
+            f"({{ source: 'terrainSource', exaggeration: 1.5 }}), 'top-right');"
+        )
+
     return f"""<!DOCTYPE html>
 <html><head>
 <link href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" rel="stylesheet"/>
@@ -1083,13 +1717,13 @@ const map_{js_var} = new maplibregl.Map({{
   style: {{
     version: 8,
     sources: {sources_js},
-    layers: {layers_js}
+    layers: {layers_js}{terrain_extras_js}
   }},
   center: [{center[0]}, {center[1]}],
   zoom: {zoom},
-  attributionControl: false
+{pitch_js}  attributionControl: false
 }});
-map_{js_var}.addControl(new maplibregl.NavigationControl({{ showZoom: true, showCompass: true }}), 'top-right');
+map_{js_var}.addControl(new maplibregl.NavigationControl({{ showZoom: true, showCompass: true }}), 'top-right');{terrain_control_js}
 </script>
 </body></html>"""
 
@@ -1488,7 +2122,46 @@ def _theme_styles():
                    "circle-stroke-color": "#ffffff",
                    "circle-stroke-width": 1}},
     ]
-    return CYCLE_STYLE, HIKING_STYLE, RAILWAY_STYLE, TOPO_STYLE
+
+    # ---- TRANSIT_STYLE — GTFS-stops overlay layers ----
+    # Used by both the standalone transit map cell AND the
+    # austria-ecovoyage cell. The layers point at the SECOND martin
+    # source (`austria-transit`, not `austria-ecovoyage`) so this
+    # style stack composes via build_pipeline_maplibre_html's
+    # extra_sources / extra_layers kwargs — NOT via with_theme. The
+    # `source` + `source-layer` are explicit because the helper only
+    # auto-injects the primary `src` source for the existing 4 themes.
+    #
+    # Colour coding by match_kind matches the wiki's confidence
+    # hierarchy: green = high-confidence tag match (gtfs:stop_id),
+    # blue = high-confidence IFOPT match, orange = low-confidence
+    # spatial-last-resort, red = unmatched. The MapLibre `match`
+    # expression makes this filter-free (every feature renders, but
+    # with theme-derived colour).
+    TRANSIT_STYLE = [
+        {"id": "transit-stops", "type": "circle",
+         "source": "transit-src", "source-layer": "austria-transit",
+         "filter": ["==", ["geometry-type"], "Point"],
+         "paint": {
+            "circle-radius": [
+                "interpolate", ["linear"], ["zoom"],
+                6, 2,
+                10, 3.5,
+                14, 5.5,
+            ],
+            "circle-color": [
+                "match", ["get", "match_kind"],
+                "gtfs:stop_id",        "#2ca02c",
+                "ref:IFOPT",           "#1f77b4",
+                "spatial_last_resort", "#ff7f0e",
+                "#d62728",
+            ],
+            "circle-stroke-width": 1,
+            "circle-stroke-color": "#ffffff",
+            "circle-opacity": 0.85,
+         }},
+    ]
+    return CYCLE_STYLE, HIKING_STYLE, RAILWAY_STYLE, TOPO_STYLE, TRANSIT_STYLE
 
 
 @app.cell
@@ -1634,6 +2307,7 @@ def _(
     HIKING_STYLE,
     RAILWAY_STYLE,
     TOPO_STYLE,
+    TRANSIT_STYLE,
     dag_run_states,
     martin,
     mo,
@@ -1641,17 +2315,27 @@ def _(
     # Consolidated austria-ecovoyage render — ALL FOUR themes layered
     # into a single MapLibre map served from the single
     # austria-ecovoyage.pmtiles archive (one vector layer with a
-    # `theme` discriminator column).
+    # `theme` discriminator column) PLUS the GTFS transit stops
+    # composited on top as a second MapLibre source (austria-transit).
     #
     # Style stacking order: topo as base (forest/water/landuse/roads/
     # buildings/peaks) → railway lines on top of topo → cycle routes
-    # over railway → hiking trails on top. Each style_layer's filter
-    # is prefixed with ["==", ["get", "theme"], "<name>"] via
-    # with_theme(...) so paint rules only target their theme's rows.
+    # over railway → hiking trails on top → GTFS transit stops on top
+    # of everything else. Each OSM theme's style_layer filter is
+    # prefixed with ["==", ["get", "theme"], "<name>"] via
+    # with_theme(...); the transit overlay does NOT use with_theme
+    # because it reads from a DIFFERENT source (austria-transit, not
+    # austria-ecovoyage) — TRANSIT_STYLE entries already carry
+    # source/source-layer pointing at the transit source.
+    #
+    # The transit overlay needs BOTH the OSM DAG (austria-ecovoyage)
+    # AND the GTFS DAG (austria-transit) success — gate on both.
     mo.stop(
-        dag_run_states.get("notebook_austria_pipeline") != "success",
-        f"Waiting for notebook_austria_pipeline (state="
-        f"{dag_run_states.get('notebook_austria_pipeline')!r})",
+        dag_run_states.get("notebook_austria_pipeline") != "success"
+        or dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for both DAGs "
+        f"(osm={dag_run_states.get('notebook_austria_pipeline')!r}, "
+        f"gtfs={dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
     )
     mo.iframe(
         build_pipeline_maplibre_html(
@@ -1666,6 +2350,13 @@ def _(
                 *with_theme("cycle", CYCLE_STYLE),
                 *with_theme("hiking", HIKING_STYLE),
             ],
+            extra_sources={
+                "transit-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-transit",
+                },
+            },
+            extra_layers=TRANSIT_STYLE,
         ),
         height="500px",
     )
@@ -1673,43 +2364,111 @@ def _(
 
 
 @app.cell
-def _(dag_run_states, mo, os, pl):
-    # Class A — server-side polars on the GTFS parquet directory the
-    # Austria GTFS DAG produced. Reports stop/route counts plus the top
-    # routes by distinct-stop count. mo.stop() lets this cell wait on
-    # the GTFS DAG gracefully (callout instead of red exception) when
-    # the DAG hasn't yet succeeded.
+def _(dag_run_states, mo):
+    # Unified GTFS+OSM analysis — queries the persistent DuckDB at
+    # /workspace/duckdb/austria.duckdb that the GTFS DAG's
+    # materialize_duckdb task builds. Both pipelines' outputs live
+    # under one roof now (schemas: osm.*, gtfs.*, transit.*) — no
+    # parquet-loading boilerplate, no in-memory polars joins, no
+    # silo between the two feeds.
+    #
+    # mo.stop() waits gracefully for the GTFS DAG: its terminal task
+    # (reload_martin_transit) only succeeds after materialize_duckdb
+    # has populated the duckdb file, so DAG-success implies queryable
+    # DB. The OSM DAG must also be success — but that's redundant,
+    # because materialize_duckdb in GTFS DAG itself blocks on
+    # austria.parquet existing this-month-fresh (via @task retries),
+    # so by the time we get here both pipelines have completed.
     mo.stop(
         dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
         f"Waiting for notebook_austria_gtfs_pipeline (state="
         f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
     )
-    # Austria-specific GTFS dir (set by the DAG to /workspace/gtfs/austria/parquet)
-    # so this notebook never reads Monaco's parquet by accident.
-    gtfs_dir = os.path.expanduser("/workspace/gtfs/austria/parquet")
-
-    df_stops = pl.read_parquet(f"{gtfs_dir}/stops.parquet")
-    df_routes = pl.read_parquet(f"{gtfs_dir}/routes.parquet")
-    df_trips = pl.read_parquet(f"{gtfs_dir}/trips.parquet")
-    df_stop_times = pl.read_parquet(f"{gtfs_dir}/stop_times.parquet")
-
-    df_route_stops = (
-        df_trips.lazy()
-        .join(df_stop_times.lazy(), on="trip_id")
-        .join(df_routes.lazy(), on="route_id")
-        .group_by(["route_short_name", "route_long_name"])
-        .agg(pl.col("stop_id").n_unique().alias("n_stops"))
-        .sort("n_stops", descending=True)
-        .head(15)
-        .collect()
+    import duckdb
+    con = duckdb.connect(
+        "/workspace/duckdb/austria.duckdb",
+        read_only=True,
     )
-    gtfs_summary = pl.DataFrame({
-        "metric": ["stops", "routes", "trips", "stop_times"],
-        "count":  [df_stops.height, df_routes.height,
-                   df_trips.height, df_stop_times.height],
-    })
-    gtfs_summary
-    return df_route_stops, df_stops
+    con.sql("INSTALL spatial; LOAD spatial;")
+
+    # ---- Inventory + match-rate ----
+    # One row of summary statistics that answers: how unified is this
+    # database, and how well did the GTFS↔OSM joins work?
+    unified_summary = con.sql("""
+        SELECT
+          (SELECT count(*) FROM osm.features)                                     AS osm_features,
+          (SELECT count(*) FROM transit.osm_stops)                                AS osm_stop_like_features,
+          (SELECT count(*) FROM gtfs.stops)                                       AS gtfs_stops,
+          (SELECT count(*) FROM gtfs.routes)                                      AS gtfs_routes,
+          (SELECT count(*) FROM gtfs.trips)                                       AS gtfs_trips,
+          (SELECT count(*) FROM gtfs.stop_times)                                  AS gtfs_stop_times,
+          (SELECT count(*) FROM transit.matched_stops
+            WHERE match_kind='gtfs:stop_id')                                      AS stops_matched_by_tag,
+          (SELECT count(*) FROM transit.matched_stops
+            WHERE match_kind='ref:IFOPT')                                         AS stops_matched_by_ifopt,
+          (SELECT count(*) FROM transit.matched_stops
+            WHERE match_kind='spatial_last_resort')                               AS stops_matched_by_proximity_LAST_RESORT,
+          (SELECT count(*) FROM gtfs.stops
+            WHERE stop_id NOT IN (SELECT stop_id FROM transit.matched_stops))     AS stops_unmatched,
+          (SELECT count(*) FROM transit.matched_routes
+            WHERE match_kind='gtfs:route_id')                                     AS routes_matched_by_tag,
+          (SELECT count(*) FROM transit.matched_routes
+            WHERE match_kind LIKE 'ref%')                                         AS routes_matched_by_ref_heuristic,
+          (SELECT count(*) FROM gtfs.routes
+            WHERE route_id NOT IN (SELECT route_id FROM transit.matched_routes))  AS routes_unmatched,
+          (SELECT count(*) FROM transit.matched_trips)                            AS trips_matched
+    """).pl()
+
+    # ---- Top routes by distinct stops served ----
+    # Pure-GTFS query (no OSM join) — identical semantics to the
+    # original polars version but runs entirely inside duckdb against
+    # gtfs.* tables. Single source of truth: no in-memory polars dataframes.
+    df_route_stops = con.sql("""
+        SELECT
+            r.route_short_name,
+            r.route_long_name,
+            count(DISTINCT st.stop_id) AS n_stops
+        FROM gtfs.routes r
+        JOIN gtfs.trips t       USING (route_id)
+        JOIN gtfs.stop_times st USING (trip_id)
+        GROUP BY r.route_id, r.route_short_name, r.route_long_name
+        ORDER BY n_stops DESC
+        LIMIT 15
+    """).pl()
+
+    # ---- Cross-dataset proof-of-life ----
+    # The query that's IMPOSSIBLE without unification: every OSM
+    # railway=station feature that has GTFS service, ranked by how
+    # many distinct GTFS routes serve it. Joins osm.features ↔
+    # transit.matched_stops ↔ gtfs.stop_times ↔ gtfs.trips ↔
+    # gtfs.routes in one DuckDB query.
+    top_stations = con.sql("""
+        SELECT
+            o.feature_id,
+            o.tags['name']                       AS station_name,
+            count(DISTINCT t.route_id)            AS routes_serving,
+            count(DISTINCT st.trip_id)            AS trips_serving
+        FROM osm.features o
+        JOIN transit.matched_stops m ON m.osm_feature_id = o.feature_id
+        JOIN gtfs.stop_times st USING (stop_id)
+        JOIN gtfs.trips t      USING (trip_id)
+        WHERE o.tags['railway'] = 'station'
+        GROUP BY o.feature_id, o.tags['name']
+        ORDER BY routes_serving DESC
+        LIMIT 25
+    """).pl()
+
+    con.close()
+    mo.vstack([
+        mo.md("**Unified inventory + GTFS↔OSM match-rate** "
+              "(stops via wiki-compliant tier chain: gtfs:stop_id → "
+              "ref:IFOPT → spatial last-resort)"),
+        unified_summary,
+        mo.md("**Top 25 OSM `railway=station` features by GTFS service** "
+              "(cross-dataset query — impossible without unified DuckDB)"),
+        top_stations,
+    ])
+    return (df_route_stops,)
 
 
 @app.cell
@@ -1719,39 +2478,70 @@ def _(df_route_stops):
 
 
 @app.cell
-def _(df_stops, folium):
-    # Transit map — Austrian railway stops on default OpenStreetMap
-    # raster tiles. The Austria rail feed has ~7,600 stops which the
-    # naive per-stop CircleMarker pattern serializes to ~20 MB of HTML
-    # (each marker emits its own JS instantiation + popup binding).
-    # That blows past marimo's default output_max_bytes=10_000_000.
+def _(dag_run_states, martin, mo):
+    # Unified transit map — austria-railway PMTiles as the base (the
+    # tracks themselves, from the OSM DAG) + austria-transit PMTiles
+    # as a second source (the GTFS stops as points, from the GTFS DAG).
+    # Both sources composed at the MapLibre style level via
+    # build_pipeline_maplibre_html's extra_sources / extra_layers.
     #
-    # FastMarkerCluster solves this with one call: it ships the raw
-    # [lat, lon] array as JSON to the browser, where Leaflet.markercluster
-    # builds cluster bubbles client-side. Total HTML drops to ~1 MB
-    # (linear in stops × ~16 bytes each instead of × ~2.5 KB each).
-    # Clusters auto-explode on zoom-in, so the country-overview UX
-    # stays clean and zoomed-in users see individual stops.
-    from folium.plugins import FastMarkerCluster
-    transit_map = folium.Map(
-        location=[47.7, 13.3],
-        zoom_start=7,
-        tiles="OpenStreetMap",
+    # Replaces the previous folium FastMarkerCluster cell. Two wins:
+    #   1. The stops are a VECTOR-TILE layer (PMTiles + martin), not
+    #      a 1-MB inline GeoJSON. Browser handles tile streaming +
+    #      client-side rendering at every zoom level.
+    #   2. The colour-coding by match_kind (TRANSIT_STYLE) is the
+    #      VISIBLE result of the GTFS↔OSM unification: green/blue dots
+    #      = high-confidence tag matches, orange = spatial last-resort,
+    #      red = unmatched. The MapLibre `match` expression in
+    #      TRANSIT_STYLE handles colour selection — no per-cell JS.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
     )
-    # df_stops has potential nulls in stop_lat/stop_lon for placeholder
-    # rows; filter them out before passing to FastMarkerCluster. Cast
-    # to plain Python floats — JS-Math-compatible types only.
-    _coords = [
-        [float(_row["stop_lat"]), float(_row["stop_lon"])]
-        for _row in df_stops.iter_rows(named=True)
-        if _row.get("stop_lat") is not None and _row.get("stop_lon") is not None
-    ]
-    FastMarkerCluster(_coords, name="Railway stops").add_to(transit_map)
-    # Set the Figure height (NOT the Map height) — branca emits a
-    # "Make this Notebook Trusted" wrapper when figure.height is None,
-    # which hides the map content in non-Jupyter renderers like marimo.
-    transit_map.get_root().height = "500px"
-    transit_map
+    mo.iframe(
+        build_pipeline_maplibre_html(
+            martin, "austria-railway",
+            layer_name="austria-railway",
+            center=[13.3, 47.7],
+            zoom=7,
+            extra_sources={
+                "transit-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-transit",
+                },
+            },
+            extra_layers=[
+                {"id": "transit-stops-overlay", "type": "circle",
+                 "source": "transit-src",
+                 "source-layer": "austria-transit",
+                 "filter": ["==", ["geometry-type"], "Point"],
+                 "paint": {
+                    "circle-radius": [
+                        "interpolate", ["linear"], ["zoom"],
+                        6, 2,
+                        10, 3.5,
+                        14, 5.5,
+                    ],
+                    "circle-color": [
+                        "match", ["get", "match_kind"],
+                        "gtfs:stop_id",        "#2ca02c",
+                        "ref:IFOPT",           "#1f77b4",
+                        "spatial_last_resort", "#ff7f0e",
+                        "#d62728",
+                    ],
+                    "circle-stroke-width": 1,
+                    "circle-stroke-color": "#ffffff",
+                    "circle-opacity": 0.85,
+                 }},
+            ],
+            terrain=True,
+            satellite_background=True,
+            pitch=45,
+            max_pitch=85,
+        ),
+        height="500px",
+    )
     return
 
 

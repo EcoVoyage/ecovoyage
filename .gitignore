@@ -78,6 +78,7 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 .run-output*.ipynb
+.austria-*-export.ipynb
 
 # ov image build / eval scratch
 .build/
@@ -225,9 +226,11 @@ __marimo__/
 
 # Runtime artifacts written by the versa notebook + its self-authored DAGs.
 # AIRFLOW_DAGS_DIR=/workspace/dags writes self-authored DAG files into dags/.
-# The 6 DAGs produce tile outputs under tiles/ and GTFS parquet under gtfs/.
-# All recoverable by re-running the notebook against a fresh image.
+# The DAGs produce tile outputs under tiles/, GTFS parquet under gtfs/, and
+# the unified GTFS+OSM DuckDB file under duckdb/. All recoverable by re-
+# running the notebook against a fresh image.
 dags/
+duckdb/
 gtfs/
 tiles/
 
