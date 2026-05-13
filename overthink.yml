@@ -1,0 +1,117 @@
+version: 4
+
+include:
+  - '@github.com/overthinkos/overthink/overthink.yml:main'
+
+deploy:
+  versa/ecovoyage:
+    image: versa
+    target: pod
+    disposable: true
+    lifecycle: dev
+    tunnel:
+      provider: tailscale
+      private: all
+    port: [auto]
+    volume:
+      - name: workspace
+        type: bind
+
+    eval:
+      - id: ecovoyage-martin-host-tilejson
+        scope: deploy
+        http: 'http://127.0.0.1:${HOST_PORT:3000}/monaco'
+        status: 200
+        body:
+          - contains: tilejson
+          - contains: vector_layers
+
+      - id: ecovoyage-versatiles-host
+        scope: deploy
+        http: 'http://127.0.0.1:${HOST_PORT:8090}/'
+        status: 200
+
+      - id: ecovoyage-pmtiles-viewer-host
+        scope: deploy
+        http: 'http://127.0.0.1:${HOST_PORT:8001}/'
+        status: 200
+
+      - id: ecovoyage-versatiles-frontend-host
+        scope: deploy
+        http: 'http://127.0.0.1:${HOST_PORT:8002}/'
+        status: 200
+
+      - id: ecovoyage-maputnik-host
+        scope: deploy
+        http: 'http://127.0.0.1:${HOST_PORT:8000}/'
+        status: 200
+
+      - id: ecovoyage-airflow-version
+        scope: deploy
+        http: 'http://127.0.0.1:${HOST_PORT:8080}/api/v2/version'
+        status: 200
+
+      - id: ecovoyage-airflow-dags-listed
+        scope: deploy
+        command: |
+          TOKEN=$(curl -sk -X POST -H 'Content-Type: application/json' \
+            -d "{\"username\":\"admin\",\"password\":\"$AIRFLOW_ADMIN_PASSWORD\"}" \
+            http://localhost:8080/auth/token \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))")
+          curl -sk -H "Authorization: Bearer $TOKEN" \
+            "http://localhost:8080/api/v2/dags?limit=30" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);print('\n'.join(sorted(e['dag_id'] for e in d.get('dags',[]))))"
+        in_container: true
+        stdout:
+          - contains: notebook_osm_pipeline
+          - contains: notebook_gtfs_pipeline
+          - contains: notebook_osm_gpqtiles_pipeline
+          - contains: notebook_osm_duckdb_mvt_pipeline
+          - contains: notebook_osm_duckdb_freestiler_pipeline
+          - contains: notebook_osm_shortbread_pipeline
+
+      - id: ecovoyage-marimo-mcp-ping
+        scope: deploy
+        mcp: ping
+        mcp_name: marimo
+
+      - id: ecovoyage-marimo-mcp-list-tools
+        scope: deploy
+        mcp: list-tools
+        mcp_name: marimo
+        stdout:
+          - contains: get_active_notebooks
+          - contains: get_cell_runtime_data
+          - contains: get_notebook_errors
+          - contains: get_lightweight_cell_map
+
+      - id: ecovoyage-workspace-notebook
+        scope: deploy
+        file: /workspace/notebooks/osm-monaco-viz.py
+        exists: true
+
+      - id: ecovoyage-workspace-dags
+        scope: deploy
+        file: /workspace/dags
+        filetype: directory
+
+      - id: ecovoyage-airflow-password-set
+        scope: deploy
+        command: 'test -n "$AIRFLOW_ADMIN_PASSWORD" && echo SET || echo UNSET'
+        in_container: true
+        stdout:
+          - equals: SET
+
+      - id: ecovoyage-dags-dir-env
+        scope: deploy
+        command: 'echo $AIRFLOW_DAGS_DIR'
+        in_container: true
+        stdout:
+          - equals: /workspace/dags
+
+      - id: ecovoyage-container-running
+        scope: deploy
+        command: 'podman inspect ov-versa-ecovoyage --format "{{.State.Status}}"'
+        in_container: false
+        stdout:
+          - equals: running
