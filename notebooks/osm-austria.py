@@ -1072,7 +1072,17 @@ def build_pipeline_maplibre_html(
         *(extra_layers or []),
     ]
     layers_js = _json.dumps(all_layers, indent=2)
-    source_dict = {"type": "vector", "url": f"{martin}/{source_name}"}
+    # Explicit `maxzoom: 12` matches the highest source-zoom that
+    # exists in austria-ecovoyage.pmtiles (freestiler bakes z=0..12).
+    # MapLibre AUTO-OVERZOOMS for display zoom > 12 — renders the
+    # z=12 vector features upscaled at z=13/14/15/.... Without this
+    # hint, MapLibre tries to fetch non-existent z=13+ tiles from
+    # martin, gets 4xx, and returns 0 features at high zoom.
+    source_dict = {
+        "type": "vector",
+        "url": f"{martin}/{source_name}",
+        "maxzoom": 12,
+    }
     if mlt:
         # Informational marker — the actual decode path depends on the
         # MapLibre GL JS version's MLT support; martin's content-type
@@ -1149,6 +1159,7 @@ const map_{js_var} = new maplibregl.Map({{
 {pitch_js}  attributionControl: false
 }});
 map_{js_var}.addControl(new maplibregl.NavigationControl({{ showZoom: true, showCompass: true }}), 'top-right');{terrain_control_js}
+window.map_{js_var} = map_{js_var};
 </script>
 </body></html>"""
 

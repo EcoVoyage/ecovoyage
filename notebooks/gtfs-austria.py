@@ -1015,7 +1015,17 @@ def build_pipeline_maplibre_html(
         *(extra_layers or []),
     ]
     layers_js = _json.dumps(all_layers, indent=2)
-    source_dict = {"type": "vector", "url": f"{martin}/{source_name}"}
+    # Explicit `maxzoom: 12` matches the highest source-zoom that
+    # exists in austria-ecovoyage.pmtiles (freestiler bakes z=0..12).
+    # MapLibre AUTO-OVERZOOMS for display zoom > 12 — renders the
+    # z=12 vector features upscaled at z=13/14/15/.... Without this
+    # hint, MapLibre tries to fetch non-existent z=13+ tiles from
+    # martin, gets 4xx, and returns 0 features at high zoom.
+    source_dict = {
+        "type": "vector",
+        "url": f"{martin}/{source_name}",
+        "maxzoom": 12,
+    }
     if mlt:
         source_dict["mlt"] = True
     all_sources = {"src": source_dict, **(extra_sources or {})}
@@ -1086,6 +1096,7 @@ const map_{js_var} = new maplibregl.Map({{
 {pitch_js}  attributionControl: false
 }});
 map_{js_var}.addControl(new maplibregl.NavigationControl({{ showZoom: true, showCompass: true }}), 'top-right');{terrain_control_js}
+window.map_{js_var} = map_{js_var};
 </script>
 </body></html>"""
 
@@ -1543,7 +1554,7 @@ def _theme_styles():
                 "#8a6a36",
             ],
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           9, 0.7, 12, 1.5, 16, 2.5],
+                           9, 1.0, 12, 1.8, 16, 3.0, 18, 4.0],
             "line-dasharray": [0.1, 2],
             "line-opacity": 0.9,
          }},
@@ -1570,7 +1581,7 @@ def _theme_styles():
                 "#8a6a36",
             ],
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           9, 0.7, 12, 1.5, 16, 2.5],
+                           9, 1.0, 12, 1.8, 16, 3.0, 18, 4.0],
             "line-dasharray": [3, 2],
             "line-opacity": 0.9,
          }},
@@ -1600,7 +1611,7 @@ def _theme_styles():
                 "#8a6a36",
             ],
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           9, 0.7, 12, 1.5, 16, 2.5],
+                           9, 1.0, 12, 1.8, 16, 3.0, 18, 4.0],
             "line-opacity": 0.9,
          }},
 
@@ -1614,8 +1625,8 @@ def _theme_styles():
          "paint": {
             "line-color": "#ffffff",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 2.0, 10, 3.0, 14, 4.5],
-            "line-opacity": 0.75,
+                           6, 3.0, 10, 4.2, 14, 5.8, 18, 7.0],
+            "line-opacity": 0.85,
          }},
         {"id": "sat-hike-route", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
@@ -1626,80 +1637,58 @@ def _theme_styles():
          "paint": {
             "line-color": "#9c5a1f",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 1.0, 10, 1.8, 14, 2.8],
+                           6, 1.6, 10, 2.4, 14, 3.6, 18, 4.5],
          }},
 
         # === SECONDARY — cycle network ===
+        #
+        # RCA finding 2026-05-14: the Austrian OSM data has only ~45
+        # `route=bicycle` features (only 1 of which carries
+        # network=lcn). The icn/ncn/rcn split that other countries
+        # use is essentially empty here. So we render TWO cycle
+        # layers: one for every `route=bicycle` (any network — those
+        # 45 named routes get the prominent halo'd teal-ink treatment
+        # from country zoom upward) + one for `highway=cycleway`
+        # dedicated infrastructure (visible at city zoom).
 
-        # Dedicated cycleways — z12+, dark navy solid
+        # Named cycle routes (route=bicycle, any network) — z6+,
+        # teal-ink with halo
+        {"id": "sat-cycle-route-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "cycle"],
+                    ["==", ["get", "route"], "bicycle"]],
+         "paint": {
+            "line-color": "#ffffff",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 3.0, 10, 4.2, 14, 5.8, 18, 7.0],
+            "line-opacity": 0.85,
+         }},
+        {"id": "sat-cycle-route", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "cycle"],
+                    ["==", ["get", "route"], "bicycle"]],
+         "paint": {
+            "line-color": "#1a4a6e",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 1.6, 10, 2.4, 14, 3.6, 18, 4.5],
+         }},
+
+        # Dedicated cycleways (highway=cycleway) — z11+, navy ink
         {"id": "sat-cycleway", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 12,
+         "minzoom": 11,
          "filter": ["all",
                     ["==", ["get", "theme"], "cycle"],
                     ["==", ["get", "highway"], "cycleway"]],
          "paint": {
             "line-color": "#0a2a4a",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           12, 1.0, 16, 2.4],
+                           11, 1.2, 14, 2.0, 18, 3.0],
             "line-opacity": 0.9,
-         }},
-
-        # Cycle local routes — z11+, light teal
-        {"id": "sat-cycle-local", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 11,
-         "filter": ["all",
-                    ["==", ["get", "theme"], "cycle"],
-                    ["==", ["get", "route"], "bicycle"],
-                    ["==", ["get", "network"], "lcn"]],
-         "paint": {
-            "line-color": "#5a8aa0",
-            "line-width": ["interpolate", ["linear"], ["zoom"],
-                           11, 0.6, 16, 1.4],
-            "line-opacity": 0.85,
-         }},
-
-        # Cycle regional routes — z9+, mid teal
-        {"id": "sat-cycle-regional", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 9,
-         "filter": ["all",
-                    ["==", ["get", "theme"], "cycle"],
-                    ["==", ["get", "route"], "bicycle"],
-                    ["==", ["get", "network"], "rcn"]],
-         "paint": {
-            "line-color": "#3a6e8a",
-            "line-width": ["interpolate", ["linear"], ["zoom"],
-                           9, 0.8, 14, 2.0],
-            "line-opacity": 0.9,
-         }},
-
-        # Cycle national/international — z6+, teal-ink with halo
-        {"id": "sat-cycle-national-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 6,
-         "filter": ["all",
-                    ["==", ["get", "theme"], "cycle"],
-                    ["==", ["get", "route"], "bicycle"],
-                    ["in", ["get", "network"], ["literal", ["icn", "ncn"]]]],
-         "paint": {
-            "line-color": "#ffffff",
-            "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 2.2, 10, 3.2, 14, 4.8],
-            "line-opacity": 0.75,
-         }},
-        {"id": "sat-cycle-national", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 6,
-         "filter": ["all",
-                    ["==", ["get", "theme"], "cycle"],
-                    ["==", ["get", "route"], "bicycle"],
-                    ["in", ["get", "network"], ["literal", ["icn", "ncn"]]]],
-         "paint": {
-            "line-color": "#1a4a6e",
-            "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 1.2, 10, 2.0, 14, 3.0],
          }},
 
         # === PRIMARY — railways (drawn LAST; on top of everything) ===
@@ -1763,8 +1752,8 @@ def _theme_styles():
          "paint": {
             "line-color": "#ffffff",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           10, 1.8, 14, 3.2, 18, 4.4],
-            "line-opacity": 0.8,
+                           10, 2.8, 14, 4.2, 18, 5.4],
+            "line-opacity": 0.85,
          }},
         {"id": "sat-rail-urban", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
@@ -1777,7 +1766,7 @@ def _theme_styles():
          "paint": {
             "line-color": "#2d6c4a",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           10, 0.9, 14, 1.9, 18, 2.6],
+                           10, 1.4, 14, 2.6, 18, 3.6],
          }},
 
         # Branch rail (rail without usage=main, no service tag) — z8+,
@@ -1793,8 +1782,8 @@ def _theme_styles():
          "paint": {
             "line-color": "#ffffff",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           8, 1.6, 12, 2.8, 16, 4.2],
-            "line-opacity": 0.8,
+                           8, 2.8, 12, 4.0, 16, 5.5, 18, 6.5],
+            "line-opacity": 0.85,
          }},
         {"id": "sat-rail-branch", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
@@ -1807,7 +1796,7 @@ def _theme_styles():
          "paint": {
             "line-color": "#a02c2c",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           8, 0.8, 12, 1.6, 16, 2.6],
+                           8, 1.4, 12, 2.4, 16, 3.6, 18, 4.5],
          }},
 
         # Mainline rail (rail usage=main) — z6+, k.k. red with halo.
@@ -1823,8 +1812,8 @@ def _theme_styles():
          "paint": {
             "line-color": "#ffffff",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 2.4, 10, 3.8, 14, 6.0, 18, 8.0],
-            "line-opacity": 0.9,
+                           6, 3.6, 10, 5.0, 14, 7.5, 18, 9.5],
+            "line-opacity": 0.95,
          }},
         {"id": "sat-rail-mainline", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
@@ -1836,7 +1825,7 @@ def _theme_styles():
          "paint": {
             "line-color": "#c93e3e",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 1.2, 10, 2.2, 14, 3.6, 18, 5.0],
+                           6, 1.8, 10, 2.8, 14, 4.4, 18, 6.0],
          }},
 
         # Mainline rail double-track center stripe — z14+, thin white
@@ -1854,7 +1843,7 @@ def _theme_styles():
          "paint": {
             "line-color": "#ffffff",
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           14, 1.0, 18, 1.6],
+                           14, 1.4, 18, 2.0],
          }},
     ]
     return (
@@ -1975,6 +1964,119 @@ def _(dag_run_states, mo):
 @app.cell
 def _(df_route_stops):
     df_route_stops
+    return
+
+
+@app.cell
+def _(dag_run_states, mo):
+    # Tag-distribution diagnostics — what OSM tag values actually
+    # exist in the data the satellite-overlay style filters against.
+    #
+    # Surfaces the empirical histograms that informed (or revealed
+    # gaps in) the filter design. Re-run after any OSM data refresh
+    # — e.g. if Austria's cycle network tagging changes upstream,
+    # the cycle histogram here surfaces the new values BEFORE the
+    # satellite-overlay map's `network=` filter silently matches
+    # nothing.
+    #
+    # Imported from the standalone .duckprobe.py script that drove
+    # the RCA of the 2026-05-13 satellite-overlay rendering issue
+    # (cycle/icn/ncn matched 0 features because Austrian OSM uses
+    # mostly highway=cycleway / cycleway=* tagging, not route-relation
+    # tagging).
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    # Aliased + underscore-prefixed so the duckdb import and the
+    # connection stay cell-private (marimo flags top-level names
+    # that collide across cells; the unified-analysis cell above
+    # already imports `duckdb`/`con`).
+    import duckdb as _duckdb
+    _con = _duckdb.connect(
+        "/workspace/duckdb/austria.duckdb",
+        read_only=True,
+    )
+
+    # Cycle-theme route + network distribution — informs the
+    # sat-cycle-route filter on the satellite-overlay map.
+    _cycle_network_dist = _con.sql("""
+        SELECT
+            tags['route']   AS route,
+            tags['network'] AS network,
+            count(*)        AS n
+        FROM osm.features
+        WHERE tags['route'] = 'bicycle'
+           OR tags['cycleway'] IS NOT NULL
+           OR tags['highway'] = 'cycleway'
+        GROUP BY 1, 2
+        ORDER BY n DESC
+        LIMIT 30
+    """).pl()
+
+    # Railway-type distribution — informs the sat-rail-* family of
+    # filters (mainline vs branch vs urban via railway= + usage=).
+    _railway_type_dist = _con.sql("""
+        SELECT
+            tags['railway'] AS railway,
+            count(*)        AS n
+        FROM osm.features
+        WHERE tags['railway'] IS NOT NULL
+        GROUP BY 1
+        ORDER BY n DESC
+        LIMIT 30
+    """).pl()
+
+    # Rail usage distribution — informs sat-rail-mainline (usage=main)
+    # vs sat-rail-branch (usage != main, no service).
+    _rail_usage_dist = _con.sql("""
+        SELECT
+            tags['usage'] AS usage,
+            count(*)      AS n
+        FROM osm.features
+        WHERE tags['railway'] = 'rail'
+        GROUP BY 1
+        ORDER BY n DESC
+    """).pl()
+
+    # SAC scale × trail_visibility distribution — informs the three
+    # sat-hike-trail-{solid,dashed,dotted} layers that encode the
+    # OSM-wiki "Hiking trails rendering proposal 1" matrix.
+    _sac_visibility_dist = _con.sql("""
+        SELECT
+            tags['sac_scale']        AS sac_scale,
+            tags['trail_visibility'] AS trail_visibility,
+            count(*)                 AS n
+        FROM osm.features
+        WHERE tags['sac_scale'] IS NOT NULL
+        GROUP BY 1, 2
+        ORDER BY n DESC
+        LIMIT 50
+    """).pl()
+
+    _con.close()
+    mo.vstack([
+        mo.md("**Satellite-overlay style filter diagnostics — "
+              "what tag values actually exist in the Austria data?**"),
+        mo.md("Cycle infrastructure — `route` × `network` distribution. "
+              "Drives the `sat-cycle-route` filter (any `route=bicycle`) "
+              "+ `sat-cycleway` (highway=cycleway):"),
+        _cycle_network_dist,
+        mo.md("Railway `railway=` type distribution — drives the "
+              "`sat-rail-mainline` / `sat-rail-branch` / `sat-rail-urban` "
+              "/ `sat-rail-tunnel` / `sat-rail-service` family:"),
+        _railway_type_dist,
+        mo.md("Rail `usage=` distribution — distinguishes mainline "
+              "(`usage=main`) from branch (everything else):"),
+        _rail_usage_dist,
+        mo.md("`sac_scale` × `trail_visibility` distribution — drives "
+              "the three `sat-hike-trail-{solid,dashed,dotted}` layers "
+              "encoding the OSM-wiki "
+              "[Hiking trails rendering proposal 1](https://wiki.openstreetmap.org/wiki/File:Hiking_trails_rendering_proposal_1.png) "
+              "matrix (colour = difficulty, pattern = visibility):"),
+        _sac_visibility_dist,
+    ])
     return
 
 
