@@ -98,6 +98,25 @@ BEFORE the final acceptance gate (R10) — in that order, no exceptions.
   remediation. Forbidden framings: "probably a flake", "rerun and
   see", "transient", "works on retry", "environmental". Blind retry
   is itself a violation. See `/ov-internals:strict-policy`.
+  Domain-specific framings ALSO forbidden — born from real cutovers
+  that shipped with broken renders because the agent talked itself
+  out of an RCA:
+  - **"Browser-side network quirk specific to the CDP-driven X
+    sandbox"** — drive the CORRECT browser pod (the one with the
+    tailscale sidecar matching the workspace's tailnet membership).
+    A wrong-pod CDP failure is a misconfigured-verification failure,
+    not an environmental one. See "Step 0 — Pick the right browser
+    pod" below.
+  - **"Tiles fetched HTTP 200 so rendering must be fine"** — the
+    bytes-on-wire test only proves transport. Visual rendering can
+    still fail due to filter matches=0, source maxzoom mismatch,
+    layer ordering, opacity, line-width clipping, or block-scoped
+    map instances unreachable from outside the iframe. Run
+    `queryRenderedFeatures` per layer per zoom AND inspect the
+    screenshot pixels.
+  - **"The same defect appears on the existing map cell above, so
+    it's not a regression"** — co-existing defects are not a defence;
+    each cell must individually pass its own R10 visual verification.
 
 - **R2. No "pre-existing" / "out of scope" / "unrelated" / "follow-up
   PR" classifications.** Every issue surfaced during the active
@@ -322,6 +341,48 @@ run** against the WARM container — drive the actual rendered browser
 DOM to prove every cell executes correctly and every map renders
 real tiles.
 
+#### Step 0 — Pick the right browser pod (mandatory preflight)
+
+The `chrome-devtools-ecovoyage` MCP at `localhost:9232/mcp` proxies
+the chromium running inside `ov-sway-browser-vnc-ecovoyage`. THAT
+pod has a tailscale sidecar (`ov-sway-browser-vnc-ecovoyage-
+tailscale`, tailscale name `ecovoyage-browser`, reachable from the
+ecovoyage tailnet); it CAN resolve `ac.armadillo-quail.ts.net` and
+fetch `MARTIN_PUBLIC_URL` / `AIRFLOW_PUBLIC_URL` / etc.
+
+The agent session may ALSO auto-load
+`mcp__plugin_ov-selkies_chrome-devtools__*` tools — those point at
+`ov-openclaw-sway-browser-pod`, a DIFFERENT pod with NO tailscale
+sidecar. Using that pod for R10 yields `ERR_NAME_NOT_RESOLVED` on
+every tailnet URL and the agent then talks itself into "browser-
+side network quirk" — a textbook R1 violation. **Do not use those
+tools for ecovoyage R10.** They drive the wrong browser.
+
+Before the first CDP call, verify:
+
+```bash
+# 1. The correct browser pod is up + has its tailscale sidecar.
+podman ps --format "{{.Names}}" | grep ov-sway-browser-vnc-ecovoyage
+# Must list BOTH:
+#   ov-sway-browser-vnc-ecovoyage
+#   ov-sway-browser-vnc-ecovoyage-tailscale
+
+# 2. The sidecar's tailscale is online + the pod can reach martin
+#    (substitute the actual MARTIN_PUBLIC_URL host):
+podman exec ov-sway-browser-vnc-ecovoyage-tailscale tailscale status \
+  | head -3
+podman exec ov-sway-browser-vnc-ecovoyage \
+  curl -sk -o /dev/null -w "%{http_code}\n" \
+       https://ac.armadillo-quail.ts.net:33000/austria-railway
+# Must be HTTP 200. If 4xx/5xx — R1 RCA on the network path BEFORE
+# any rendering work; never proceed with a half-broken browser pod.
+```
+
+If `chrome-devtools-ecovoyage` is in the `mcp__*` tool surface →
+preferred. If not → see step 4's "raw HTTP MCP fallback" below
+(drive the same `localhost:9232` endpoint via curl-based MCP
+handshake — NOT a fall-back to the wrong-pod selkies CDP).
+
 The notebook-change acceptance battery, in order:
 
 1. **`ov status versa -i ecovoyage`** — still required. `Active:
@@ -337,29 +398,120 @@ The notebook-change acceptance battery, in order:
    kernel. ALL cells must execute with 0 errors (use the JSON
    scanner pattern: load the .ipynb, grep `output_type == "error"`,
    assert empty).
-4. **CDP MCP — full browser-side notebook run.** Connect via the
-   `chrome-devtools-ecovoyage` MCP at `localhost:9232/mcp`:
-   - `navigate_page` to the notebook URL (HTTPS — tailnet listener
-     is TLS-only; resolve URL from the marimo MCP's
-     `get_active_notebooks` and the tailnet hostname).
-   - `wait_for` notebook header text to appear.
-   - `evaluate_script` to read every cell's rendered output state
-     from the marimo runtime — confirm no cell is in `error` /
-     `stale` / `disabled-transitively` state; every map-rendering
-     cell has its `<iframe>` populated and the inner `window.map`
-     fired its `load` event.
-   - `list_network_requests` (filter `resourceTypes=["fetch","xhr"]`)
-     — every tile fetch HTTP 200, MIME type matches expected
-     (`application/x-protobuf` for martin vector tiles,
-     `image/webp` for versatiles raster, `image/png|jpeg` for
-     DEM/raster sources), payload size > 0. Zero 4xx/5xx.
-   - `list_console_messages` (`types=["error","warn"]`) clean of
-     MapLibre / sprite / glyph / WebGL diagnostics.
-   - For every visible map cell, DOM-walk the iframe and assert the
-     style's `sources` + `layers` resolved correctly
-     (`map.getStyle().sources` and `.layers` non-empty; expected
-     source IDs present).
-   - `take_screenshot` of the page for visual record.
+4. **CDP per-zoom verification matrix.** Connect via the
+   `chrome-devtools-ecovoyage` MCP at `localhost:9232/mcp` (after
+   the Step 0 preflight passed). The protocol:
+
+   **a. Iframe map-instance hook (helper-side requirement).** The
+   `build_pipeline_maplibre_html` helper MUST emit
+   `window.map_<js_var> = map_<js_var>;` after the
+   `addControl(NavigationControl)` line. The MapLibre
+   `const map_<js_var>` declared inside the iframe's `<script>` is
+   block-scoped; without the window assignment the agent cannot
+   reach `iframe.contentWindow.map_<js_var>.jumpTo(...)` from the
+   parent page to drive zoom-stepping. Any helper change that
+   regresses this assignment FAILS this step.
+
+   **b. Per-source `maxzoom` configuration (helper-side requirement).**
+   When the vector pmtiles are baked at `max_zoom=N` (austria-
+   ecovoyage = 12, monaco = 14, etc.), the helper's source dict
+   MUST declare `"maxzoom": N` so MapLibre auto-overzooms for
+   display zoom > N. Without this, MapLibre fetches non-existent
+   z=N+1 tiles, gets 4xx, and silently returns 0 features at high
+   zoom — the cell looks fine at default zoom but breaks the moment
+   the user scrolls in. Verify by reading the source dict literal
+   in the cell's exported HTML.
+
+   **c. Navigate + scroll the target iframe into view.**
+   `navigate_page` to the notebook URL. `resize_page` to a known
+   viewport (default 1280×900). `wait_for` the iframe's content
+   marker. `evaluate_script` to find the iframe
+   (`document.querySelectorAll('iframe')`), match on a content
+   discriminator (e.g. inner HTML contains
+   `satellite-bg-austria-ecovoyage`), call `scrollIntoView`.
+
+   **d. Canonical test centers (Austria workspace).** Every
+   zoom-by-zoom verification pass for an Austria-scoped notebook
+   map runs the loop TWICE — once around each of these two centers,
+   chosen to exercise every visual axis of the satellite-overlay
+   style:
+
+   | Center | `[lon, lat]` | Why |
+   |---|---|---|
+   | **Innsbruck** | `[11.392778, 47.267222]` | Alpine + rural. Steep tonal variation on the satellite imagery (snow / rock / forest). Has the Brenner mainline + branch lines + 6 tram lines + the Hungerburgbahn funicular (`railway=funicular`) + intense SAC-scale variety (T1 city walks through T5 alpine routes) + the national Inn-Radweg (`route=bicycle` long-distance) + dense `route=hiking` long-distance trails. Best for surfacing line-width / halo / colour-contrast issues. |
+   | **Wien Hauptbahnhof** | `[16.377778, 48.185]` | Dense urban. Vienna's mainline rail hub (8+ platforms, multiple branch and S-Bahn lines), tram network, U-Bahn subway (`railway=subway`), Wiener Linien GTFS stops at high density. Best for surfacing urban-rail filter coverage, GTFS-dot clustering, text-label collision behaviour, double-track centre stripe rendering at z=14. |
+
+   Run the sequence:
+   ```
+   for center in [Innsbruck, Wien Hauptbahnhof]:
+       for z in [6, 8, 10, 12, 14]:
+           ...
+   ```
+   yielding **10 screenshots + 10 feature-count records** per
+   verification pass. A cutover that passes Innsbruck but fails
+   Wien Hauptbahnhof (or vice versa) is NOT green — both centers
+   must clear every assertion.
+
+   **e. Per-zoom-per-center step.** For each `(center, z)`:
+   - `evaluate_script` calls
+     `iframe.contentWindow.map_<var>.jumpTo({center: <CENTER>,
+     zoom: z, pitch: 0, bearing: 0})`. Pitch reset to 0 for the
+     verification pass — camera tilt occlusion is a separate
+     visual concern handled at the default-view check.
+   - Wait 5 s for tiles to settle.
+   - `evaluate_script` calls
+     `map.queryRenderedFeatures(undefined, {layers: [<id>]}).length`
+     for EVERY expected layer ID. Record counts.
+   - `take_screenshot` to a known filename
+     (`/tmp/<cell-id>-<center-slug>-z<z>.png`, e.g.
+     `/tmp/sat-overlay-innsbruck-z10.png`,
+     `/tmp/sat-overlay-wien-z14.png`). `podman cp` the file from
+     the browser pod to the host so the agent can `Read` it.
+
+   **f. Assertions per layer per zoom.** Each expected layer has
+   a min-feature-count expectation per zoom (declared in the
+   cell's docstring or surrounding skill). At z=6 country view in
+   Austria, mainline rail must show >100 features (340 is
+   typical). At z=14 single-coordinate city zoom, expect 0–N per
+   layer depending on whether the viewport intersects features —
+   but the layer must EXIST in the style
+   (`map.getStyle().layers` contains its id). A layer that returns
+   0 features at EVERY tested zoom AT BOTH CENTERS is a filter bug
+   — fix BEFORE shipping.
+
+   **g. Console + network checks at each (center, zoom).**
+   `list_console_messages(types=["error","warn"])` must be clean
+   of MapLibre / sprite / glyph / WebGL / tile-fetch diagnostics.
+   The marimo-side preload-warning noise from `noise-*.png` /
+   `gradient-*.png` is benign and may be ignored.
+   `list_network_requests(resourceTypes=["xhr","fetch"])` must
+   show every tile fetch HTTP 200 with the expected MIME
+   (`application/x-protobuf` for martin vector tiles, `image/webp`
+   for versatiles satellite raster, `application/json` for
+   mapterhorn raster-DEM tilejson, font PBFs for glyphs).
+   `ERR_NAME_NOT_RESOLVED` on any tailnet host → STOP, return to
+   Step 0.
+
+   **h. Visual inspection of each screenshot.** Pull the PNGs
+   from the browser pod (`podman cp
+   ov-sway-browser-vnc-ecovoyage:/tmp/<name>.png /tmp/<name>.png`)
+   and `Read` them. Each frame must show:
+   - The primary tier (railways) as the visual headline — bold,
+     visible against satellite imagery, halo intact.
+   - The secondary tiers (cycle + hiking long-distance routes)
+     visible from z=6 with halo.
+   - The tertiary tier (footpaths / SAC trails) appearing at the
+     expected zoom thresholds without obscuring the satellite
+     imagery.
+   - No "broken polygons" — line layers must not render as solid
+     fills, dashed layers must show dashes, dotted layers must
+     show dots.
+   - GTFS dot overlay uniform; text labels appearing at z≥11.
+
+   Visual inconsistencies are R1 RCA triggers — query the layer's
+   actual paint properties, compare against expected, fix in the
+   style constant. Don't ship the cutover with a known-defect
+   documented as "follow-up" in the commit body.
 5. **Airflow REST round-trip** — only when the notebook touched a
    self-author DAG cell: confirm the freshly-written DAG file lands
    in `/workspace/dags/`, registers in `GET /api/v2/dags`, and
@@ -375,13 +527,44 @@ NEVER `fully tested and validated` — the CDP step IS what proves
 the notebook actually runs end-to-end in the browser (the marimo
 export alone doesn't execute the embedded MapLibre JS).
 
-When the `chrome-devtools-ecovoyage` MCP is NOT loaded in the agent
-session (the .mcp.json entry is reachable but the harness didn't
-auto-load it), the CDP step must be flagged as **skipped** in the
-acceptance report — and the commit tier caps at `analysed on a
-live system`. Don't substitute curl-against-tile-URLs for the
-CDP-side proof; curl bypasses CORS, sees no JS, and tests a
-connection the user's browser never makes.
+When the `chrome-devtools-ecovoyage` MCP is NOT in the agent
+session's loaded tool surface (the `.mcp.json` entry registered
+the server but the harness didn't auto-load its tools), the
+procedure is NOT to skip the CDP step. The MCP server at
+`localhost:9232/mcp` is still reachable; drive it via a raw HTTP
+MCP handshake:
+
+1. `POST localhost:9232/mcp` with JSON-RPC `initialize` → capture
+   the `Mcp-Session-Id` response header.
+2. `POST` `notifications/initialized` with the same session-id
+   header.
+3. `POST` `tools/call` with `name="navigate_page"` /
+   `name="evaluate_script"` / `name="take_screenshot"` etc. The
+   tool name + argument schema match the equivalent
+   `mcp__chrome-devtools-ecovoyage__*` tools exactly. The
+   Streamable HTTP transport returns either JSON or
+   `event: message\ndata: <json>` SSE chunks — handle both.
+4. Save the driver as a one-off Python script (e.g.
+   `.cdp-driver.py`); delete it after the run so it doesn't end
+   up in the commit.
+
+DO NOT fall back to a different chrome-devtools-* MCP that happens
+to be in the session's tool surface (e.g.
+`mcp__plugin_ov-selkies_chrome-devtools__*` points at the wrong
+browser pod, NO tailnet — every tailnet tile fetch fails). Using
+the wrong pod's CDP and then explaining away the failures is the
+exact R1 violation this protocol exists to prevent.
+
+DO NOT substitute curl-against-tile-URLs for the CDP-side proof;
+curl bypasses CORS, sees no JS, and tests a connection the user's
+browser never makes.
+
+The CDP step is mandatory for any cutover that touches a map
+cell. If a hard infrastructure failure (the browser pod itself is
+down, the tailscale sidecar is offline) prevents driving the
+correct pod, STOP — fix the infrastructure first. Don't ship a
+"tier downgraded because CDP skipped" commit when the agent had a
+working pod available all along.
 
 ## Hard Cutover by Default — ONE PHASE, test EVERYTHING at the end
 
