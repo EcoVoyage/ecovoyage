@@ -79,6 +79,7 @@ target/
 .ipynb_checkpoints
 .run-output*.ipynb
 .austria-*-export.ipynb
+.gtfs-*-export.ipynb
 
 # ov image build / eval scratch
 .build/
