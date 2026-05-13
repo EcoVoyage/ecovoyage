@@ -105,8 +105,15 @@ def _(airflow_public, mo):
         mid-teal regional, light-teal local, navy dedicated
         cycleways.
       - **SECONDARY** hiking network: sienna long-distance routes
-        (halo, visible from country zoom), darker ochre SAC-graded
-        trails.
+        (halo, visible from country zoom) for named `route=hiking`
+        relations. Individual SAC-graded trails render with the
+        OSM-wiki ["Hiking trails rendering proposal 1"](https://wiki.openstreetmap.org/wiki/File:Hiking_trails_rendering_proposal_1.png)
+        encoding: **colour = difficulty** (T1 red `#c62828`, T2
+        orange `#ef6c00`, T3 purple `#7b1fa2`, T4+ cyan `#03a9f4`,
+        collapsing T4 / T5 / T6); **line pattern = visibility** —
+        solid for `trail_visibility=excellent` (or untagged), dashed
+        for `good`/`intermediate` ("sometimes hard to follow"),
+        dotted for `bad`/`horrible`/`no` ("no clear path").
       - **TERTIARY** generic footpaths: warm ochre dashed, faint —
         the only tier that holds back until city zoom.
       - **GTFS stops**: uniform white-fill / dark-stroke dots at
@@ -1492,20 +1499,108 @@ def _theme_styles():
             "line-opacity": 0.7,
          }},
 
-        # === SECONDARY — hiking (long-distance + SAC) ===
+        # === SECONDARY — hiking (long-distance + SAC × visibility) ===
 
-        # SAC-graded trails — z9+, medium dashed darker ochre
-        {"id": "sat-hike-sac", "type": "line",
+        # SAC-graded trails — three layers encoding the
+        # OSM-wiki "Hiking trails rendering proposal 1" (Rooart 2018,
+        # https://wiki.openstreetmap.org/wiki/File:Hiking_trails_rendering_proposal_1.png).
+        # Colour encodes sac_scale difficulty (T1 red → T2 orange →
+        # T3 purple → T4+ cyan); line pattern encodes trail_visibility
+        # (excellent/missing → solid, good/intermediate → dashed,
+        # bad/horrible/no → dotted). MapLibre v5 line-dasharray is a
+        # literal-array paint property (not data-driven), so the three
+        # visibility classes need three layers. Inside each, line-color
+        # is a `match` on sac_scale.
+        #
+        # Draw order: dotted FIRST (lowest priority — uncertain paths
+        # render behind certain paths), then dashed, then solid on top.
+        # The four-colour palette tracks OpenAndroMaps + the proposal
+        # image swatches.
+
+        # T-scale → colour. Used identically in all three trail layers.
+        # (Defined inline three times for layer-level isolation; the
+        # marimo cell's local scope makes it cheap.)
+
+        # Dotted: trail_visibility = bad / horrible / no — "No clear path"
+        {"id": "sat-hike-trail-dotted", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
          "minzoom": 9,
          "filter": ["all",
                     ["==", ["get", "theme"], "hiking"],
-                    ["!=", ["get", "sac_scale"], None]],
+                    ["!=", ["get", "sac_scale"], None],
+                    ["in", ["get", "trail_visibility"],
+                     ["literal", ["bad", "horrible", "no"]]]],
+         "layout": {"line-cap": "round"},
          "paint": {
-            "line-color": "#7a4a1c",
+            "line-color": [
+                "match", ["get", "sac_scale"],
+                "hiking",                    "#c62828",
+                "mountain_hiking",           "#ef6c00",
+                "demanding_mountain_hiking", "#7b1fa2",
+                "alpine_hiking",             "#03a9f4",
+                "demanding_alpine_hiking",   "#03a9f4",
+                "difficult_alpine_hiking",   "#03a9f4",
+                "#8a6a36",
+            ],
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           9, 0.6, 12, 1.4, 16, 2.4],
-            "line-dasharray": [4, 2],
+                           9, 0.7, 12, 1.5, 16, 2.5],
+            "line-dasharray": [0.1, 2],
+            "line-opacity": 0.9,
+         }},
+
+        # Dashed: trail_visibility = good / intermediate —
+        # "Sometimes hard to follow"
+        {"id": "sat-hike-trail-dashed", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 9,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "hiking"],
+                    ["!=", ["get", "sac_scale"], None],
+                    ["in", ["get", "trail_visibility"],
+                     ["literal", ["good", "intermediate"]]]],
+         "paint": {
+            "line-color": [
+                "match", ["get", "sac_scale"],
+                "hiking",                    "#c62828",
+                "mountain_hiking",           "#ef6c00",
+                "demanding_mountain_hiking", "#7b1fa2",
+                "alpine_hiking",             "#03a9f4",
+                "demanding_alpine_hiking",   "#03a9f4",
+                "difficult_alpine_hiking",   "#03a9f4",
+                "#8a6a36",
+            ],
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           9, 0.7, 12, 1.5, 16, 2.5],
+            "line-dasharray": [3, 2],
+            "line-opacity": 0.9,
+         }},
+
+        # Solid: trail_visibility = excellent (or untagged) —
+        # "Always easy to follow"; the default fallback for ways
+        # without an explicit trail_visibility tag (per the proposal
+        # T1 hiking is well-marked by default).
+        {"id": "sat-hike-trail-solid", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 9,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "hiking"],
+                    ["!=", ["get", "sac_scale"], None],
+                    ["any",
+                     ["==", ["get", "trail_visibility"], "excellent"],
+                     ["==", ["get", "trail_visibility"], None]]],
+         "paint": {
+            "line-color": [
+                "match", ["get", "sac_scale"],
+                "hiking",                    "#c62828",
+                "mountain_hiking",           "#ef6c00",
+                "demanding_mountain_hiking", "#7b1fa2",
+                "alpine_hiking",             "#03a9f4",
+                "demanding_alpine_hiking",   "#03a9f4",
+                "difficult_alpine_hiking",   "#03a9f4",
+                "#8a6a36",
+            ],
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           9, 0.7, 12, 1.5, 16, 2.5],
             "line-opacity": 0.9,
          }},
 
