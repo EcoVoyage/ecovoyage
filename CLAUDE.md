@@ -223,25 +223,37 @@ workspace. The verification loop has THREE rules — none optional:
    reset — but commit local edits FIRST (lines 305–309 below) since
    force-seed overwrites the workspace bind contents.
 
-3. **After committing the real fix in source, re-verify on a FRESH
-   `ov update versa -i ecovoyage` (with image rebuild via
-   `ov image build '@github.com/overthinkos/overthink/versa:main'`
-   when the image-side changed).** A fix that passes only on a
-   hand-patched target is not a real fix — it's a regression waiting
-   for the next unrelated rebuild. Pasteable proof of the
-   fresh-rebuild re-verification is the acceptance gate.
+3. **After committing the real fix in source, re-verify against the
+   running deploy.** Two paths depending on what changed:
+
+   * **Pure-notebook changes** (the ONLY files touched are under
+     `notebooks/`): the fresh-rebuild requirement is RELAXED.
+     The workspace is bind-mounted, so the notebook on disk IS the
+     notebook the container's marimo kernel reads — marimo
+     hot-reloads on file change, no `ov update` needed. The
+     acceptance gate becomes the CDP-driven full-notebook run
+     described below (see "Notebook-only changes — CDP-driven gate").
+   * **Image / overthink.yml / DAG-author-cell / helper-Python /
+     anything else**: re-verify on a FRESH `ov update versa -i
+     ecovoyage` (with image rebuild via `ov image build
+     '@github.com/overthinkos/overthink/versa:main'` when the
+     image-side changed). A fix that passes only on a hand-patched
+     target is not a real fix — it's a regression waiting for the
+     next unrelated rebuild. Pasteable proof of the fresh-rebuild
+     re-verification is the acceptance gate.
 
 **A `--dry-run` does NOT count as an R10 test.** Dry-run renders
 prompts / scope / plans WITHOUT invoking the runner or producing
 artifacts — it proves nothing about runtime behavior. R10 requires a
-FULL live run of every new or changed surface against the freshly-
-rebuilt container.
+FULL live run of every new or changed surface against the running
+container (freshly-rebuilt for image / config changes; warm-running
+for pure-notebook changes).
 
 **A REBUILD by itself does NOT count as an R10 test either.** The
 rebuild is preflight setup. R10 means the cutover's NEW or CHANGED
 code path — the runner / verb evaluation / subprocess / deploy_eval
-overlay — actually executed AGAINST the fresh target and produced
-output you pasted.
+overlay / NEW notebook cell — actually executed AGAINST the target
+and produced output you pasted.
 
 **The 9-bullet R10 acceptance battery** runs against the SAME fresh
 rebuild. Every bullet required:
@@ -299,6 +311,77 @@ All ten bullets execute against the SAME fresh rebuild. Pasteable
 output for each is the deliverable. Missing any bullet caps the
 tier at `analysed on a live system`, never
 `fully tested and validated`.
+
+### Notebook-only changes — CDP-driven gate (relaxed R10)
+
+When the cutover touched ONLY `notebooks/*.py` files (no image, no
+overthink.yml, no upstream layer, no Python helper outside the
+notebook itself), the fresh-`ov update` requirement above is
+DROPPED. The acceptance gate is instead a **CDP-driven full-notebook
+run** against the WARM container — drive the actual rendered browser
+DOM to prove every cell executes correctly and every map renders
+real tiles.
+
+The notebook-change acceptance battery, in order:
+
+1. **`ov status versa -i ecovoyage`** — still required. `Active:
+   active (running)`; the container the CDP browser will hit must
+   be up.
+2. **Marimo MCP round-trip** — same as the full battery's bullet 6.
+   `get_active_notebooks` shows a session for the edited file;
+   `get_lightweight_cell_map` shows expected cells with
+   `runtime_state=idle`, `has_output=true`, `has_errors=false`;
+   `get_notebook_errors` empty; `lint_notebook` clean.
+3. **Headless `marimo export ipynb --include-outputs`** of the
+   edited notebook — proves Python-side wellformedness from a cold
+   kernel. ALL cells must execute with 0 errors (use the JSON
+   scanner pattern: load the .ipynb, grep `output_type == "error"`,
+   assert empty).
+4. **CDP MCP — full browser-side notebook run.** Connect via the
+   `chrome-devtools-ecovoyage` MCP at `localhost:9232/mcp`:
+   - `navigate_page` to the notebook URL (HTTPS — tailnet listener
+     is TLS-only; resolve URL from the marimo MCP's
+     `get_active_notebooks` and the tailnet hostname).
+   - `wait_for` notebook header text to appear.
+   - `evaluate_script` to read every cell's rendered output state
+     from the marimo runtime — confirm no cell is in `error` /
+     `stale` / `disabled-transitively` state; every map-rendering
+     cell has its `<iframe>` populated and the inner `window.map`
+     fired its `load` event.
+   - `list_network_requests` (filter `resourceTypes=["fetch","xhr"]`)
+     — every tile fetch HTTP 200, MIME type matches expected
+     (`application/x-protobuf` for martin vector tiles,
+     `image/webp` for versatiles raster, `image/png|jpeg` for
+     DEM/raster sources), payload size > 0. Zero 4xx/5xx.
+   - `list_console_messages` (`types=["error","warn"]`) clean of
+     MapLibre / sprite / glyph / WebGL diagnostics.
+   - For every visible map cell, DOM-walk the iframe and assert the
+     style's `sources` + `layers` resolved correctly
+     (`map.getStyle().sources` and `.layers` non-empty; expected
+     source IDs present).
+   - `take_screenshot` of the page for visual record.
+5. **Airflow REST round-trip** — only when the notebook touched a
+   self-author DAG cell: confirm the freshly-written DAG file lands
+   in `/workspace/dags/`, registers in `GET /api/v2/dags`, and
+   reaches `state: success` on a triggered run.
+6. **DuckDB / tile-output integrity** — only when the notebook
+   change affects downstream artifacts: confirm
+   `/workspace/duckdb/austria.duckdb` schemas are intact OR the
+   relevant `austria-*.pmtiles` file refreshed, AS APPLICABLE to
+   what the notebook touched.
+
+Missing the CDP step caps the tier at `analysed on a live system`,
+NEVER `fully tested and validated` — the CDP step IS what proves
+the notebook actually runs end-to-end in the browser (the marimo
+export alone doesn't execute the embedded MapLibre JS).
+
+When the `chrome-devtools-ecovoyage` MCP is NOT loaded in the agent
+session (the .mcp.json entry is reachable but the harness didn't
+auto-load it), the CDP step must be flagged as **skipped** in the
+acceptance report — and the commit tier caps at `analysed on a
+live system`. Don't substitute curl-against-tile-URLs for the
+CDP-side proof; curl bypasses CORS, sees no JS, and tests a
+connection the user's browser never makes.
 
 ## Hard Cutover by Default — ONE PHASE, test EVERYTHING at the end
 
