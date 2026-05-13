@@ -77,7 +77,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-.run-output.ipynb
+.run-output*.ipynb
 
 # ov image build / eval scratch
 .build/
