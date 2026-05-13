@@ -181,6 +181,148 @@ def _(Path, os, textwrap):
                       CASE WHEN ST_GeometryType(geometry) IN ('POLYGON','MULTIPOLYGON')
                            THEN ST_Area(geometry) ELSE NULL END        AS way_area"""
 
+        # Per-theme SELECT field fragments — theme-specific projections appended
+        # after _COMMON_SELECT_FIELDS in each freestiler task's SELECT body. The
+        # tag inventory for each theme is cited from upstream rendering style
+        # configs (see the per-task comments). R3: one definition per theme,
+        # used by both the theme's standalone task AND the consolidated
+        # austria-ecovoyage UNION ALL BY NAME query.
+
+        _CYCLE_FIELDS = """
+                      tags['cycleway']                                 AS cycleway,
+                      tags['cycleway:left']                            AS cycleway_left,
+                      tags['cycleway:right']                           AS cycleway_right,
+                      tags['cycleway:both']                            AS cycleway_both,
+                      tags['bicycle']                                  AS bicycle,
+                      tags['bicycle_road']                             AS bicycle_road,
+                      tags['oneway:bicycle']                           AS oneway_bicycle,
+                      tags['mtb:scale']                                AS mtb_scale,
+                      tags['mtb:scale:uphill']                         AS mtb_scale_uphill,
+                      tags['smoothness']                               AS smoothness,
+                      tags['segregated']                               AS segregated,
+                      tags['route']                                    AS route,
+                      tags['network']                                  AS network,
+                      tags['amenity']                                  AS amenity"""
+
+        _CYCLE_WHERE = """tags['highway'] IS NOT NULL
+                      OR tags['cycleway'] IS NOT NULL
+                      OR tags['route'] = 'bicycle'
+                      OR tags['amenity'] IN ('bicycle_parking','bicycle_rental','bicycle_repair_station')"""
+
+        _TOPO_FIELDS = """
+                      tags['place']                                    AS place,
+                      tags['boundary']                                 AS boundary,
+                      TRY_CAST(tags['admin_level'] AS INTEGER)         AS admin_level,
+                      tags['landuse']                                  AS landuse,
+                      tags['landcover']                                AS landcover,
+                      tags['waterway']                                 AS waterway,
+                      tags['intermittent']                             AS intermittent,
+                      tags['aerialway']                                AS aerialway,
+                      tags['power']                                    AS power,
+                      tags['building']                                 AS building,
+                      tags['amenity']                                  AS amenity,
+                      tags['historic']                                 AS historic,
+                      tags['man_made']                                 AS man_made,
+                      tags['mountain_pass']                            AS mountain_pass,
+                      tags['wikipedia']                                AS wikipedia,
+                      tags['railway']                                  AS railway"""
+
+        _TOPO_WHERE = """tags['highway'] IN ('motorway','trunk','primary','secondary','tertiary','unclassified',
+                                               'residential','service','track','path','footway','bridleway','cycleway','steps')
+                      OR tags['railway'] IS NOT NULL
+                      OR tags['waterway'] IS NOT NULL
+                      OR tags['natural'] IS NOT NULL
+                      OR tags['landuse'] IN ('forest','meadow','farmland','farmyard','grass','orchard','vineyard',
+                                               'cemetery','residential','industrial','commercial','quarry')
+                      OR tags['boundary'] IS NOT NULL
+                      OR tags['place'] IS NOT NULL
+                      OR tags['amenity'] IS NOT NULL
+                      OR tags['tourism'] IS NOT NULL
+                      OR tags['aerialway'] IS NOT NULL
+                      OR tags['building'] IS NOT NULL
+                      OR tags['power'] IN ('line','minor_line','tower','pole','substation','generator')
+                      OR tags['man_made'] IN ('tower','mast','lighthouse','windmill','chimney','communications_tower')"""
+
+        # Railway-specific fields plus the z_order CASE expression that mirrors
+        # OpenRailwayMap CartoCSS layer ordering (tunnels below, bridges above,
+        # mainline rail above transit + abandoned/preserved tracks).
+        _RAILWAY_FIELDS = """
+                      tags['railway']                                  AS railway,
+                      tags['public_transport']                         AS public_transport,
+                      tags['usage']                                    AS usage,
+                      tags['service']                                  AS service,
+                      tags['construction']                             AS construction,
+                      tags['cutting']                                  AS cutting,
+                      tags['embankment']                               AS embankment,
+                      tags['abandoned']                                AS abandoned,
+                      tags['disused']                                  AS disused,
+                      tags['razed']                                    AS razed,
+                      tags['proposed']                                 AS proposed,
+                      tags['man_made']                                 AS man_made,
+                      tags['power']                                    AS power,
+                      tags['area']                                     AS area,
+                      tags['electrified']                              AS electrified,
+                      TRY_CAST(tags['frequency'] AS DOUBLE)            AS frequency,
+                      TRY_CAST(tags['voltage'] AS INTEGER)             AS voltage,
+                      tags['deelectrified']                            AS deelectrified,
+                      tags['construction:electrified']                 AS construction_electrified,
+                      TRY_CAST(tags['construction:frequency'] AS DOUBLE)  AS construction_frequency,
+                      TRY_CAST(tags['construction:voltage'] AS INTEGER)   AS construction_voltage,
+                      tags['proposed:electrified']                     AS proposed_electrified,
+                      TRY_CAST(tags['proposed:frequency'] AS DOUBLE)      AS proposed_frequency,
+                      TRY_CAST(tags['proposed:voltage'] AS INTEGER)       AS proposed_voltage,
+                      tags['abandoned:electrified']                    AS abandoned_electrified,
+                      tags['maxspeed']                                 AS maxspeed,
+                      tags['maxspeed:forward']                         AS maxspeed_forward,
+                      tags['maxspeed:backward']                        AS maxspeed_backward,
+                      tags['railway:preferred_direction']              AS preferred_direction,
+                      tags['railway:position']                         AS railway_position,
+                      tags['railway:position:detail']                  AS railway_position_detail,
+                      tags['railway:local_operated']                   AS railway_local_operated,
+                      tags['railway:signal:direction']                 AS signal_direction,
+                      tags['railway:signal:speed_limit']               AS signal_speed_limit,
+                      tags['railway:signal:speed_limit:form']          AS signal_speed_limit_form,
+                      tags['railway:signal:speed_limit:speed']         AS signal_speed_limit_speed,
+                      tags['railway:signal:speed_limit_distant']       AS signal_speed_limit_distant,
+                      tags['railway:signal:speed_limit_distant:form']  AS signal_speed_limit_distant_form,
+                      tags['railway:signal:speed_limit_distant:speed'] AS signal_speed_limit_distant_speed,
+                      COALESCE(TRY_CAST(tags['layer'] AS INTEGER), 0) * 10
+                        + CASE WHEN tags['tunnel'] IS NOT NULL THEN -10
+                               WHEN tags['bridge'] IS NOT NULL THEN  10
+                               ELSE 0 END
+                        + CASE WHEN tags['railway'] = 'rail' THEN 5
+                               WHEN tags['railway'] IN ('light_rail','subway','tram','narrow_gauge','monorail','funicular') THEN 3
+                               WHEN tags['railway'] IN ('preserved','miniature') THEN 1
+                               ELSE 0 END                              AS z_order"""
+
+        _RAILWAY_WHERE = """tags['railway'] IS NOT NULL
+                      OR tags['public_transport'] IN ('station','stop_position','platform','halt')
+                      OR (tags['power'] = 'line' AND tags['line'] = 'busbar')
+                      OR (tags['man_made'] IN ('mast','tower')
+                          AND tags['tower:type'] = 'communication'
+                          AND tags['railway'] IS NOT NULL)"""
+
+        _HIKING_FIELDS = """
+                      tags['sac_scale']                                AS sac_scale,
+                      tags['trail_visibility']                         AS trail_visibility,
+                      tags['mtb:scale']                                AS mtb_scale,
+                      tags['foot']                                     AS foot,
+                      tags['hiking']                                   AS hiking,
+                      tags['informal']                                 AS informal,
+                      tags['route']                                    AS route,
+                      tags['network']                                  AS network,
+                      tags['osmc:symbol']                              AS osmc_symbol,
+                      tags['wheelchair']                               AS wheelchair,
+                      tags['mountain_pass']                            AS mountain_pass,
+                      tags['railway']                                  AS railway"""
+
+        _HIKING_WHERE = """tags['highway'] IN ('path','footway','track','bridleway','steps','pedestrian')
+                      OR tags['route'] = 'hiking'
+                      OR tags['sac_scale'] IS NOT NULL
+                      OR tags['natural'] IN ('peak','saddle','cliff','ridge','arete','volcano','spring','cave_entrance','glacier')
+                      OR tags['tourism'] IN ('alpine_hut','wilderness_hut','viewpoint','camp_site','picnic_site','information')
+                      OR tags['mountain_pass'] IS NOT NULL"""
+
 
         def _needs_regen(path: Path) -> bool:
             """Return True if `path` is missing OR was produced in a
@@ -313,72 +455,9 @@ def _(Path, os, textwrap):
                 if not _needs_regen(out):
                     return str(out)
                 query = f"""
-                    SELECT
-                      feature_id                                       AS osm_id,
-                      geometry,
-                      tags['railway']                               AS railway,
-                      tags['public_transport']                      AS public_transport,
-                      tags['usage']                                 AS usage,
-                      tags['service']                               AS service,
-                      tags['construction']                          AS construction,
-                      tags['tunnel']                                AS tunnel,
-                      tags['bridge']                                AS bridge,
-                      tags['cutting']                               AS cutting,
-                      tags['embankment']                            AS embankment,
-                      tags['abandoned']                             AS abandoned,
-                      tags['disused']                               AS disused,
-                      tags['razed']                                 AS razed,
-                      tags['proposed']                              AS proposed,
-                      tags['man_made']                              AS man_made,
-                      tags['power']                                 AS power,
-                      tags['area']                                  AS area,
-                      TRY_CAST(tags['layer'] AS INTEGER)            AS layer,
-                      TRY_CAST(tags['ele'] AS DOUBLE)               AS ele,
-                      tags['name']                                  AS name,
-                      tags['ref']                                   AS ref,
-                      tags['electrified']                           AS electrified,
-                      TRY_CAST(tags['frequency'] AS DOUBLE)         AS frequency,
-                      TRY_CAST(tags['voltage'] AS INTEGER)          AS voltage,
-                      tags['deelectrified']                         AS deelectrified,
-                      tags['construction:electrified']              AS construction_electrified,
-                      TRY_CAST(tags['construction:frequency'] AS DOUBLE)  AS construction_frequency,
-                      TRY_CAST(tags['construction:voltage'] AS INTEGER)   AS construction_voltage,
-                      tags['proposed:electrified']                  AS proposed_electrified,
-                      TRY_CAST(tags['proposed:frequency'] AS DOUBLE)      AS proposed_frequency,
-                      TRY_CAST(tags['proposed:voltage'] AS INTEGER)       AS proposed_voltage,
-                      tags['abandoned:electrified']                 AS abandoned_electrified,
-                      tags['maxspeed']                              AS maxspeed,
-                      tags['maxspeed:forward']                      AS maxspeed_forward,
-                      tags['maxspeed:backward']                     AS maxspeed_backward,
-                      tags['railway:preferred_direction']           AS preferred_direction,
-                      tags['railway:position']                      AS railway_position,
-                      tags['railway:position:detail']               AS railway_position_detail,
-                      tags['railway:local_operated']                AS railway_local_operated,
-                      tags['railway:signal:direction']              AS signal_direction,
-                      tags['railway:signal:speed_limit']            AS signal_speed_limit,
-                      tags['railway:signal:speed_limit:form']       AS signal_speed_limit_form,
-                      tags['railway:signal:speed_limit:speed']      AS signal_speed_limit_speed,
-                      tags['railway:signal:speed_limit_distant']    AS signal_speed_limit_distant,
-                      tags['railway:signal:speed_limit_distant:form']  AS signal_speed_limit_distant_form,
-                      tags['railway:signal:speed_limit_distant:speed'] AS signal_speed_limit_distant_speed,
-                      CASE WHEN ST_GeometryType(geometry) IN ('POLYGON','MULTIPOLYGON')
-                           THEN ST_Area(geometry) ELSE NULL END        AS way_area,
-                      COALESCE(TRY_CAST(tags['layer'] AS INTEGER), 0) * 10
-                        + CASE WHEN tags['tunnel'] IS NOT NULL THEN -10
-                               WHEN tags['bridge'] IS NOT NULL THEN  10
-                               ELSE 0 END
-                        + CASE WHEN tags['railway'] = 'rail' THEN 5
-                               WHEN tags['railway'] IN ('light_rail','subway','tram','narrow_gauge','monorail','funicular') THEN 3
-                               WHEN tags['railway'] IN ('preserved','miniature') THEN 1
-                               ELSE 0 END                              AS z_order
+                    SELECT{_COMMON_SELECT_FIELDS},{_RAILWAY_FIELDS}
                     FROM read_parquet('{parquet_path}')
-                    WHERE
-                      tags['railway'] IS NOT NULL
-                      OR tags['public_transport'] IN ('station','stop_position','platform','halt')
-                      OR (tags['power'] = 'line' AND tags['line'] = 'busbar')
-                      OR (tags['man_made'] IN ('mast','tower')
-                          AND tags['tower:type'] = 'communication'
-                          AND tags['railway'] IS NOT NULL)
+                    WHERE {_RAILWAY_WHERE}
                 """
                 # Inner-tile encoding: MVT (Mapbox Vector Tile, protobuf).
                 # The original plan was tile_format="mlt" (MapLibre Tile spec)
@@ -415,26 +494,9 @@ def _(Path, os, textwrap):
                 if not _needs_regen(out):
                     return str(out)
                 query = f"""
-                    SELECT{_COMMON_SELECT_FIELDS},
-                      tags['cycleway']                                 AS cycleway,
-                      tags['cycleway:left']                            AS cycleway_left,
-                      tags['cycleway:right']                           AS cycleway_right,
-                      tags['cycleway:both']                            AS cycleway_both,
-                      tags['bicycle']                                  AS bicycle,
-                      tags['bicycle_road']                             AS bicycle_road,
-                      tags['oneway:bicycle']                           AS oneway_bicycle,
-                      tags['mtb:scale']                                AS mtb_scale,
-                      tags['mtb:scale:uphill']                         AS mtb_scale_uphill,
-                      tags['smoothness']                               AS smoothness,
-                      tags['segregated']                               AS segregated,
-                      tags['route']                                    AS route,
-                      tags['network']                                  AS network,
-                      tags['amenity']                                  AS amenity
+                    SELECT{_COMMON_SELECT_FIELDS},{_CYCLE_FIELDS}
                     FROM read_parquet('{parquet_path}')
-                    WHERE tags['highway'] IS NOT NULL
-                       OR tags['cycleway'] IS NOT NULL
-                       OR tags['route'] = 'bicycle'
-                       OR tags['amenity'] IN ('bicycle_parking','bicycle_rental','bicycle_repair_station')
+                    WHERE {_CYCLE_WHERE}
                 """
                 freestiler.freestile_query(
                     query=query,
@@ -460,39 +522,9 @@ def _(Path, os, textwrap):
                 if not _needs_regen(out):
                     return str(out)
                 query = f"""
-                    SELECT{_COMMON_SELECT_FIELDS},
-                      tags['place']                                    AS place,
-                      tags['boundary']                                 AS boundary,
-                      TRY_CAST(tags['admin_level'] AS INTEGER)         AS admin_level,
-                      tags['landuse']                                  AS landuse,
-                      tags['landcover']                                AS landcover,
-                      tags['waterway']                                 AS waterway,
-                      tags['intermittent']                             AS intermittent,
-                      tags['aerialway']                                AS aerialway,
-                      tags['power']                                    AS power,
-                      tags['building']                                 AS building,
-                      tags['amenity']                                  AS amenity,
-                      tags['historic']                                 AS historic,
-                      tags['man_made']                                 AS man_made,
-                      tags['mountain_pass']                            AS mountain_pass,
-                      tags['wikipedia']                                AS wikipedia,
-                      tags['railway']                                  AS railway
+                    SELECT{_COMMON_SELECT_FIELDS},{_TOPO_FIELDS}
                     FROM read_parquet('{parquet_path}')
-                    WHERE tags['highway'] IN ('motorway','trunk','primary','secondary','tertiary','unclassified',
-                                               'residential','service','track','path','footway','bridleway','cycleway','steps')
-                       OR tags['railway'] IS NOT NULL
-                       OR tags['waterway'] IS NOT NULL
-                       OR tags['natural'] IS NOT NULL
-                       OR tags['landuse'] IN ('forest','meadow','farmland','farmyard','grass','orchard','vineyard',
-                                               'cemetery','residential','industrial','commercial','quarry')
-                       OR tags['boundary'] IS NOT NULL
-                       OR tags['place'] IS NOT NULL
-                       OR tags['amenity'] IS NOT NULL
-                       OR tags['tourism'] IS NOT NULL
-                       OR tags['aerialway'] IS NOT NULL
-                       OR tags['building'] IS NOT NULL
-                       OR tags['power'] IN ('line','minor_line','tower','pole','substation','generator')
-                       OR tags['man_made'] IN ('tower','mast','lighthouse','windmill','chimney','communications_tower')
+                    WHERE {_TOPO_WHERE}
                 """
                 freestiler.freestile_query(
                     query=query,
@@ -516,31 +548,70 @@ def _(Path, os, textwrap):
                 if not _needs_regen(out):
                     return str(out)
                 query = f"""
-                    SELECT{_COMMON_SELECT_FIELDS},
-                      tags['sac_scale']                                AS sac_scale,
-                      tags['trail_visibility']                         AS trail_visibility,
-                      tags['mtb:scale']                                AS mtb_scale,
-                      tags['foot']                                     AS foot,
-                      tags['hiking']                                   AS hiking,
-                      tags['informal']                                 AS informal,
-                      tags['route']                                    AS route,
-                      tags['network']                                  AS network,
-                      tags['osmc:symbol']                              AS osmc_symbol,
-                      tags['wheelchair']                               AS wheelchair,
-                      tags['mountain_pass']                            AS mountain_pass,
-                      tags['railway']                                  AS railway
+                    SELECT{_COMMON_SELECT_FIELDS},{_HIKING_FIELDS}
                     FROM read_parquet('{parquet_path}')
-                    WHERE tags['highway'] IN ('path','footway','track','bridleway','steps','pedestrian')
-                       OR tags['route'] = 'hiking'
-                       OR tags['sac_scale'] IS NOT NULL
-                       OR tags['natural'] IN ('peak','saddle','cliff','ridge','arete','volcano','spring','cave_entrance','glacier')
-                       OR tags['tourism'] IN ('alpine_hut','wilderness_hut','viewpoint','camp_site','picnic_site','information')
-                       OR tags['mountain_pass'] IS NOT NULL
+                    WHERE {_HIKING_WHERE}
                 """
                 freestiler.freestile_query(
                     query=query,
                     output=str(out),
                     layer_name="austria-hiking",
+                    min_zoom=0,
+                    max_zoom=14,
+                )
+                return str(out)
+
+            @task
+            def freestiler_ecovoyage_convert(parquet_path: str) -> str:
+                # Consolidated single-PMTiles output carrying the union of all
+                # four themes (cycle / topo / railway / hiking) in ONE vector
+                # layer (`austria-ecovoyage`) discriminated by a `theme` column.
+                # Built FROM SCRATCH via a single optimized DuckDB query — no
+                # tile-join, no pmtiles merge of the existing theme archives.
+                #
+                # Optimization shape:
+                #   1. MATERIALIZED CTE pre-filters the parquet ONCE with the
+                #      UNION of all four themes' WHERE predicates.
+                #   2. Four UNION ALL BY NAME subqueries read from the same
+                #      materialized base. Each emits its theme's column set
+                #      (theme-specific fields + the shared _COMMON_SELECT_FIELDS);
+                #      UNION ALL BY NAME pads missing columns with NULL.
+                #   3. freestiler streams DuckDB rows directly into the Rust
+                #      tiling engine — no Python materialization.
+                # A row that matches multiple themes is emitted once per matching
+                # theme so MapLibre can style each appearance independently via a
+                # ["==", ["get", "theme"], "<name>"] filter clause prepended to
+                # every style layer.
+                import freestiler
+                TILES.mkdir(parents=True, exist_ok=True)
+                out = TILES / "austria-ecovoyage.pmtiles"
+                if not _needs_regen(out):
+                    return str(out)
+                query = f"""
+                    WITH base AS MATERIALIZED (
+                        SELECT feature_id, geometry, tags
+                        FROM read_parquet('{parquet_path}')
+                        WHERE ({_CYCLE_WHERE})
+                           OR ({_TOPO_WHERE})
+                           OR ({_RAILWAY_WHERE})
+                           OR ({_HIKING_WHERE})
+                    )
+                    SELECT 'cycle' AS theme,{_COMMON_SELECT_FIELDS},{_CYCLE_FIELDS}
+                    FROM base WHERE {_CYCLE_WHERE}
+                    UNION ALL BY NAME
+                    SELECT 'topo' AS theme,{_COMMON_SELECT_FIELDS},{_TOPO_FIELDS}
+                    FROM base WHERE {_TOPO_WHERE}
+                    UNION ALL BY NAME
+                    SELECT 'railway' AS theme,{_COMMON_SELECT_FIELDS},{_RAILWAY_FIELDS}
+                    FROM base WHERE {_RAILWAY_WHERE}
+                    UNION ALL BY NAME
+                    SELECT 'hiking' AS theme,{_COMMON_SELECT_FIELDS},{_HIKING_FIELDS}
+                    FROM base WHERE {_HIKING_WHERE}
+                """
+                freestiler.freestile_query(
+                    query=query,
+                    output=str(out),
+                    layer_name="austria-ecovoyage",
                     min_zoom=0,
                     max_zoom=14,
                 )
@@ -608,6 +679,7 @@ def _(Path, os, textwrap):
                 freestiler_cycle_convert(parquet),
                 freestiler_topo_convert(parquet),
                 freestiler_hiking_convert(parquet),
+                freestiler_ecovoyage_convert(parquet),
             ])
 
 
@@ -976,6 +1048,403 @@ map_{js_var}.addControl(new maplibregl.NavigationControl({{ showZoom: true, show
 </body></html>"""
 
 
+@app.function
+def with_theme(theme: str, layers: list) -> list:
+    """For the consolidated `austria-ecovoyage` cell: prepend a
+    theme-equality clause to each style-layer's filter, so a paint
+    rule originally targeting all railway features only paints rows
+    whose `theme` discriminator column equals `theme`. Also rewrites
+    each layer's `id` with an `evo-` prefix so the merged style has
+    no id collisions across the four themes."""
+    result = []
+    theme_clause = ["==", ["get", "theme"], theme]
+    for layer in layers:
+        new_layer = {**layer, "id": f"evo-{layer['id']}"}
+        old_filter = layer.get("filter")
+        if old_filter is None:
+            new_layer["filter"] = theme_clause
+        elif isinstance(old_filter, list) and old_filter and old_filter[0] == "all":
+            new_layer["filter"] = ["all", theme_clause, *old_filter[1:]]
+        else:
+            new_layer["filter"] = ["all", theme_clause, old_filter]
+        result.append(new_layer)
+    return result
+
+
+@app.cell
+def _theme_styles():
+    # MapLibre style-layer lists per theme, factored out of the four
+    # individual theme map cells so the consolidated austria-ecovoyage
+    # cell can reuse them via with_theme(...). R3: one source of truth
+    # for each theme's paint rules; both the standalone theme cell and
+    # the ecovoyage cell pull from the same constants.
+
+    RAILWAY_STYLE = [
+        # Tunnels (rendered below everything else via order)
+        {"id": "rail-tunnel", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["!=", ["get", "tunnel"], None]],
+         "paint": {"line-color": "#888888", "line-width": 1.0,
+                   "line-dasharray": [2, 2]}},
+        # Construction / proposed
+        {"id": "rail-construction", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["!=", ["get", "construction"], None]],
+         "paint": {"line-color": "#aaaaaa", "line-width": 1.0,
+                   "line-dasharray": [4, 2]}},
+        # Abandoned / disused / razed
+        {"id": "rail-disused", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["any",
+                     ["!=", ["get", "abandoned"], None],
+                     ["!=", ["get", "disused"], None],
+                     ["!=", ["get", "razed"], None]]],
+         "paint": {"line-color": "#cccccc", "line-width": 0.8}},
+        # Service tracks (sidings, yards, spurs)
+        {"id": "rail-service", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "railway"], "rail"],
+                    ["!=", ["get", "service"], None]],
+         "paint": {"line-color": "#888888", "line-width": 0.8}},
+        # Branch lines (rail without usage=main)
+        {"id": "rail-branch", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "railway"], "rail"],
+                    ["!=", ["get", "usage"], "main"],
+                    ["==", ["get", "service"], None]],
+         "paint": {"line-color": "#cc6633", "line-width": 1.2}},
+        # Mainline rail (usage=main) — top of the line hierarchy
+        {"id": "rail-main", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "railway"], "rail"],
+                    ["==", ["get", "usage"], "main"]],
+         "paint": {"line-color": "#3366cc", "line-width": 1.6}},
+        # Urban transit
+        {"id": "rail-transit", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "railway"],
+                     ["literal", ["tram", "light_rail", "subway", "monorail"]]]],
+         "paint": {"line-color": "#883388", "line-width": 1.0}},
+        # Narrow gauge / funicular / preserved / miniature
+        {"id": "rail-narrow", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "railway"],
+                     ["literal", ["narrow_gauge", "funicular", "preserved", "miniature"]]]],
+         "paint": {"line-color": "#5a8c2a", "line-width": 1.0}},
+        # Stations + halts (point and polygon)
+        {"id": "stations-fill", "type": "fill",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Polygon"],
+                    ["any",
+                     ["==", ["get", "railway"], "station"],
+                     ["==", ["get", "public_transport"], "station"]]],
+         "paint": {"fill-color": "#3366cc", "fill-opacity": 0.25,
+                   "fill-outline-color": "#3366cc"}},
+        {"id": "stations-pt", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["any",
+                     ["==", ["get", "railway"], "station"],
+                     ["==", ["get", "railway"], "halt"],
+                     ["==", ["get", "public_transport"], "station"]]],
+         "paint": {"circle-color": "#3366cc",
+                   "circle-radius": 4,
+                   "circle-stroke-color": "#ffffff",
+                   "circle-stroke-width": 1}},
+        # Signals
+        {"id": "signals", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["==", ["get", "railway"], "signal"]],
+         "paint": {"circle-color": "#cc3333",
+                   "circle-radius": 2}},
+    ]
+
+    CYCLE_STYLE = [
+        # Road/path context (muted)
+        {"id": "ctx-road", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["motorway","trunk","primary","secondary","tertiary"]]]],
+         "paint": {"line-color": "#cccccc", "line-width": 0.6}},
+        {"id": "ctx-minor", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["unclassified","residential","service","track"]]]],
+         "paint": {"line-color": "#dddddd", "line-width": 0.4}},
+        # Cycleways
+        {"id": "cycle-lane", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "cycleway"],
+                     ["literal", ["lane","shared_lane","share_busway"]]]],
+         "paint": {"line-color": "#3388ff",
+                   "line-width": 1.2,
+                   "line-dasharray": [3, 2]}},
+        {"id": "cycle-track", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["any",
+                     ["==", ["get", "cycleway"], "track"],
+                     ["==", ["get", "segregated"], "yes"]]],
+         "paint": {"line-color": "#2e8b3a", "line-width": 1.4}},
+        # Dedicated cycleway/bicycle_road highways
+        {"id": "cycle-dedicated", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["any",
+                     ["==", ["get", "highway"], "cycleway"],
+                     ["==", ["get", "bicycle_road"], "yes"]]],
+         "paint": {"line-color": "#1e6f2c", "line-width": 1.8}},
+        # Cycle routes (relation members tagged route=bicycle)
+        {"id": "cycle-route", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "route"], "bicycle"]],
+         "paint": {"line-color": "#3050d0",
+                   "line-width": 2.0,
+                   "line-opacity": 0.65}},
+        # MTB difficult trails
+        {"id": "cycle-mtb-hard", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "mtb_scale"],
+                     ["literal", ["3","4","5","6"]]]],
+         "paint": {"line-color": "#d24a1f", "line-width": 1.4,
+                   "line-dasharray": [4, 2]}},
+        # Bicycle amenities (parking, rental, repair)
+        {"id": "cycle-amenity", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["in", ["get", "amenity"],
+                     ["literal", ["bicycle_parking","bicycle_rental","bicycle_repair_station"]]]],
+         "paint": {"circle-color": "#1e6f2c",
+                   "circle-radius": 3.5,
+                   "circle-stroke-color": "#ffffff",
+                   "circle-stroke-width": 1}},
+    ]
+
+    TOPO_STYLE = [
+        # Landuse polygons (drawn first, below everything)
+        {"id": "topo-forest", "type": "fill",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Polygon"],
+                    ["in", ["get", "landuse"],
+                     ["literal", ["forest","wood"]]]],
+         "paint": {"fill-color": "#9bbf8a", "fill-opacity": 0.55}},
+        {"id": "topo-meadow", "type": "fill",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Polygon"],
+                    ["in", ["get", "landuse"],
+                     ["literal", ["meadow","grass","orchard","vineyard","farmland","farmyard"]]]],
+         "paint": {"fill-color": "#dfe9c8", "fill-opacity": 0.5}},
+        {"id": "topo-urban", "type": "fill",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Polygon"],
+                    ["in", ["get", "landuse"],
+                     ["literal", ["residential","industrial","commercial"]]]],
+         "paint": {"fill-color": "#e8d8c8", "fill-opacity": 0.45}},
+        # Natural polygons (water bodies, glaciers, scree)
+        {"id": "topo-water", "type": "fill",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Polygon"],
+                    ["==", ["get", "natural"], "water"]],
+         "paint": {"fill-color": "#a8c8e8", "fill-opacity": 0.85}},
+        {"id": "topo-glacier", "type": "fill",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Polygon"],
+                    ["==", ["get", "natural"], "glacier"]],
+         "paint": {"fill-color": "#eaf2ff", "fill-opacity": 0.9,
+                   "fill-outline-color": "#88a8c8"}},
+        # Waterways (lines)
+        {"id": "topo-waterway", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["!=", ["get", "waterway"], None]],
+         "paint": {"line-color": "#4a90c8", "line-width": 0.8}},
+        # Roads thinned for topo context
+        {"id": "topo-road-major", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["motorway","trunk","primary"]]]],
+         "paint": {"line-color": "#b08858", "line-width": 1.2}},
+        {"id": "topo-road-minor", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["secondary","tertiary","unclassified","residential"]]]],
+         "paint": {"line-color": "#b0b0b0", "line-width": 0.6}},
+        # Railways (gray dashed)
+        {"id": "topo-rail", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["!=", ["get", "railway"], None]],
+         "paint": {"line-color": "#606060", "line-width": 0.8,
+                   "line-dasharray": [3, 2]}},
+        # Buildings
+        {"id": "topo-building", "type": "fill",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Polygon"],
+                    ["!=", ["get", "building"], None]],
+         "paint": {"fill-color": "#9c8c7c", "fill-opacity": 0.6}},
+        # Peaks (orange triangles)
+        {"id": "topo-peak", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["in", ["get", "natural"],
+                     ["literal", ["peak","volcano"]]]],
+         "paint": {"circle-color": "#c8642a",
+                   "circle-radius": 3,
+                   "circle-stroke-color": "#ffffff",
+                   "circle-stroke-width": 1}},
+        # Saddles + mountain passes (yellow dots)
+        {"id": "topo-saddle", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["any",
+                     ["==", ["get", "natural"], "saddle"],
+                     ["!=", ["get", "mountain_pass"], None]]],
+         "paint": {"circle-color": "#dccb44", "circle-radius": 2.5,
+                   "circle-stroke-color": "#a08e2a",
+                   "circle-stroke-width": 1}},
+        # Alpine huts (red squares done with small circles)
+        {"id": "topo-hut", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["in", ["get", "tourism"],
+                     ["literal", ["alpine_hut","wilderness_hut"]]]],
+         "paint": {"circle-color": "#cc3333",
+                   "circle-radius": 3.5,
+                   "circle-stroke-color": "#ffffff",
+                   "circle-stroke-width": 1}},
+    ]
+
+    HIKING_STYLE = [
+        # Base trails (anything path-like, gray underlay)
+        {"id": "hike-trail-base", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["path","footway","track","bridleway","steps","pedestrian"]]]],
+         "paint": {"line-color": "#888888", "line-width": 0.8}},
+        # SAC scale T1-T2 (easy/mountain hiking) — green solid
+        {"id": "hike-sac-easy", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "sac_scale"],
+                     ["literal", ["hiking","mountain_hiking"]]]],
+         "paint": {"line-color": "#2e8b3a", "line-width": 1.4}},
+        # SAC scale T3-T4 — red dashed
+        {"id": "hike-sac-demanding", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "sac_scale"],
+                     ["literal", ["demanding_mountain_hiking","alpine_hiking"]]]],
+         "paint": {"line-color": "#d24a1f", "line-width": 1.4,
+                   "line-dasharray": [4, 2]}},
+        # SAC scale T5-T6 — black dashed
+        {"id": "hike-sac-extreme", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "sac_scale"],
+                     ["literal", ["demanding_alpine_hiking","difficult_alpine_hiking"]]]],
+         "paint": {"line-color": "#202020", "line-width": 1.6,
+                   "line-dasharray": [2, 3]}},
+        # Hiking-route relations colored by network
+        {"id": "hike-route-iwn", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "route"], "hiking"],
+                    ["==", ["get", "network"], "iwn"]],
+         "paint": {"line-color": "#7e22ce", "line-width": 2.2,
+                   "line-opacity": 0.6}},
+        {"id": "hike-route-nwn", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "route"], "hiking"],
+                    ["==", ["get", "network"], "nwn"]],
+         "paint": {"line-color": "#cc2233", "line-width": 1.8,
+                   "line-opacity": 0.6}},
+        {"id": "hike-route-rwn", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "route"], "hiking"],
+                    ["==", ["get", "network"], "rwn"]],
+         "paint": {"line-color": "#2244cc", "line-width": 1.4,
+                   "line-opacity": 0.6}},
+        {"id": "hike-route-lwn", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "route"], "hiking"],
+                    ["==", ["get", "network"], "lwn"]],
+         "paint": {"line-color": "#bba422", "line-width": 1.2,
+                   "line-opacity": 0.6}},
+        # Cliffs (gray)
+        {"id": "hike-cliff", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "natural"],
+                     ["literal", ["cliff","ridge","arete"]]]],
+         "paint": {"line-color": "#666666", "line-width": 0.8}},
+        # Mountain features
+        {"id": "hike-peak", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["in", ["get", "natural"],
+                     ["literal", ["peak","volcano"]]]],
+         "paint": {"circle-color": "#c8642a",
+                   "circle-radius": 3,
+                   "circle-stroke-color": "#ffffff",
+                   "circle-stroke-width": 1}},
+        {"id": "hike-saddle", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["any",
+                     ["==", ["get", "natural"], "saddle"],
+                     ["!=", ["get", "mountain_pass"], None]]],
+         "paint": {"circle-color": "#dccb44", "circle-radius": 2.5,
+                   "circle-stroke-color": "#a08e2a",
+                   "circle-stroke-width": 1}},
+        # Springs (blue dots)
+        {"id": "hike-spring", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["==", ["get", "natural"], "spring"]],
+         "paint": {"circle-color": "#4a90c8", "circle-radius": 2.5,
+                   "circle-stroke-color": "#ffffff",
+                   "circle-stroke-width": 1}},
+        # Alpine huts (red)
+        {"id": "hike-hut", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["in", ["get", "tourism"],
+                     ["literal", ["alpine_hut","wilderness_hut"]]]],
+         "paint": {"circle-color": "#cc3333", "circle-radius": 4,
+                   "circle-stroke-color": "#ffffff",
+                   "circle-stroke-width": 1.5}},
+        # Viewpoints (turquoise eye)
+        {"id": "hike-viewpoint", "type": "circle",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["==", ["get", "tourism"], "viewpoint"]],
+         "paint": {"circle-color": "#22aaaa", "circle-radius": 3,
+                   "circle-stroke-color": "#ffffff",
+                   "circle-stroke-width": 1}},
+    ]
+    return CYCLE_STYLE, HIKING_STYLE, RAILWAY_STYLE, TOPO_STYLE
+
+
 @app.cell
 def _(dag_run_states, martin, mo):
     # Pipeline 4 — DuckDB → freestiler. Renders the Austria PMTiles
@@ -1010,18 +1479,15 @@ def _(dag_run_states, martin, mo):
 
 
 @app.cell
-def _(dag_run_states, martin, mo):
+def _(RAILWAY_STYLE, dag_run_states, martin, mo):
     # OpenRailwayMap-aligned render of the austria-railway PMTiles
-    # archive (filtered to railway features only, projected to ORM's
-    # tag schema, encoded as MLT inside PMTiles when freestiler
-    # supports it — falls back to MVT transparently).
-    #
-    # Style mirrors the categorical color choices in OpenRailwayMap-
-    # CartoCSS/standard.mss at a coarse level: mainline rail in blue,
-    # branch lines in orange, urban transit (tram/light_rail/subway)
-    # in purple, freight-yard service tracks in gray, stations as
-    # filled circles. ORM's full electrification + signal styling
-    # ladder would land here in a follow-up.
+    # archive. Style is RAILWAY_STYLE (defined in the _theme_styles
+    # cell) — the same list also feeds the consolidated
+    # austria-ecovoyage cell via with_theme("railway", RAILWAY_STYLE).
+    # Mirrors categorical color choices in OpenRailwayMap-
+    # CartoCSS/standard.mss: mainline rail in blue, branch lines in
+    # orange, urban transit (tram/light_rail/subway) in purple,
+    # freight-yard service tracks in gray, stations as filled circles.
     mo.stop(
         dag_run_states.get("notebook_austria_pipeline") != "success",
         f"Waiting for notebook_austria_pipeline (state="
@@ -1034,94 +1500,7 @@ def _(dag_run_states, martin, mo):
             layer_name="austria-railway",
             center=[13.3, 47.7],
             zoom=7,
-            style_layers=[
-                # Tunnels (rendered below everything else via order)
-                {"id": "rail-tunnel", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["!=", ["get", "tunnel"], None]],
-                 "paint": {"line-color": "#888888", "line-width": 1.0,
-                           "line-dasharray": [2, 2]}},
-                # Construction / proposed
-                {"id": "rail-construction", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["!=", ["get", "construction"], None]],
-                 "paint": {"line-color": "#aaaaaa", "line-width": 1.0,
-                           "line-dasharray": [4, 2]}},
-                # Abandoned / disused / razed
-                {"id": "rail-disused", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["any",
-                             ["!=", ["get", "abandoned"], None],
-                             ["!=", ["get", "disused"], None],
-                             ["!=", ["get", "razed"], None]]],
-                 "paint": {"line-color": "#cccccc", "line-width": 0.8}},
-                # Service tracks (sidings, yards, spurs)
-                {"id": "rail-service", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["==", ["get", "railway"], "rail"],
-                            ["!=", ["get", "service"], None]],
-                 "paint": {"line-color": "#888888", "line-width": 0.8}},
-                # Branch lines (rail without usage=main)
-                {"id": "rail-branch", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["==", ["get", "railway"], "rail"],
-                            ["!=", ["get", "usage"], "main"],
-                            ["==", ["get", "service"], None]],
-                 "paint": {"line-color": "#cc6633", "line-width": 1.2}},
-                # Mainline rail (usage=main) — top of the line hierarchy
-                {"id": "rail-main", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["==", ["get", "railway"], "rail"],
-                            ["==", ["get", "usage"], "main"]],
-                 "paint": {"line-color": "#3366cc", "line-width": 1.6}},
-                # Urban transit
-                {"id": "rail-transit", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "railway"],
-                             ["literal", ["tram", "light_rail", "subway", "monorail"]]]],
-                 "paint": {"line-color": "#883388", "line-width": 1.0}},
-                # Narrow gauge / funicular / preserved / miniature
-                {"id": "rail-narrow", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "railway"],
-                             ["literal", ["narrow_gauge", "funicular", "preserved", "miniature"]]]],
-                 "paint": {"line-color": "#5a8c2a", "line-width": 1.0}},
-                # Stations + halts (point and polygon)
-                {"id": "stations-fill", "type": "fill",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Polygon"],
-                            ["any",
-                             ["==", ["get", "railway"], "station"],
-                             ["==", ["get", "public_transport"], "station"]]],
-                 "paint": {"fill-color": "#3366cc", "fill-opacity": 0.25,
-                           "fill-outline-color": "#3366cc"}},
-                {"id": "stations-pt", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["any",
-                             ["==", ["get", "railway"], "station"],
-                             ["==", ["get", "railway"], "halt"],
-                             ["==", ["get", "public_transport"], "station"]]],
-                 "paint": {"circle-color": "#3366cc",
-                           "circle-radius": 4,
-                           "circle-stroke-color": "#ffffff",
-                           "circle-stroke-width": 1}},
-                # Signals
-                {"id": "signals", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["==", ["get", "railway"], "signal"]],
-                 "paint": {"circle-color": "#cc3333",
-                           "circle-radius": 2}},
-            ],
+            style_layers=RAILWAY_STYLE,
         ),
         height="500px",
     )
@@ -1129,13 +1508,11 @@ def _(dag_run_states, martin, mo):
 
 
 @app.cell
-def _(dag_run_states, martin, mo):
-    # Cycle-themed render of the austria-cycle PMTiles archive.
-    # Tags projected from cyclemap/openmaptiles-cycle's transportation +
-    # cycleway sources. Style mirrors openmaptiles-cycle's cycle overlay:
-    # mainline rail/road context in muted gray, cycleways green
-    # (segregated) / blue (designated bike route), mtb:scale>=3 red-orange,
-    # bicycle amenities as small symbols.
+def _(CYCLE_STYLE, dag_run_states, martin, mo):
+    # Cycle-themed render of the austria-cycle PMTiles archive. Style is
+    # CYCLE_STYLE (defined in the _theme_styles cell) — also fed to the
+    # consolidated austria-ecovoyage cell via
+    # with_theme("cycle", CYCLE_STYLE).
     mo.stop(
         dag_run_states.get("notebook_austria_pipeline") != "success",
         f"Waiting for notebook_austria_pipeline (state="
@@ -1148,71 +1525,7 @@ def _(dag_run_states, martin, mo):
             layer_name="austria-cycle",
             center=[13.3, 47.7],
             zoom=7,
-            style_layers=[
-                # Road/path context (muted)
-                {"id": "ctx-road", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "highway"],
-                             ["literal", ["motorway","trunk","primary","secondary","tertiary"]]]],
-                 "paint": {"line-color": "#cccccc", "line-width": 0.6}},
-                {"id": "ctx-minor", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "highway"],
-                             ["literal", ["unclassified","residential","service","track"]]]],
-                 "paint": {"line-color": "#dddddd", "line-width": 0.4}},
-                # Cycleways
-                {"id": "cycle-lane", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "cycleway"],
-                             ["literal", ["lane","shared_lane","share_busway"]]]],
-                 "paint": {"line-color": "#3388ff",
-                           "line-width": 1.2,
-                           "line-dasharray": [3, 2]}},
-                {"id": "cycle-track", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["any",
-                             ["==", ["get", "cycleway"], "track"],
-                             ["==", ["get", "segregated"], "yes"]]],
-                 "paint": {"line-color": "#2e8b3a", "line-width": 1.4}},
-                # Dedicated cycleway/bicycle_road highways
-                {"id": "cycle-dedicated", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["any",
-                             ["==", ["get", "highway"], "cycleway"],
-                             ["==", ["get", "bicycle_road"], "yes"]]],
-                 "paint": {"line-color": "#1e6f2c", "line-width": 1.8}},
-                # Cycle routes (relation members tagged route=bicycle)
-                {"id": "cycle-route", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["==", ["get", "route"], "bicycle"]],
-                 "paint": {"line-color": "#3050d0",
-                           "line-width": 2.0,
-                           "line-opacity": 0.65}},
-                # MTB difficult trails
-                {"id": "cycle-mtb-hard", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "mtb_scale"],
-                             ["literal", ["3","4","5","6"]]]],
-                 "paint": {"line-color": "#d24a1f", "line-width": 1.4,
-                           "line-dasharray": [4, 2]}},
-                # Bicycle amenities (parking, rental, repair)
-                {"id": "cycle-amenity", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["in", ["get", "amenity"],
-                             ["literal", ["bicycle_parking","bicycle_rental","bicycle_repair_station"]]]],
-                 "paint": {"circle-color": "#1e6f2c",
-                           "circle-radius": 3.5,
-                           "circle-stroke-color": "#ffffff",
-                           "circle-stroke-width": 1}},
-            ],
+            style_layers=CYCLE_STYLE,
         ),
         height="500px",
     )
@@ -1220,13 +1533,11 @@ def _(dag_run_states, martin, mo):
 
 
 @app.cell
-def _(dag_run_states, martin, mo):
-    # Topo-themed render of the austria-topo PMTiles archive.
-    # Tags projected from OpenTopoMap's vector/tilemaker/process-otm.lua
-    # acceptance sets. OSM features only; DEM-derived contours are out
-    # of scope (separate raster pipeline). Style mirrors OTM's color
-    # choices: forest greens, water blues, peak triangles, hut icons,
-    # streets thinned to background context.
+def _(TOPO_STYLE, dag_run_states, martin, mo):
+    # Topo-themed render of the austria-topo PMTiles archive. Style is
+    # TOPO_STYLE (defined in the _theme_styles cell) — also fed to the
+    # consolidated austria-ecovoyage cell via
+    # with_theme("topo", TOPO_STYLE).
     mo.stop(
         dag_run_states.get("notebook_austria_pipeline") != "success",
         f"Waiting for notebook_austria_pipeline (state="
@@ -1239,101 +1550,7 @@ def _(dag_run_states, martin, mo):
             layer_name="austria-topo",
             center=[13.3, 47.7],
             zoom=7,
-            style_layers=[
-                # Landuse polygons (drawn first, below everything)
-                {"id": "topo-forest", "type": "fill",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Polygon"],
-                            ["in", ["get", "landuse"],
-                             ["literal", ["forest","wood"]]]],
-                 "paint": {"fill-color": "#9bbf8a", "fill-opacity": 0.55}},
-                {"id": "topo-meadow", "type": "fill",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Polygon"],
-                            ["in", ["get", "landuse"],
-                             ["literal", ["meadow","grass","orchard","vineyard","farmland","farmyard"]]]],
-                 "paint": {"fill-color": "#dfe9c8", "fill-opacity": 0.5}},
-                {"id": "topo-urban", "type": "fill",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Polygon"],
-                            ["in", ["get", "landuse"],
-                             ["literal", ["residential","industrial","commercial"]]]],
-                 "paint": {"fill-color": "#e8d8c8", "fill-opacity": 0.45}},
-                # Natural polygons (water bodies, glaciers, scree)
-                {"id": "topo-water", "type": "fill",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Polygon"],
-                            ["==", ["get", "natural"], "water"]],
-                 "paint": {"fill-color": "#a8c8e8", "fill-opacity": 0.85}},
-                {"id": "topo-glacier", "type": "fill",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Polygon"],
-                            ["==", ["get", "natural"], "glacier"]],
-                 "paint": {"fill-color": "#eaf2ff", "fill-opacity": 0.9,
-                           "fill-outline-color": "#88a8c8"}},
-                # Waterways (lines)
-                {"id": "topo-waterway", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["!=", ["get", "waterway"], None]],
-                 "paint": {"line-color": "#4a90c8", "line-width": 0.8}},
-                # Roads thinned for topo context
-                {"id": "topo-road-major", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "highway"],
-                             ["literal", ["motorway","trunk","primary"]]]],
-                 "paint": {"line-color": "#b08858", "line-width": 1.2}},
-                {"id": "topo-road-minor", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "highway"],
-                             ["literal", ["secondary","tertiary","unclassified","residential"]]]],
-                 "paint": {"line-color": "#b0b0b0", "line-width": 0.6}},
-                # Railways (gray dashed)
-                {"id": "topo-rail", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["!=", ["get", "railway"], None]],
-                 "paint": {"line-color": "#606060", "line-width": 0.8,
-                           "line-dasharray": [3, 2]}},
-                # Buildings
-                {"id": "topo-building", "type": "fill",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Polygon"],
-                            ["!=", ["get", "building"], None]],
-                 "paint": {"fill-color": "#9c8c7c", "fill-opacity": 0.6}},
-                # Peaks (orange triangles)
-                {"id": "topo-peak", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["in", ["get", "natural"],
-                             ["literal", ["peak","volcano"]]]],
-                 "paint": {"circle-color": "#c8642a",
-                           "circle-radius": 3,
-                           "circle-stroke-color": "#ffffff",
-                           "circle-stroke-width": 1}},
-                # Saddles + mountain passes (yellow dots)
-                {"id": "topo-saddle", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["any",
-                             ["==", ["get", "natural"], "saddle"],
-                             ["!=", ["get", "mountain_pass"], None]]],
-                 "paint": {"circle-color": "#dccb44", "circle-radius": 2.5,
-                           "circle-stroke-color": "#a08e2a",
-                           "circle-stroke-width": 1}},
-                # Alpine huts (red squares done with small circles)
-                {"id": "topo-hut", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["in", ["get", "tourism"],
-                             ["literal", ["alpine_hut","wilderness_hut"]]]],
-                 "paint": {"circle-color": "#cc3333",
-                           "circle-radius": 3.5,
-                           "circle-stroke-color": "#ffffff",
-                           "circle-stroke-width": 1}},
-            ],
+            style_layers=TOPO_STYLE,
         ),
         height="500px",
     )
@@ -1341,13 +1558,11 @@ def _(dag_run_states, martin, mo):
 
 
 @app.cell
-def _(dag_run_states, martin, mo):
-    # Hiking-themed render of the austria-hiking PMTiles archive.
-    # Tags projected from sletuffe/OpenHikingMap's mapnik XML styles.
-    # Trail difficulty by SAC scale: T1-T2 (hiking/mountain hiking) green;
-    # T3-T4 (demanding/alpine) red dashes; T5-T6 (difficult/very difficult
-    # alpine) black dashed. Hiking-route relations colored by network
-    # (nwn red, rwn blue, lwn yellow). Peaks + saddles + huts marked.
+def _(HIKING_STYLE, dag_run_states, martin, mo):
+    # Hiking-themed render of the austria-hiking PMTiles archive. Style
+    # is HIKING_STYLE (defined in the _theme_styles cell) — also fed to
+    # the consolidated austria-ecovoyage cell via
+    # with_theme("hiking", HIKING_STYLE).
     mo.stop(
         dag_run_states.get("notebook_austria_pipeline") != "success",
         f"Waiting for notebook_austria_pipeline (state="
@@ -1360,117 +1575,50 @@ def _(dag_run_states, martin, mo):
             layer_name="austria-hiking",
             center=[13.3, 47.7],
             zoom=7,
+            style_layers=HIKING_STYLE,
+        ),
+        height="500px",
+    )
+    return
+
+
+@app.cell
+def _(
+    CYCLE_STYLE,
+    HIKING_STYLE,
+    RAILWAY_STYLE,
+    TOPO_STYLE,
+    dag_run_states,
+    martin,
+    mo,
+):
+    # Consolidated austria-ecovoyage render — ALL FOUR themes layered
+    # into a single MapLibre map served from the single
+    # austria-ecovoyage.pmtiles archive (one vector layer with a
+    # `theme` discriminator column).
+    #
+    # Style stacking order: topo as base (forest/water/landuse/roads/
+    # buildings/peaks) → railway lines on top of topo → cycle routes
+    # over railway → hiking trails on top. Each style_layer's filter
+    # is prefixed with ["==", ["get", "theme"], "<name>"] via
+    # with_theme(...) so paint rules only target their theme's rows.
+    mo.stop(
+        dag_run_states.get("notebook_austria_pipeline") != "success",
+        f"Waiting for notebook_austria_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_pipeline')!r})",
+    )
+    mo.iframe(
+        build_pipeline_maplibre_html(
+            martin,
+            "austria-ecovoyage",
+            layer_name="austria-ecovoyage",
+            center=[13.3, 47.7],
+            zoom=7,
             style_layers=[
-                # Base trails (anything path-like, gray underlay)
-                {"id": "hike-trail-base", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "highway"],
-                             ["literal", ["path","footway","track","bridleway","steps","pedestrian"]]]],
-                 "paint": {"line-color": "#888888", "line-width": 0.8}},
-                # SAC scale T1-T2 (easy/mountain hiking) — green solid
-                {"id": "hike-sac-easy", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "sac_scale"],
-                             ["literal", ["hiking","mountain_hiking"]]]],
-                 "paint": {"line-color": "#2e8b3a", "line-width": 1.4}},
-                # SAC scale T3-T4 — red dashed
-                {"id": "hike-sac-demanding", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "sac_scale"],
-                             ["literal", ["demanding_mountain_hiking","alpine_hiking"]]]],
-                 "paint": {"line-color": "#d24a1f", "line-width": 1.4,
-                           "line-dasharray": [4, 2]}},
-                # SAC scale T5-T6 — black dashed
-                {"id": "hike-sac-extreme", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "sac_scale"],
-                             ["literal", ["demanding_alpine_hiking","difficult_alpine_hiking"]]]],
-                 "paint": {"line-color": "#202020", "line-width": 1.6,
-                           "line-dasharray": [2, 3]}},
-                # Hiking-route relations colored by network
-                {"id": "hike-route-iwn", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["==", ["get", "route"], "hiking"],
-                            ["==", ["get", "network"], "iwn"]],
-                 "paint": {"line-color": "#7e22ce", "line-width": 2.2,
-                           "line-opacity": 0.6}},
-                {"id": "hike-route-nwn", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["==", ["get", "route"], "hiking"],
-                            ["==", ["get", "network"], "nwn"]],
-                 "paint": {"line-color": "#cc2233", "line-width": 1.8,
-                           "line-opacity": 0.6}},
-                {"id": "hike-route-rwn", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["==", ["get", "route"], "hiking"],
-                            ["==", ["get", "network"], "rwn"]],
-                 "paint": {"line-color": "#2244cc", "line-width": 1.4,
-                           "line-opacity": 0.6}},
-                {"id": "hike-route-lwn", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["==", ["get", "route"], "hiking"],
-                            ["==", ["get", "network"], "lwn"]],
-                 "paint": {"line-color": "#bba422", "line-width": 1.2,
-                           "line-opacity": 0.6}},
-                # Cliffs (gray)
-                {"id": "hike-cliff", "type": "line",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "LineString"],
-                            ["in", ["get", "natural"],
-                             ["literal", ["cliff","ridge","arete"]]]],
-                 "paint": {"line-color": "#666666", "line-width": 0.8}},
-                # Mountain features
-                {"id": "hike-peak", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["in", ["get", "natural"],
-                             ["literal", ["peak","volcano"]]]],
-                 "paint": {"circle-color": "#c8642a",
-                           "circle-radius": 3,
-                           "circle-stroke-color": "#ffffff",
-                           "circle-stroke-width": 1}},
-                {"id": "hike-saddle", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["any",
-                             ["==", ["get", "natural"], "saddle"],
-                             ["!=", ["get", "mountain_pass"], None]]],
-                 "paint": {"circle-color": "#dccb44", "circle-radius": 2.5,
-                           "circle-stroke-color": "#a08e2a",
-                           "circle-stroke-width": 1}},
-                # Springs (blue dots)
-                {"id": "hike-spring", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["==", ["get", "natural"], "spring"]],
-                 "paint": {"circle-color": "#4a90c8", "circle-radius": 2.5,
-                           "circle-stroke-color": "#ffffff",
-                           "circle-stroke-width": 1}},
-                # Alpine huts (red)
-                {"id": "hike-hut", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["in", ["get", "tourism"],
-                             ["literal", ["alpine_hut","wilderness_hut"]]]],
-                 "paint": {"circle-color": "#cc3333", "circle-radius": 4,
-                           "circle-stroke-color": "#ffffff",
-                           "circle-stroke-width": 1.5}},
-                # Viewpoints (turquoise eye)
-                {"id": "hike-viewpoint", "type": "circle",
-                 "filter": ["all",
-                            ["==", ["geometry-type"], "Point"],
-                            ["==", ["get", "tourism"], "viewpoint"]],
-                 "paint": {"circle-color": "#22aaaa", "circle-radius": 3,
-                           "circle-stroke-color": "#ffffff",
-                           "circle-stroke-width": 1}},
+                *with_theme("topo", TOPO_STYLE),
+                *with_theme("railway", RAILWAY_STYLE),
+                *with_theme("cycle", CYCLE_STYLE),
+                *with_theme("hiking", HIKING_STYLE),
             ],
         ),
         height="500px",
