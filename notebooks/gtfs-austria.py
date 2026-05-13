@@ -80,15 +80,24 @@ def _(airflow_public, mo):
     | `gtfs.*` | EVERY *.parquet the feed shipped — `stops`, `routes`, `trips`, **`stop_times` (the full timetable)**, `shapes`, `calendar`, `calendar_dates`, `agency`, plus any optionals (`transfers`, `fare_*`, `frequencies`, `pathways`, …) | THIS notebook's DAG |
     | `transit.*` | `osm_stops`, `osm_route_masters`, `osm_routes`, `matched_stops`, `matched_routes`, `matched_trips` | THIS notebook's wiki-compliant joins |
 
-    Maps below:
+    Maps below — three viewpoints on the same unified dataset:
 
     - **Unified transit map** — `austria-railway` PMTiles (tracks)
       + `austria-transit` PMTiles (GTFS stops as points) overlaid on
       3D mapterhorn terrain + versatiles satellite imagery. Stops
       colour-coded by wiki-tier (gtfs:stop_id / ref:IFOPT /
-      spatial-last-resort) matched to OSM.
+      spatial-last-resort) matched to OSM. The "3D explore" view.
     - **Ecovoyage 5-theme map** — `austria-ecovoyage` PMTiles
-      (cycle/topo/railway/hiking) + GTFS transit overlay.
+      (cycle/topo/railway/hiking) + GTFS transit overlay on a flat
+      solid background. The "vector overview" view — every OSM
+      polygon fill (water / forest / landuse) drawn from OSM tags.
+    - **Satellite-overlay map** — `austria-ecovoyage` lines + points
+      ONLY (polygon fills stripped) + GTFS transit overlay, all
+      drawn on top of a flat versatiles satellite background. The
+      "satellite annotation" view — relies on the satellite imagery
+      to show water / forest / fields, overlays just the railways,
+      roads, hiking trails, peaks, alpine huts, and GTFS stops as
+      thin annotations.
 
     ## GTFS↔OSM unification model — see [OSM wiki: GTFS](https://wiki.openstreetmap.org/wiki/GTFS)
 
@@ -1046,6 +1055,17 @@ def with_theme(theme: str, layers: list) -> list:
     return result
 
 
+@app.function
+def lines_and_points_only(layers: list) -> list:
+    """Filter out fill-type layers so the satellite background shows
+    through. Used by the satellite-overlay map cell — polygon fills
+    (water / forest / glacier / farmland / residential) would
+    otherwise paint over the imagery satellite already renders.
+    Run AFTER `with_theme(...)` so the evo-prefixed layer IDs survive.
+    """
+    return [layer for layer in layers if layer.get("type") != "fill"]
+
+
 @app.cell
 def _theme_styles():
     # MapLibre style-layer lists per theme. Copied verbatim from
@@ -1608,6 +1628,75 @@ def _(
                 },
             },
             extra_layers=TRANSIT_STYLE,
+        ),
+        height="500px",
+    )
+    return
+
+
+@app.cell
+def _(
+    CYCLE_STYLE,
+    HIKING_STYLE,
+    Path,
+    RAILWAY_STYLE,
+    TOPO_STYLE,
+    TRANSIT_STYLE,
+    dag_run_states,
+    martin,
+    mo,
+):
+    # Satellite-overlay map — versatiles satellite imagery as the
+    # background; OSM-derived lines + points (railways, roads,
+    # hiking trails, cycle routes, peaks, alpine huts) overlaid as
+    # thin annotations; GTFS stops on top via TRANSIT_STYLE.
+    #
+    # Polygon-fill layers (water / forest / glacier / farmland /
+    # residential — all from TOPO_STYLE) are stripped by
+    # `lines_and_points_only` so the satellite imagery shows through
+    # everywhere except where a deliberate line or point glyph
+    # annotates the scene. The satellite already renders water as
+    # blue, forest as green, fields as tan — overlaying OSM-tagged
+    # polygon fills would be duplicative + obscure the imagery.
+    #
+    # No 3D terrain, no hillshade, no sky, no camera pitch — the
+    # transit map cell above is the 3D-elevation view; this cell is
+    # the flat top-down satellite view. Hillshade is redundant with
+    # the satellite's own shadow rendering; 3D tilt and TerrainControl
+    # belong with the transit map's mapterhorn DEM source.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    _ecovoyage_pmtiles = Path("/workspace/tiles/pmtiles/austria-ecovoyage.pmtiles")
+    mo.stop(
+        not _ecovoyage_pmtiles.exists() or _ecovoyage_pmtiles.stat().st_size == 0,
+        "`austria-ecovoyage.pmtiles` not yet present — open and run "
+        "`osm-austria.py` first. Its OSM DAG produces this tile via "
+        "the `freestiler_ecovoyage_convert` task.",
+    )
+    mo.iframe(
+        build_pipeline_maplibre_html(
+            martin,
+            "austria-ecovoyage",
+            layer_name="austria-ecovoyage",
+            center=[13.3, 47.7],
+            zoom=7,
+            style_layers=[
+                *lines_and_points_only(with_theme("topo", TOPO_STYLE)),
+                *lines_and_points_only(with_theme("railway", RAILWAY_STYLE)),
+                *lines_and_points_only(with_theme("cycle", CYCLE_STYLE)),
+                *lines_and_points_only(with_theme("hiking", HIKING_STYLE)),
+            ],
+            extra_sources={
+                "transit-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-transit",
+                },
+            },
+            extra_layers=TRANSIT_STYLE,
+            satellite_background=True,
         ),
         height="500px",
     )
