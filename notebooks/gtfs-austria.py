@@ -92,12 +92,14 @@ def _(airflow_public, mo):
       solid background. The "vector overview" view — every OSM
       polygon fill (water / forest / landuse) drawn from OSM tags.
     - **Satellite-overlay map** — `austria-ecovoyage` lines + points
-      ONLY (polygon fills stripped) + GTFS transit overlay, all
-      drawn on top of a flat versatiles satellite background. The
-      "satellite annotation" view — relies on the satellite imagery
-      to show water / forest / fields, overlays just the railways,
-      roads, hiking trails, peaks, alpine huts, and GTFS stops as
-      thin annotations.
+      ONLY (polygon fills stripped) + GTFS transit overlay, drawn on
+      top of a versatiles satellite background draped over 3D
+      mapterhorn terrain (sky + camera tilt + TerrainControl on; the
+      hillshade overlay is OFF because the satellite imagery already
+      renders shadows). The "satellite annotation" view — relies on
+      the satellite imagery to show water / forest / fields, overlays
+      just the railways, roads, hiking trails, peaks, alpine huts,
+      and GTFS stops as thin annotations.
 
     ## GTFS↔OSM unification model — see [OSM wiki: GTFS](https://wiki.openstreetmap.org/wiki/GTFS)
 
@@ -892,12 +894,20 @@ def build_pipeline_maplibre_html(
     satellite_background: bool = False,
     pitch: int = 0,
     max_pitch: int = 60,
+    hillshade: bool = True,
 ) -> str:
     """MapLibre HTML template for a martin vector-tile source.
 
     See the sibling osm-austria.py docstring for the full description
-    of the four opt-in terrain/satellite kwargs. With all defaults the
+    of the opt-in terrain/satellite kwargs. With all defaults the
     output is byte-identical to the pre-terrain template.
+
+    `hillshade=False` together with `terrain=True` keeps the 3D
+    elevation effect + sky + camera pitch + TerrainControl but drops
+    the relief-shading `hills-*` layer + the `hillshadeSource`
+    raster-DEM source. Useful on a satellite background where the
+    imagery already renders shadows naturally and an explicit
+    hillshade overlay is duplicative.
     """
     import json as _json
     layer_prefix = source_name
@@ -953,7 +963,7 @@ def build_pipeline_maplibre_html(
             "type": "background",
             "paint": {"background-color": "#f6f3ec"},
         })
-    if terrain:
+    if terrain and hillshade:
         base_layers.append({
             "id": f"hills-{layer_prefix}",
             "type": "hillshade",
@@ -992,7 +1002,8 @@ def build_pipeline_maplibre_html(
             "url": "https://tiles.mapterhorn.com/tilejson.json",
         }
         all_sources["terrainSource"] = _dem
-        all_sources["hillshadeSource"] = _dem
+        if hillshade:
+            all_sources["hillshadeSource"] = _dem
     sources_js = _json.dumps(all_sources)
     mlt_attr = ' data-mlt="true"' if mlt else ''
 
@@ -1659,11 +1670,12 @@ def _(
     # blue, forest as green, fields as tan — overlaying OSM-tagged
     # polygon fills would be duplicative + obscure the imagery.
     #
-    # No 3D terrain, no hillshade, no sky, no camera pitch — the
-    # transit map cell above is the 3D-elevation view; this cell is
-    # the flat top-down satellite view. Hillshade is redundant with
-    # the satellite's own shadow rendering; 3D tilt and TerrainControl
-    # belong with the transit map's mapterhorn DEM source.
+    # 3D terrain + sky + camera pitch + TerrainControl are ON (same
+    # mapterhorn DEM source the transit map cell uses) so the satellite
+    # imagery drapes over the elevation model and the user can tilt the
+    # view. The hillshade layer is OFF — relief shading is redundant
+    # with the satellite's own shadow rendering and would only obscure
+    # the imagery.
     mo.stop(
         dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
         f"Waiting for notebook_austria_gtfs_pipeline (state="
@@ -1697,6 +1709,10 @@ def _(
             },
             extra_layers=TRANSIT_STYLE,
             satellite_background=True,
+            terrain=True,
+            hillshade=False,
+            pitch=45,
+            max_pitch=85,
         ),
         height="500px",
     )

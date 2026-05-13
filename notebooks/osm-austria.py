@@ -927,6 +927,7 @@ def build_pipeline_maplibre_html(
     satellite_background: bool = False,
     pitch: int = 0,
     max_pitch: int = 60,
+    hillshade: bool = True,
 ) -> str:
     """MapLibre HTML template for a martin vector-tile source.
 
@@ -975,6 +976,12 @@ def build_pipeline_maplibre_html(
     `terrain=True`; with both flags False the helper emits
     byte-identical output to the pre-2026-05 template, leaving the
     other six callers in this notebook untouched.
+
+    `hillshade=False` together with `terrain=True` keeps the 3D
+    elevation effect + sky + camera pitch + TerrainControl but drops
+    the relief-shading `hills-*` layer + the `hillshadeSource`
+    raster-DEM source. Useful on a satellite background where the
+    imagery already renders shadows naturally.
     """
     import json as _json
     layer_prefix = source_name
@@ -1036,7 +1043,7 @@ def build_pipeline_maplibre_html(
             "type": "background",
             "paint": {"background-color": "#f6f3ec"},
         })
-    if terrain:
+    if terrain and hillshade:
         base_layers.append({
             "id": f"hills-{layer_prefix}",
             "type": "hillshade",
@@ -1086,7 +1093,8 @@ def build_pipeline_maplibre_html(
             "url": "https://tiles.mapterhorn.com/tilejson.json",
         }
         all_sources["terrainSource"] = _dem
-        all_sources["hillshadeSource"] = _dem
+        if hillshade:
+            all_sources["hillshadeSource"] = _dem
     sources_js = _json.dumps(all_sources)
     mlt_attr = ' data-mlt="true"' if mlt else ''
 
