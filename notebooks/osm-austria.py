@@ -928,6 +928,7 @@ def build_pipeline_maplibre_html(
     pitch: int = 0,
     max_pitch: int = 60,
     hillshade: bool = True,
+    glyphs_url: str | None = None,
 ) -> str:
     """MapLibre HTML template for a martin vector-tile source.
 
@@ -982,6 +983,14 @@ def build_pipeline_maplibre_html(
     the relief-shading `hills-*` layer + the `hillshadeSource`
     raster-DEM source. Useful on a satellite background where the
     imagery already renders shadows naturally.
+
+    `glyphs_url` is a MapLibre glyphs URL template (e.g.
+    `https://example.com/fonts/{fontstack}/{range}.pbf`). When set,
+    emits a top-level `glyphs:` key in the style object so symbol
+    layers with `text-field` can render. The versatiles-glyphs-rs
+    convention (matched by the versatiles-frontend layer's /fonts/
+    re-export) is the source-of-truth protocol. Default `None`
+    preserves byte-identical output for every existing caller.
     """
     import json as _json
     layer_prefix = source_name
@@ -1114,6 +1123,11 @@ def build_pipeline_maplibre_html(
             f"({{ source: 'terrainSource', exaggeration: 1.5 }}), 'top-right');"
         )
 
+    # Optional glyphs URL for SDF font tiles. The versatiles-glyphs-rs
+    # protocol (re-exported by the versatiles-frontend layer at /fonts/)
+    # is the URL convention. Empty when None — byte-identical to pre-glyphs.
+    glyphs_js = f'    glyphs: "{glyphs_url}",\n' if glyphs_url else ""
+
     return f"""<!DOCTYPE html>
 <html><head>
 <link href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" rel="stylesheet"/>
@@ -1127,7 +1141,7 @@ const map_{js_var} = new maplibregl.Map({{
   container: 'map-{layer_prefix}',
   style: {{
     version: 8,
-    sources: {sources_js},
+{glyphs_js}    sources: {sources_js},
     layers: {layers_js}{terrain_extras_js}
   }},
   center: [{center[0]}, {center[1]}],

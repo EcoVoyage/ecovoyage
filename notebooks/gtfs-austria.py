@@ -43,8 +43,9 @@ def _resolved_urls(os, pl):
     })
     martin                = _resolved["MARTIN_PUBLIC_URL"]
     airflow_public        = _resolved["AIRFLOW_PUBLIC_URL"]
+    versatiles_assets     = _resolved["VERSATILES_ASSETS_PUBLIC_URL"]
     urls
-    return airflow_public, martin
+    return airflow_public, martin, versatiles_assets
 
 
 @app.cell
@@ -91,15 +92,31 @@ def _(airflow_public, mo):
       (cycle/topo/railway/hiking) + GTFS transit overlay on a flat
       solid background. The "vector overview" view — every OSM
       polygon fill (water / forest / landuse) drawn from OSM tags.
-    - **Satellite-overlay map** — `austria-ecovoyage` lines + points
-      ONLY (polygon fills stripped) + GTFS transit overlay, drawn on
-      top of a versatiles satellite background draped over 3D
-      mapterhorn terrain (sky + camera tilt + TerrainControl on; the
-      hillshade overlay is OFF because the satellite imagery already
-      renders shadows). The "satellite annotation" view — relies on
-      the satellite imagery to show water / forest / fields, overlays
-      just the railways, roads, hiking trails, peaks, alpine huts,
-      and GTFS stops as thin annotations.
+    - **Satellite-overlay map** — versatiles satellite imagery
+      draped over 3D mapterhorn terrain, with a dedicated zoom-banded
+      transport-network overlay inspired by Artaria's 1911
+      Eisenbahnkarte von Österreich-Ungarn:
+      - **PRIMARY** railways: k.k. Staatsbahn red mainline (with
+        white halo + a thin white center stripe at city zoom for
+        the period "double-track" signature), deeper red branch
+        lines, k.u. green urban transit (tram / light-rail / subway).
+      - **SECONDARY** cycle network: deep teal-ink national /
+        international routes (halo, visible from country zoom),
+        mid-teal regional, light-teal local, navy dedicated
+        cycleways.
+      - **SECONDARY** hiking network: sienna long-distance routes
+        (halo, visible from country zoom), darker ochre SAC-graded
+        trails.
+      - **TERTIARY** generic footpaths: warm ochre dashed, faint —
+        the only tier that holds back until city zoom.
+      - **GTFS stops**: uniform white-fill / dark-stroke dots at
+        every zoom (no `match_kind` colour coding — see the
+        analysis cell above for the diagnostic), with **Noto Sans
+        name labels at z11+** (collision-avoided). Text rendering
+        uses the versatiles-glyphs-rs SDF font protocol
+        (https://github.com/versatiles-org/versatiles-glyphs-rs)
+        served by the versatiles-frontend layer at
+        `{{VERSATILES_ASSETS_PUBLIC_URL}}/fonts/`.
 
     ## GTFS↔OSM unification model — see [OSM wiki: GTFS](https://wiki.openstreetmap.org/wiki/GTFS)
 
@@ -895,6 +912,7 @@ def build_pipeline_maplibre_html(
     pitch: int = 0,
     max_pitch: int = 60,
     hillshade: bool = True,
+    glyphs_url: str | None = None,
 ) -> str:
     """MapLibre HTML template for a martin vector-tile source.
 
@@ -908,6 +926,16 @@ def build_pipeline_maplibre_html(
     raster-DEM source. Useful on a satellite background where the
     imagery already renders shadows naturally and an explicit
     hillshade overlay is duplicative.
+
+    `glyphs_url` is a MapLibre glyphs URL template (e.g.
+    `https://example.com/fonts/{fontstack}/{range}.pbf`). When set,
+    emits a top-level `glyphs:` key in the style object so symbol
+    layers with `text-field` can render. The
+    versatiles-glyphs-rs convention (matched by the versatiles
+    frontend layer's /fonts/ re-export) is the source-of-truth
+    protocol. Default `None` preserves byte-identical output for
+    every existing caller — text layers fall back to MapLibre's
+    empty-glyphs behaviour (text simply doesn't render).
     """
     import json as _json
     layer_prefix = source_name
@@ -1021,6 +1049,15 @@ def build_pipeline_maplibre_html(
             f"({{ source: 'terrainSource', exaggeration: 1.5 }}), 'top-right');"
         )
 
+    # Optional glyphs URL emitted as a top-level style key so symbol
+    # layers with text-field can resolve their SDF font tiles. The
+    # versatiles-glyphs-rs URL convention (matched by the versatiles
+    # frontend layer's /fonts/ re-export) is the source-of-truth
+    # protocol; the caller passes the full template including the
+    # {fontstack}/{range}.pbf MapLibre placeholders. Empty string
+    # when None — produces byte-identical output to pre-glyphs.
+    glyphs_js = f'    glyphs: "{glyphs_url}",\n' if glyphs_url else ""
+
     return f"""<!DOCTYPE html>
 <html><head>
 <link href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" rel="stylesheet"/>
@@ -1034,7 +1071,7 @@ const map_{js_var} = new maplibregl.Map({{
   container: 'map-{layer_prefix}',
   style: {{
     version: 8,
-    sources: {sources_js},
+{glyphs_js}    sources: {sources_js},
     layers: {layers_js}{terrain_extras_js}
   }},
   center: [{center[0]}, {center[1]}],
@@ -1064,17 +1101,6 @@ def with_theme(theme: str, layers: list) -> list:
             new_layer["filter"] = ["all", theme_clause, old_filter]
         result.append(new_layer)
     return result
-
-
-@app.function
-def lines_and_points_only(layers: list) -> list:
-    """Filter out fill-type layers so the satellite background shows
-    through. Used by the satellite-overlay map cell — polygon fills
-    (water / forest / glacier / farmland / residential) would
-    otherwise paint over the imagery satellite already renders.
-    Run AFTER `with_theme(...)` so the evo-prefixed layer IDs survive.
-    """
-    return [layer for layer in layers if layer.get("type") != "fill"]
 
 
 @app.cell
@@ -1365,17 +1391,19 @@ def _theme_styles():
                    "circle-stroke-width": 1}},
     ]
 
-    # ---- TRANSIT_STYLE — GTFS-stops overlay layers ----
-    # Used by both the standalone transit map cell AND the ecovoyage
-    # 5-theme cell. Layers point at the SECOND martin source
-    # (`austria-transit`, not `austria-ecovoyage`) so this style stack
-    # composes via build_pipeline_maplibre_html's extra_sources /
-    # extra_layers kwargs — NOT via with_theme.
+    # ---- TRANSIT_STYLE — GTFS-stops overlay (uniform dots + labels) ----
+    # Used by every map cell that overlays GTFS stops. The dot is now
+    # UNIFORM (white fill + dark stroke) — classic period-map "transit
+    # point" look that reads on every background. The text symbol
+    # layer below renders the stop name at z11+ via versatiles-
+    # glyphs-rs SDF font tiles (wired via the helper's `glyphs_url`
+    # kwarg). MapLibre's default text-allow-overlap=false drops
+    # crowded labels at city zoom — no per-stop importance ranking
+    # needed.
     #
-    # Colour coding by match_kind matches the wiki's confidence
-    # hierarchy: green = high-confidence tag match (gtfs:stop_id),
-    # blue = high-confidence IFOPT match, orange = low-confidence
-    # spatial-last-resort, red = unmatched.
+    # The match_kind discriminator is no longer encoded into colour.
+    # It's still inspectable via the unified-analysis cell's
+    # transit.matched_stops query above the map.
     TRANSIT_STYLE = [
         {"id": "transit-stops", "type": "circle",
          "source": "transit-src", "source-layer": "austria-transit",
@@ -1383,23 +1411,365 @@ def _theme_styles():
          "paint": {
             "circle-radius": [
                 "interpolate", ["linear"], ["zoom"],
-                6, 2,
-                10, 3.5,
-                14, 5.5,
+                6, 1.8,
+                10, 2.8,
+                14, 4.5,
+                18, 6.5,
             ],
-            "circle-color": [
-                "match", ["get", "match_kind"],
-                "gtfs:stop_id",        "#2ca02c",
-                "ref:IFOPT",           "#1f77b4",
-                "spatial_last_resort", "#ff7f0e",
-                "#d62728",
+            "circle-color": "#ffffff",
+            "circle-stroke-color": "#1a1a1a",
+            "circle-stroke-width": 1.2,
+            "circle-opacity": 0.95,
+         }},
+        {"id": "transit-stops-label", "type": "symbol",
+         "source": "transit-src", "source-layer": "austria-transit",
+         "minzoom": 11,
+         "filter": ["==", ["geometry-type"], "Point"],
+         "layout": {
+            "text-field": ["get", "name"],
+            "text-font": ["Noto Sans Regular"],
+            "text-size": [
+                "interpolate", ["linear"], ["zoom"],
+                11, 10,
+                14, 12,
+                18, 14,
             ],
-            "circle-stroke-width": 1,
-            "circle-stroke-color": "#ffffff",
-            "circle-opacity": 0.85,
+            "text-anchor": "top",
+            "text-offset": [0, 0.6],
+            "text-padding": 2,
+            # MapLibre default text-allow-overlap=false handles
+            # collision avoidance — crowded labels are dropped.
+         },
+         "paint": {
+            "text-color": "#1a1a1a",
+            "text-halo-color": "#ffffff",
+            "text-halo-width": 1.5,
+            "text-halo-blur": 0.5,
          }},
     ]
-    return CYCLE_STYLE, HIKING_STYLE, RAILWAY_STYLE, TOPO_STYLE, TRANSIT_STYLE
+
+    # ---- SATELLITE_OVERLAY_STYLE — zoom-banded transport overlay ----
+    # Dedicated style for the satellite-overlay map cell. Inspired by
+    # Artaria's 1911 Eisenbahnkarte von Österreich-Ungarn — railways
+    # are the visual headline (k.k. Staatsbahn red for mainline,
+    # k.u. green for urban transit); cycle network is secondary
+    # (deep teal-ink, halo on the long-distance routes); hiking
+    # network is also secondary (sienna, halo on long-distance
+    # routes); generic footpaths are tertiary (warm ochre dashed).
+    #
+    # Reads from the `austria-ecovoyage` martin source (single
+    # UNION-ALL-BY-NAME pmtiles with a `theme` discriminator). Every
+    # layer filter anchors `theme` first.
+    #
+    # Layer ORDER (top of list = bottom of draw stack):
+    #   tertiary footpaths → secondary cycle → secondary hiking →
+    #   primary railways.
+    #
+    # White casings (halos) ride underneath every long-distance line
+    # tier (mainline rail, branch rail, urban rail, cycle national,
+    # hiking long-distance). The mainline-rail "double-track" effect
+    # at z14+ overlays a thin white center stripe so the line reads
+    # as `casing | red | stripe | red | casing` — period-printed-
+    # map railway track signature.
+    SATELLITE_OVERLAY_STYLE = [
+        # === TERTIARY (drawn first; underneath everything) ===
+
+        # Generic footpaths — z11+, thinnest dashed warm ochre
+        {"id": "sat-footway", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 11,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "hiking"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["path", "footway", "bridleway", "steps"]]],
+                    ["==", ["get", "sac_scale"], None],
+                    ["!=", ["get", "route"], "hiking"]],
+         "paint": {
+            "line-color": "#a06030",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           11, 0.4, 14, 0.9, 18, 1.6],
+            "line-dasharray": [2, 2],
+            "line-opacity": 0.7,
+         }},
+
+        # === SECONDARY — hiking (long-distance + SAC) ===
+
+        # SAC-graded trails — z9+, medium dashed darker ochre
+        {"id": "sat-hike-sac", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 9,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "hiking"],
+                    ["!=", ["get", "sac_scale"], None]],
+         "paint": {
+            "line-color": "#7a4a1c",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           9, 0.6, 12, 1.4, 16, 2.4],
+            "line-dasharray": [4, 2],
+            "line-opacity": 0.9,
+         }},
+
+        # Hiking long-distance routes — z6+, sienna with white halo
+        {"id": "sat-hike-route-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "hiking"],
+                    ["==", ["get", "route"], "hiking"]],
+         "paint": {
+            "line-color": "#ffffff",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 2.0, 10, 3.0, 14, 4.5],
+            "line-opacity": 0.75,
+         }},
+        {"id": "sat-hike-route", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "hiking"],
+                    ["==", ["get", "route"], "hiking"]],
+         "paint": {
+            "line-color": "#9c5a1f",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 1.0, 10, 1.8, 14, 2.8],
+         }},
+
+        # === SECONDARY — cycle network ===
+
+        # Dedicated cycleways — z12+, dark navy solid
+        {"id": "sat-cycleway", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 12,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "cycle"],
+                    ["==", ["get", "highway"], "cycleway"]],
+         "paint": {
+            "line-color": "#0a2a4a",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           12, 1.0, 16, 2.4],
+            "line-opacity": 0.9,
+         }},
+
+        # Cycle local routes — z11+, light teal
+        {"id": "sat-cycle-local", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 11,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "cycle"],
+                    ["==", ["get", "route"], "bicycle"],
+                    ["==", ["get", "network"], "lcn"]],
+         "paint": {
+            "line-color": "#5a8aa0",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           11, 0.6, 16, 1.4],
+            "line-opacity": 0.85,
+         }},
+
+        # Cycle regional routes — z9+, mid teal
+        {"id": "sat-cycle-regional", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 9,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "cycle"],
+                    ["==", ["get", "route"], "bicycle"],
+                    ["==", ["get", "network"], "rcn"]],
+         "paint": {
+            "line-color": "#3a6e8a",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           9, 0.8, 14, 2.0],
+            "line-opacity": 0.9,
+         }},
+
+        # Cycle national/international — z6+, teal-ink with halo
+        {"id": "sat-cycle-national-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "cycle"],
+                    ["==", ["get", "route"], "bicycle"],
+                    ["in", ["get", "network"], ["literal", ["icn", "ncn"]]]],
+         "paint": {
+            "line-color": "#ffffff",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 2.2, 10, 3.2, 14, 4.8],
+            "line-opacity": 0.75,
+         }},
+        {"id": "sat-cycle-national", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "cycle"],
+                    ["==", ["get", "route"], "bicycle"],
+                    ["in", ["get", "network"], ["literal", ["icn", "ncn"]]]],
+         "paint": {
+            "line-color": "#1a4a6e",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 1.2, 10, 2.0, 14, 3.0],
+         }},
+
+        # === PRIMARY — railways (drawn LAST; on top of everything) ===
+
+        # Service tracks (sidings) — z13+, thin gray dashed
+        {"id": "sat-rail-service", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 13,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "rail"],
+                    ["!=", ["get", "service"], None]],
+         "paint": {
+            "line-color": "#6c757d",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           13, 0.5, 16, 1.2],
+            "line-dasharray": [3, 2],
+            "line-opacity": 0.8,
+         }},
+
+        # Rail construction — z9+, gray dashed
+        {"id": "sat-rail-construction", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 9,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["!=", ["get", "construction"], None]],
+         "paint": {
+            "line-color": "#9aa0a6",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           9, 0.8, 14, 1.6],
+            "line-dasharray": [4, 3],
+            "line-opacity": 0.85,
+         }},
+
+        # Rail tunnels — z10+, dashed red, partially transparent
+        {"id": "sat-rail-tunnel", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["!=", ["get", "tunnel"], None]],
+         "paint": {
+            "line-color": "#c93e3e",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           10, 1.0, 14, 2.0],
+            "line-dasharray": [2, 2],
+            "line-opacity": 0.55,
+         }},
+
+        # Urban rail (tram, light_rail, subway, narrow_gauge,
+        # monorail, funicular) — z10+, k.u. green with halo
+        {"id": "sat-rail-urban-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["in", ["get", "railway"],
+                     ["literal", ["light_rail", "subway", "tram",
+                                  "narrow_gauge", "monorail", "funicular"]]]],
+         "paint": {
+            "line-color": "#ffffff",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           10, 1.8, 14, 3.2, 18, 4.4],
+            "line-opacity": 0.8,
+         }},
+        {"id": "sat-rail-urban", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["in", ["get", "railway"],
+                     ["literal", ["light_rail", "subway", "tram",
+                                  "narrow_gauge", "monorail", "funicular"]]]],
+         "paint": {
+            "line-color": "#2d6c4a",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           10, 0.9, 14, 1.9, 18, 2.6],
+         }},
+
+        # Branch rail (rail without usage=main, no service tag) — z8+,
+        # deeper red with halo
+        {"id": "sat-rail-branch-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 8,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "rail"],
+                    ["!=", ["get", "usage"], "main"],
+                    ["==", ["get", "service"], None]],
+         "paint": {
+            "line-color": "#ffffff",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           8, 1.6, 12, 2.8, 16, 4.2],
+            "line-opacity": 0.8,
+         }},
+        {"id": "sat-rail-branch", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 8,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "rail"],
+                    ["!=", ["get", "usage"], "main"],
+                    ["==", ["get", "service"], None]],
+         "paint": {
+            "line-color": "#a02c2c",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           8, 0.8, 12, 1.6, 16, 2.6],
+         }},
+
+        # Mainline rail (rail usage=main) — z6+, k.k. red with halo.
+        # The visual headline of the entire map; widest line in the
+        # whole style.
+        {"id": "sat-rail-mainline-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "rail"],
+                    ["==", ["get", "usage"], "main"]],
+         "paint": {
+            "line-color": "#ffffff",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 2.4, 10, 3.8, 14, 6.0, 18, 8.0],
+            "line-opacity": 0.9,
+         }},
+        {"id": "sat-rail-mainline", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "rail"],
+                    ["==", ["get", "usage"], "main"]],
+         "paint": {
+            "line-color": "#c93e3e",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 1.2, 10, 2.2, 14, 3.6, 18, 5.0],
+         }},
+
+        # Mainline rail double-track center stripe — z14+, thin white
+        # over the red core. Renders as
+        # casing | red | stripe | red | casing — period-printed-map
+        # railway signature; only visible at city zoom where the line
+        # is wide enough.
+        {"id": "sat-rail-mainline-stripe", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 14,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "rail"],
+                    ["==", ["get", "usage"], "main"]],
+         "paint": {
+            "line-color": "#ffffff",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           14, 1.0, 18, 1.6],
+         }},
+    ]
+    return (
+        CYCLE_STYLE,
+        HIKING_STYLE,
+        RAILWAY_STYLE,
+        SATELLITE_OVERLAY_STYLE,
+        TOPO_STYLE,
+        TRANSIT_STYLE,
+    )
 
 
 @app.cell
@@ -1647,28 +2017,35 @@ def _(
 
 @app.cell
 def _(
-    CYCLE_STYLE,
-    HIKING_STYLE,
     Path,
-    RAILWAY_STYLE,
-    TOPO_STYLE,
+    SATELLITE_OVERLAY_STYLE,
     TRANSIT_STYLE,
     dag_run_states,
     martin,
     mo,
+    versatiles_assets,
 ):
     # Satellite-overlay map — versatiles satellite imagery as the
-    # background; OSM-derived lines + points (railways, roads,
-    # hiking trails, cycle routes, peaks, alpine huts) overlaid as
-    # thin annotations; GTFS stops on top via TRANSIT_STYLE.
+    # background; transport overlay drawn with a dedicated zoom-banded
+    # style (`SATELLITE_OVERLAY_STYLE`) tuned for the satellite
+    # background. The aesthetic is inspired by Artaria's 1911
+    # Eisenbahnkarte von Österreich-Ungarn — railways are the visual
+    # headline (k.k. Staatsbahn red mainline + double-track stripe at
+    # city zoom, k.u. green for urban transit), cycle network is
+    # secondary (deep teal-ink with halo on long-distance routes),
+    # hiking network is also secondary (sienna with halo on
+    # long-distance routes), generic footpaths are tertiary.
     #
-    # Polygon-fill layers (water / forest / glacier / farmland /
-    # residential — all from TOPO_STYLE) are stripped by
-    # `lines_and_points_only` so the satellite imagery shows through
-    # everywhere except where a deliberate line or point glyph
-    # annotates the scene. The satellite already renders water as
-    # blue, forest as green, fields as tan — overlaying OSM-tagged
-    # polygon fills would be duplicative + obscure the imagery.
+    # GTFS stops overlay (`TRANSIT_STYLE`) uses uniform white-fill /
+    # dark-stroke circles at every zoom + a Noto Sans text label per
+    # stop at z11+ (collision-avoided by MapLibre's default). The
+    # match_kind discriminator is no longer encoded into colour —
+    # it remains queryable in the unified-analysis cell above.
+    #
+    # Text labels need an SDF glyph source: wired here via the helper's
+    # `glyphs_url` kwarg, pointing at the versatiles-frontend layer's
+    # /fonts/ re-export (which serves versatiles-fonts in the
+    # versatiles-glyphs-rs URL convention).
     #
     # 3D terrain + sky + camera pitch + TerrainControl are ON (same
     # mapterhorn DEM source the transit map cell uses) so the satellite
@@ -1695,12 +2072,7 @@ def _(
             layer_name="austria-ecovoyage",
             center=[13.3, 47.7],
             zoom=7,
-            style_layers=[
-                *lines_and_points_only(with_theme("topo", TOPO_STYLE)),
-                *lines_and_points_only(with_theme("railway", RAILWAY_STYLE)),
-                *lines_and_points_only(with_theme("cycle", CYCLE_STYLE)),
-                *lines_and_points_only(with_theme("hiking", HIKING_STYLE)),
-            ],
+            style_layers=SATELLITE_OVERLAY_STYLE,
             extra_sources={
                 "transit-src": {
                     "type": "vector",
@@ -1713,6 +2085,7 @@ def _(
             hillshade=False,
             pitch=45,
             max_pitch=85,
+            glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
         ),
         height="500px",
     )
