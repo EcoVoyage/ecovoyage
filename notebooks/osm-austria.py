@@ -429,6 +429,9 @@ def _(Path, os, textwrap):
                         layer_name="austria",
                         min_zoom=0,
                         max_zoom=12,
+                        base_zoom=12,
+                        drop_rate=2.0,
+                        coalesce=True,
                     )
                 else:
                     public = sorted(n for n in dir(freestiler) if not n.startswith("_"))
@@ -623,10 +626,17 @@ def _(Path, os, textwrap):
                     SELECT 'hiking' AS theme,{_COMMON_SELECT_FIELDS},{_HIKING_FIELDS}
                     FROM base WHERE {_HIKING_WHERE}
                 """
-                # See TILE_GEN_KWARGS-equivalent rationale at the top of this
-                # DAG: base_zoom + drop_rate + coalesce thin features at low
-                # zooms so single-tile bytes stay browser-friendly. For
-                # ecovoyage specifically max_zoom=12 (vs the standalone
+                # base_zoom + drop_rate + coalesce thin features at low
+                # zooms so single-tile bytes stay browser-friendly. Without
+                # these freestiler emits z=7 tiles >300 MB which crash
+                # browser tabs on the consolidated view. Attempts to run
+                # without coalesce destabilized freestiler — multiple tasks
+                # segfault at runtime; coalesce is required for stable
+                # builds at this data scale. Cost: polygons (forest /
+                # landuse / water fills) get merged aggressively at low
+                # zooms; country-zoom views are line-heavy. Users zoom
+                # into theme-specific cells for full-density detail at z14.
+                # For ecovoyage specifically max_zoom=12 (vs the standalone
                 # theme tiles' z14) caps detail at city zoom — the 4
                 # standalone cells still go to z14 for fine detail when
                 # users click into a specific theme.
@@ -1024,14 +1034,25 @@ def build_pipeline_maplibre_html(
          "filter": ["==", ["geometry-type"], "Point"],
          "paint": {"circle-color": "#b04a3d", "circle-radius": 1.5}},
     ]
-    data_layers = style_layers if style_layers is not None else default_layers
-    # Inject source + source-layer defaults where the caller omitted
-    # them — saves repetition in long style lists.
-    for _layer in data_layers:
+    raw_layers = style_layers if style_layers is not None else default_layers
+    # Defensive copy + force-set source / source-layer to this cell's
+    # layer_name. The previous setdefault-based approach was an R1 bug:
+    # when style_layers was a shared module-level constant (the four
+    # *_STYLE lists in _theme_styles), a prior cell's invocation
+    # MUTATED the dicts to set source-layer="austria-<that-cell>".
+    # Subsequent cells (e.g. the consolidated ecovoyage cell consuming
+    # the same constants via with_theme) inherited the stale value,
+    # and MapLibre tried to fetch features from a non-existent
+    # source-layer inside the ecovoyage tile → blank map.
+    # Always copy + always overwrite. R3 — one definition, many
+    # call sites — only works when shared definitions are immutable.
+    data_layers = []
+    for _layer in raw_layers:
+        _layer = dict(_layer)  # shallow copy — paint/filter dicts shared but not mutated
         if _layer.get("type") != "background":
-            _layer.setdefault("source", "src")
-            if _layer.get("type") != "background":
-                _layer.setdefault("source-layer", layer_name)
+            _layer["source"] = "src"
+            _layer["source-layer"] = layer_name
+        data_layers.append(_layer)
 
     all_layers = [
         {"id": f"bg-{layer_prefix}", "type": "background",
