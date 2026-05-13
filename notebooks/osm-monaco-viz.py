@@ -179,7 +179,7 @@ def _(Path, os, textwrap):
 
         @dag(
             dag_id="notebook_osm_pipeline",
-            schedule=None,
+            schedule="@monthly",
             start_date=datetime(2026, 1, 1),
             catchup=False,
             tags=["osm", "notebook"],
@@ -412,7 +412,7 @@ def _(Path, os, textwrap):
 
         @dag(
             dag_id="notebook_gtfs_pipeline",
-            schedule=None,
+            schedule="@monthly",
             start_date=datetime(2026, 1, 1),
             catchup=False,
             tags=["gtfs", "transit", "notebook"],
@@ -500,7 +500,7 @@ def _(Path, os, textwrap):
 
         @dag(
             dag_id="notebook_osm_gpqtiles_pipeline",
-            schedule=None,
+            schedule="@monthly",
             start_date=datetime(2026, 1, 1),
             catchup=False,
             tags=["osm", "notebook", "gpq-tiles"],
@@ -646,7 +646,7 @@ def _(Path, os, textwrap):
 
         @dag(
             dag_id="notebook_osm_duckdb_mvt_pipeline",
-            schedule=None,
+            schedule="@monthly",
             start_date=datetime(2026, 1, 1),
             catchup=False,
             tags=["osm", "notebook", "duckdb-mvt"],
@@ -863,7 +863,7 @@ def _(Path, os, textwrap):
 
         @dag(
             dag_id="notebook_osm_duckdb_freestiler_pipeline",
-            schedule=None,
+            schedule="@monthly",
             start_date=datetime(2026, 1, 1),
             catchup=False,
             tags=["osm", "notebook", "duckdb-freestiler"],
@@ -1016,7 +1016,7 @@ def _(Path, os, textwrap):
 
         @dag(
             dag_id="notebook_osm_shortbread_pipeline",
-            schedule=None,
+            schedule="@monthly",
             start_date=datetime(2026, 1, 1),
             catchup=False,
             tags=["osm", "notebook", "shortbread", "tilemaker"],

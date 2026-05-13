@@ -254,7 +254,112 @@ def _(Path, os, textwrap):
                 return str(out)
 
             @task
-            def reload_martin(pmtiles_path: str) -> str:
+            def freestiler_railway_convert(parquet_path: str) -> str:
+                # ORM-aligned freestiler SQL: filters the country-scale parquet
+                # to railway-related features only, projects the exact tag set
+                # OpenRailwayMap's osm2pgsql import + rendering views consume
+                # (orm-simple.style + sql/osm_carto_views.sql in
+                # OpenRailwayMap-CartoCSS), drops the raw tags Map<String,String>
+                # entirely. Output: MLT-encoded tiles inside a PMTiles archive
+                # at austria-railway.pmtiles.
+                #
+                # max_zoom=14 (vs the all-features pipeline's 12): the railway
+                # subset is a small fraction of the full PBF, so z14 tiles stay
+                # cheap to generate. z14 matches the live ORM site's max zoom
+                # so MapLibre styles transferred from there look right.
+                import freestiler
+                TILES.mkdir(parents=True, exist_ok=True)
+                out = TILES / "austria-railway.pmtiles"
+                query = f"""
+                    SELECT
+                      feature_id                                       AS osm_id,
+                      geometry,
+                      tags['railway']                               AS railway,
+                      tags['public_transport']                      AS public_transport,
+                      tags['usage']                                 AS usage,
+                      tags['service']                               AS service,
+                      tags['construction']                          AS construction,
+                      tags['tunnel']                                AS tunnel,
+                      tags['bridge']                                AS bridge,
+                      tags['cutting']                               AS cutting,
+                      tags['embankment']                            AS embankment,
+                      tags['abandoned']                             AS abandoned,
+                      tags['disused']                               AS disused,
+                      tags['razed']                                 AS razed,
+                      tags['proposed']                              AS proposed,
+                      tags['man_made']                              AS man_made,
+                      tags['power']                                 AS power,
+                      tags['area']                                  AS area,
+                      TRY_CAST(tags['layer'] AS INTEGER)            AS layer,
+                      TRY_CAST(tags['ele'] AS DOUBLE)               AS ele,
+                      tags['name']                                  AS name,
+                      tags['ref']                                   AS ref,
+                      tags['electrified']                           AS electrified,
+                      TRY_CAST(tags['frequency'] AS DOUBLE)         AS frequency,
+                      TRY_CAST(tags['voltage'] AS INTEGER)          AS voltage,
+                      tags['deelectrified']                         AS deelectrified,
+                      tags['construction:electrified']              AS construction_electrified,
+                      TRY_CAST(tags['construction:frequency'] AS DOUBLE)  AS construction_frequency,
+                      TRY_CAST(tags['construction:voltage'] AS INTEGER)   AS construction_voltage,
+                      tags['proposed:electrified']                  AS proposed_electrified,
+                      TRY_CAST(tags['proposed:frequency'] AS DOUBLE)      AS proposed_frequency,
+                      TRY_CAST(tags['proposed:voltage'] AS INTEGER)       AS proposed_voltage,
+                      tags['abandoned:electrified']                 AS abandoned_electrified,
+                      tags['maxspeed']                              AS maxspeed,
+                      tags['maxspeed:forward']                      AS maxspeed_forward,
+                      tags['maxspeed:backward']                     AS maxspeed_backward,
+                      tags['railway:preferred_direction']           AS preferred_direction,
+                      tags['railway:position']                      AS railway_position,
+                      tags['railway:position:detail']               AS railway_position_detail,
+                      tags['railway:local_operated']                AS railway_local_operated,
+                      tags['railway:signal:direction']              AS signal_direction,
+                      tags['railway:signal:speed_limit']            AS signal_speed_limit,
+                      tags['railway:signal:speed_limit:form']       AS signal_speed_limit_form,
+                      tags['railway:signal:speed_limit:speed']      AS signal_speed_limit_speed,
+                      tags['railway:signal:speed_limit_distant']    AS signal_speed_limit_distant,
+                      tags['railway:signal:speed_limit_distant:form']  AS signal_speed_limit_distant_form,
+                      tags['railway:signal:speed_limit_distant:speed'] AS signal_speed_limit_distant_speed,
+                      CASE WHEN ST_GeometryType(geometry) IN ('POLYGON','MULTIPOLYGON')
+                           THEN ST_Area(geometry) ELSE NULL END        AS way_area,
+                      COALESCE(TRY_CAST(tags['layer'] AS INTEGER), 0) * 10
+                        + CASE WHEN tags['tunnel'] IS NOT NULL THEN -10
+                               WHEN tags['bridge'] IS NOT NULL THEN  10
+                               ELSE 0 END
+                        + CASE WHEN tags['railway'] = 'rail' THEN 5
+                               WHEN tags['railway'] IN ('light_rail','subway','tram','narrow_gauge','monorail','funicular') THEN 3
+                               WHEN tags['railway'] IN ('preserved','miniature') THEN 1
+                               ELSE 0 END                              AS z_order
+                    FROM read_parquet('{parquet_path}')
+                    WHERE
+                      tags['railway'] IS NOT NULL
+                      OR tags['public_transport'] IN ('station','stop_position','platform','halt')
+                      OR (tags['power'] = 'line' AND tags['line'] = 'busbar')
+                      OR (tags['man_made'] IN ('mast','tower')
+                          AND tags['tower:type'] = 'communication'
+                          AND tags['railway'] IS NOT NULL)
+                """
+                # Inner-tile encoding: MVT (Mapbox Vector Tile, protobuf).
+                # The original plan was tile_format="mlt" (MapLibre Tile spec)
+                # for smaller line/polygon tiles. freestiler 0.1+ accepts the
+                # kwarg AND emits valid MLT-inside-PMTiles, BUT martin v1.9.0
+                # rejects the archive at startup with
+                #   "Format Mlt and compression Gzip are not yet supported"
+                # — a fatal warning that halts the entire tile server, not just
+                # the unsupported source. Until martin grows MLT decode support
+                # (upstream issue scope), MVT is the only encoding that survives
+                # the tile-server boot path. Flip back to "mlt" once the next
+                # martin release lands the decoder.
+                freestiler.freestile_query(
+                    query=query,
+                    output=str(out),
+                    layer_name="austria-railway",
+                    min_zoom=0,
+                    max_zoom=14,
+                )
+                return str(out)
+
+            @task
+            def reload_martin(pmtiles_paths: list[str]) -> list[str]:
                 # Identical sync primitives as the Monaco DAGs:
                 #   1. flock — serializes the supervisorctl invocations
                 #      so only one restart runs at a time globally.
@@ -263,12 +368,19 @@ def _(Path, os, textwrap):
                 #      source listed) instead of trusting supervisorctl's
                 #      exit code (which can be non-zero even when martin
                 #      ends up healthy).
+                #
+                # Takes a list of pmtiles paths to fan-in over the parallel
+                # freestiler_convert + freestiler_railway_convert tasks. One
+                # restart serves both sources.
                 import fcntl
                 import json as _json
                 import socket
                 import time as _time
                 import urllib.request
-                source_name = pmtiles_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                expected_sources = [
+                    p.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                    for p in pmtiles_paths
+                ]
                 with open("/tmp/ov-martin-restart.lock", "w") as _lock:
                     fcntl.flock(_lock.fileno(), fcntl.LOCK_EX)
                     subprocess.run(
@@ -292,15 +404,20 @@ def _(Path, os, textwrap):
                     "http://localhost:3000/catalog", timeout=10,
                 ) as _resp:
                     _catalog = _json.load(_resp)
-                if source_name not in _catalog.get("tiles", {}):
+                available = sorted(_catalog.get("tiles", {}).keys())
+                missing = [s for s in expected_sources if s not in available]
+                if missing:
                     raise RuntimeError(
-                        f"martin /catalog missing source '{source_name}' "
-                        f"after reload; available="
-                        f"{sorted(_catalog.get('tiles', {}).keys())}",
+                        f"martin /catalog missing sources {missing} "
+                        f"after reload; available={available}",
                     )
-                return pmtiles_path
+                return pmtiles_paths
 
-            reload_martin(freestiler_convert(pbf_to_geoparquet(download_pbf())))
+            parquet = pbf_to_geoparquet(download_pbf())
+            reload_martin([
+                freestiler_convert(parquet),
+                freestiler_railway_convert(parquet),
+            ])
 
 
         notebook_austria_pipeline()
@@ -565,6 +682,8 @@ def build_pipeline_maplibre_html(
     layer_name: str,
     center: list,
     zoom: int,
+    style_layers: list | None = None,
+    mlt: bool = False,
 ) -> str:
     """MapLibre HTML template for a martin vector-tile source.
 
@@ -577,36 +696,79 @@ def build_pipeline_maplibre_html(
     the JS parser silently mis-tokenises as a subtraction expression
     and throws ReferenceError. Same R3 derivation as the Monaco
     notebook.
+
+    When `style_layers` is provided it replaces the default
+    fill/line/circle triplet (the background layer is kept). Each
+    entry is a MapLibre style-layer dict passed through verbatim;
+    `source: 'src'` and `source-layer: layer_name` are injected when
+    absent so callers can omit them.
+
+    `mlt=True` records the inner-encoding hint in the source
+    declaration. Martin currently emits MVT bytes regardless of
+    inner format; the flag is here so that when MapLibre GL JS adds
+    MLT decode support upstream we can flip a single bit. The
+    MapLibre version is captured in a DOM `data-maplibre-version`
+    attribute so a CDP probe can assert the decoder side too.
     """
+    import json as _json
     layer_prefix = source_name
     js_var = source_name.replace("-", "_")
+
+    default_layers = [
+        {"id": f"fill-{layer_prefix}", "type": "fill",
+         "source": "src", "source-layer": layer_name,
+         "filter": ["==", ["geometry-type"], "Polygon"],
+         "paint": {"fill-color": "#a4c0a8",
+                   "fill-outline-color": "#5e7060",
+                   "fill-opacity": 0.55}},
+        {"id": f"line-{layer_prefix}", "type": "line",
+         "source": "src", "source-layer": layer_name,
+         "filter": ["==", ["geometry-type"], "LineString"],
+         "paint": {"line-color": "#3a3a3a", "line-width": 0.8}},
+        {"id": f"circ-{layer_prefix}", "type": "circle",
+         "source": "src", "source-layer": layer_name,
+         "filter": ["==", ["geometry-type"], "Point"],
+         "paint": {"circle-color": "#b04a3d", "circle-radius": 1.5}},
+    ]
+    data_layers = style_layers if style_layers is not None else default_layers
+    # Inject source + source-layer defaults where the caller omitted
+    # them — saves repetition in long style lists.
+    for _layer in data_layers:
+        if _layer.get("type") != "background":
+            _layer.setdefault("source", "src")
+            if _layer.get("type") != "background":
+                _layer.setdefault("source-layer", layer_name)
+
+    all_layers = [
+        {"id": f"bg-{layer_prefix}", "type": "background",
+         "paint": {"background-color": "#f6f3ec"}},
+        *data_layers,
+    ]
+    layers_js = _json.dumps(all_layers, indent=2)
+    source_dict = {"type": "vector", "url": f"{martin}/{source_name}"}
+    if mlt:
+        # Informational marker — the actual decode path depends on the
+        # MapLibre GL JS version's MLT support; martin's content-type
+        # response is what drives the decoder. Captured in the DOM via
+        # data-mlt for the CDP probe.
+        source_dict["mlt"] = True
+    sources_js = _json.dumps({"src": source_dict})
+    mlt_attr = ' data-mlt="true"' if mlt else ''
     return f"""<!DOCTYPE html>
 <html><head>
 <link href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" rel="stylesheet"/>
 <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
 <style>html,body{{margin:0;padding:0;}}#map-{layer_prefix}{{height:500px;width:100%;}}</style>
 </head><body>
-<div id="map-{layer_prefix}"></div>
+<div id="map-{layer_prefix}"{mlt_attr} data-maplibre-version=""></div>
 <script>
+document.getElementById('map-{layer_prefix}').dataset.maplibreVersion = maplibregl.version || '';
 const map_{js_var} = new maplibregl.Map({{
   container: 'map-{layer_prefix}',
   style: {{
-version: 8,
-sources: {{ src: {{ type: 'vector', url: '{martin}/{source_name}' }} }},
-layers: [
-  {{ id: 'bg-{layer_prefix}', type: 'background',
-     paint: {{ 'background-color': '#f6f3ec' }} }},
-  {{ id: 'fill-{layer_prefix}', type: 'fill', source: 'src', 'source-layer': '{layer_name}',
-     filter: ['==', ['geometry-type'], 'Polygon'],
-     paint: {{ 'fill-color': '#a4c0a8', 'fill-outline-color': '#5e7060',
-               'fill-opacity': 0.55 }} }},
-  {{ id: 'line-{layer_prefix}', type: 'line', source: 'src', 'source-layer': '{layer_name}',
-     filter: ['==', ['geometry-type'], 'LineString'],
-     paint: {{ 'line-color': '#3a3a3a', 'line-width': 0.8 }} }},
-  {{ id: 'circ-{layer_prefix}', type: 'circle', source: 'src', 'source-layer': '{layer_name}',
-     filter: ['==', ['geometry-type'], 'Point'],
-     paint: {{ 'circle-color': '#b04a3d', 'circle-radius': 1.5 }} }}
-]
+    version: 8,
+    sources: {sources_js},
+    layers: {layers_js}
   }},
   center: [{center[0]}, {center[1]}],
   zoom: {zoom},
@@ -644,6 +806,125 @@ def _(dag_run_states, martin, mo):
             layer_name="austria",
             center=[13.3, 47.7],
             zoom=7,
+        ),
+        height="500px",
+    )
+    return
+
+
+@app.cell
+def _(dag_run_states, martin, mo):
+    # OpenRailwayMap-aligned render of the austria-railway PMTiles
+    # archive (filtered to railway features only, projected to ORM's
+    # tag schema, encoded as MLT inside PMTiles when freestiler
+    # supports it — falls back to MVT transparently).
+    #
+    # Style mirrors the categorical color choices in OpenRailwayMap-
+    # CartoCSS/standard.mss at a coarse level: mainline rail in blue,
+    # branch lines in orange, urban transit (tram/light_rail/subway)
+    # in purple, freight-yard service tracks in gray, stations as
+    # filled circles. ORM's full electrification + signal styling
+    # ladder would land here in a follow-up.
+    mo.stop(
+        dag_run_states.get("notebook_austria_pipeline") != "success",
+        f"Waiting for notebook_austria_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_pipeline')!r})",
+    )
+    mo.iframe(
+        build_pipeline_maplibre_html(
+            martin,
+            "austria-railway",
+            layer_name="austria-railway",
+            center=[13.3, 47.7],
+            zoom=7,
+            style_layers=[
+                # Tunnels (rendered below everything else via order)
+                {"id": "rail-tunnel", "type": "line",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "LineString"],
+                            ["!=", ["get", "tunnel"], None]],
+                 "paint": {"line-color": "#888888", "line-width": 1.0,
+                           "line-dasharray": [2, 2]}},
+                # Construction / proposed
+                {"id": "rail-construction", "type": "line",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "LineString"],
+                            ["!=", ["get", "construction"], None]],
+                 "paint": {"line-color": "#aaaaaa", "line-width": 1.0,
+                           "line-dasharray": [4, 2]}},
+                # Abandoned / disused / razed
+                {"id": "rail-disused", "type": "line",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "LineString"],
+                            ["any",
+                             ["!=", ["get", "abandoned"], None],
+                             ["!=", ["get", "disused"], None],
+                             ["!=", ["get", "razed"], None]]],
+                 "paint": {"line-color": "#cccccc", "line-width": 0.8}},
+                # Service tracks (sidings, yards, spurs)
+                {"id": "rail-service", "type": "line",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "LineString"],
+                            ["==", ["get", "railway"], "rail"],
+                            ["!=", ["get", "service"], None]],
+                 "paint": {"line-color": "#888888", "line-width": 0.8}},
+                # Branch lines (rail without usage=main)
+                {"id": "rail-branch", "type": "line",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "LineString"],
+                            ["==", ["get", "railway"], "rail"],
+                            ["!=", ["get", "usage"], "main"],
+                            ["==", ["get", "service"], None]],
+                 "paint": {"line-color": "#cc6633", "line-width": 1.2}},
+                # Mainline rail (usage=main) — top of the line hierarchy
+                {"id": "rail-main", "type": "line",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "LineString"],
+                            ["==", ["get", "railway"], "rail"],
+                            ["==", ["get", "usage"], "main"]],
+                 "paint": {"line-color": "#3366cc", "line-width": 1.6}},
+                # Urban transit
+                {"id": "rail-transit", "type": "line",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "LineString"],
+                            ["in", ["get", "railway"],
+                             ["literal", ["tram", "light_rail", "subway", "monorail"]]]],
+                 "paint": {"line-color": "#883388", "line-width": 1.0}},
+                # Narrow gauge / funicular / preserved / miniature
+                {"id": "rail-narrow", "type": "line",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "LineString"],
+                            ["in", ["get", "railway"],
+                             ["literal", ["narrow_gauge", "funicular", "preserved", "miniature"]]]],
+                 "paint": {"line-color": "#5a8c2a", "line-width": 1.0}},
+                # Stations + halts (point and polygon)
+                {"id": "stations-fill", "type": "fill",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "Polygon"],
+                            ["any",
+                             ["==", ["get", "railway"], "station"],
+                             ["==", ["get", "public_transport"], "station"]]],
+                 "paint": {"fill-color": "#3366cc", "fill-opacity": 0.25,
+                           "fill-outline-color": "#3366cc"}},
+                {"id": "stations-pt", "type": "circle",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "Point"],
+                            ["any",
+                             ["==", ["get", "railway"], "station"],
+                             ["==", ["get", "railway"], "halt"],
+                             ["==", ["get", "public_transport"], "station"]]],
+                 "paint": {"circle-color": "#3366cc",
+                           "circle-radius": 4,
+                           "circle-stroke-color": "#ffffff",
+                           "circle-stroke-width": 1}},
+                # Signals
+                {"id": "signals", "type": "circle",
+                 "filter": ["all",
+                            ["==", ["geometry-type"], "Point"],
+                            ["==", ["get", "railway"], "signal"]],
+                 "paint": {"circle-color": "#cc3333",
+                           "circle-radius": 2}},
+            ],
         ),
         height="500px",
     )
