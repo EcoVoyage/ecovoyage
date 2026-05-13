@@ -418,6 +418,9 @@ def _(Path, os, textwrap):
                         layer_name="austria",
                         min_zoom=0,
                         max_zoom=12,
+                        base_zoom=12,
+                        drop_rate=2.0,
+                        coalesce=True,
                     )
                 elif hasattr(freestiler, "freestile"):
                     freestiler.freestile(
@@ -476,6 +479,9 @@ def _(Path, os, textwrap):
                     layer_name="austria-railway",
                     min_zoom=0,
                     max_zoom=14,
+                    base_zoom=14,
+                    drop_rate=2.0,
+                    coalesce=True,
                 )
                 return str(out)
 
@@ -504,6 +510,9 @@ def _(Path, os, textwrap):
                     layer_name="austria-cycle",
                     min_zoom=0,
                     max_zoom=14,
+                    base_zoom=14,
+                    drop_rate=2.0,
+                    coalesce=True,
                 )
                 return str(out)
 
@@ -532,6 +541,9 @@ def _(Path, os, textwrap):
                     layer_name="austria-topo",
                     min_zoom=0,
                     max_zoom=12,
+                    base_zoom=12,
+                    drop_rate=2.0,
+                    coalesce=True,
                 )
                 return str(out)
 
@@ -558,6 +570,9 @@ def _(Path, os, textwrap):
                     layer_name="austria-hiking",
                     min_zoom=0,
                     max_zoom=14,
+                    base_zoom=14,
+                    drop_rate=2.0,
+                    coalesce=True,
                 )
                 return str(out)
 
@@ -608,12 +623,22 @@ def _(Path, os, textwrap):
                     SELECT 'hiking' AS theme,{_COMMON_SELECT_FIELDS},{_HIKING_FIELDS}
                     FROM base WHERE {_HIKING_WHERE}
                 """
+                # See TILE_GEN_KWARGS-equivalent rationale at the top of this
+                # DAG: base_zoom + drop_rate + coalesce thin features at low
+                # zooms so single-tile bytes stay browser-friendly. For
+                # ecovoyage specifically max_zoom=12 (vs the standalone
+                # theme tiles' z14) caps detail at city zoom — the 4
+                # standalone cells still go to z14 for fine detail when
+                # users click into a specific theme.
                 freestiler.freestile_query(
                     query=query,
                     output=str(out),
                     layer_name="austria-ecovoyage",
                     min_zoom=0,
-                    max_zoom=14,
+                    max_zoom=12,
+                    base_zoom=12,
+                    drop_rate=2.0,
+                    coalesce=True,
                 )
                 return str(out)
 
