@@ -497,9 +497,36 @@ def _(Path, os, textwrap):
                 # ingestion (freestiler can't ATTACH a duckdb file mid-
                 # query, so we round-trip through parquet — the same
                 # pattern every other freestiler task already uses).
+                #
+                # `primary_route_type` rolls the GTFS route_type column
+                # up to a single integer per stop using the precedence
+                # rail > subway > tram > funicular > cable_car/gondola >
+                # ferry > bus. The satellite-overlay map's TRANSIT_STYLE
+                # uses it to tint each stop dot by mode (Artaria-1911
+                # operator-color signature). Values follow the GTFS
+                # route_type enum: 0=tram, 1=subway, 2=rail, 3=bus,
+                # 4=ferry, 5=cable_car, 6=gondola, 7=funicular.
                 transit_parquet = TILES_WORK / "austria-transit-stops.parquet"
                 con.sql(f"""
                     COPY (
+                        WITH stop_route_types AS (
+                            SELECT
+                                st.stop_id,
+                                CASE
+                                    WHEN bool_or(r.route_type = 2) THEN 2  -- rail
+                                    WHEN bool_or(r.route_type = 1) THEN 1  -- subway
+                                    WHEN bool_or(r.route_type = 0) THEN 0  -- tram
+                                    WHEN bool_or(r.route_type = 7) THEN 7  -- funicular
+                                    WHEN bool_or(r.route_type IN (5, 6)) THEN 5  -- cable car / gondola
+                                    WHEN bool_or(r.route_type = 4) THEN 4  -- ferry
+                                    WHEN bool_or(r.route_type = 3) THEN 3  -- bus
+                                    ELSE NULL
+                                END AS primary_route_type
+                            FROM gtfs.stop_times st
+                            JOIN gtfs.trips t USING (trip_id)
+                            JOIN gtfs.routes r USING (route_id)
+                            GROUP BY st.stop_id
+                        )
                         SELECT
                             CAST(s.stop_id AS VARCHAR)         AS osm_id,
                             ST_Point(s.stop_lon, s.stop_lat)   AS geometry,
@@ -509,9 +536,18 @@ def _(Path, os, textwrap):
                             CAST(s.location_type AS INTEGER)   AS location_type,
                             COALESCE(m.match_kind, 'unmatched') AS match_kind,
                             m.match_distance_m,
-                            m.osm_feature_id
+                            m.osm_feature_id,
+                            -- Cast to VARCHAR so freestiler keeps the
+                            -- column through the parquet → MVT round-
+                            -- trip (numeric-nullable cols are silently
+                            -- dropped). The TRANSIT_STYLE filter uses
+                            -- ["==", ["get","primary_route_type"], "2"]
+                            -- against the resulting string values.
+                            CAST(rt.primary_route_type AS VARCHAR)
+                                AS primary_route_type
                         FROM gtfs.stops s
                         LEFT JOIN transit.matched_stops m USING (stop_id)
+                        LEFT JOIN stop_route_types rt USING (stop_id)
                     ) TO '{transit_parquet}' (FORMAT 'parquet')
                 """)
                 con.close()
@@ -669,7 +705,8 @@ def _(Path, os, textwrap):
                            location_type,
                            match_kind,
                            match_distance_m,
-                           osm_feature_id
+                           osm_feature_id,
+                           primary_route_type
                     FROM read_parquet('{transit_parquet_path}')
                 """
                 freestiler.freestile_query(
@@ -1123,24 +1160,134 @@ def with_theme(theme: str, layers: list) -> list:
 
 @app.cell
 def _theme_styles():
-    # MapLibre style-layer lists per theme. Copied verbatim from
-    # osm-austria.py's _theme_styles cell — the ecovoyage 5-theme map
-    # below needs all four OSM theme constants plus TRANSIT_STYLE.
-    # KEEP THIS IN SYNC WITH notebooks/osm-austria.py.
+    # MapLibre style-layer lists for the 6 maps in this notebook. All
+    # 5 style constants reference a shared Artaria-1911-inspired palette
+    # + pattern vocabulary + width-ramp block at the TOP of this cell —
+    # SINGLE SOURCE OF TRUTH (R3). To adjust the color of any tier
+    # across every map in the notebook, edit ONE constant here.
+    #
+    # Palette is keyed to the Artaria 1911 Eisenbahnkarte legend
+    # (k.k. red mainline, k.u. green urban, k.k. Böhm.Nordbahn violet
+    # for funicular, etc.) and includes RESERVED slots for non-rail
+    # public transport modes (bus/ferry/cable-car) that the GTFS DAG's
+    # `primary_route_type` rollup tints transit-stop dots by.
+    #
+    # NOTE: notebooks/osm-austria.py's _theme_styles cell still uses the
+    # pre-2026-05-14 heterogeneous palette and will be brought in line
+    # in a separate cutover.
 
+    # === Artaria 1911 palette =========================================
+    # Railway tiers (operator hues from the legend)
+    ART_KK_RED          = "#c93e3e"  # k.k. ÖStB mainline (Hauptlinie)
+    ART_KK_RED_DARK     = "#a02c2c"  # k.k. branch / secondary
+    ART_KU_GREEN_DARK   = "#0f3a22"  # subway / U-Bahn (near-black-green)
+    ART_KU_GREEN        = "#2d6c4a"  # tram / streetcar (k.u. mid-green)
+    ART_KU_GREEN_LIGHT  = "#6ba582"  # light_rail / Stadtbahn / S-Bahn
+    ART_VIOLET          = "#5e3a8a"  # funicular / Zahnradbahn
+    ART_VIOLET_LIGHT    = "#7a5aa0"  # aerialway / cable-car / gondola
+
+    # Non-rail public transport (RESERVED palette slots — used by
+    # TRANSIT_STYLE per-mode dot tinting)
+    ART_BUS             = "#b8862b"  # bus stops (mustard ochre)
+    ART_FERRY           = "#3a6a9a"  # ferry/ship piers (deep blue-grey)
+
+    # Cycle hierarchy
+    ART_TEAL            = "#1a4a6e"  # cycle long-distance routes
+    ART_TEAL_DARK       = "#0a2a4a"  # dedicated cycleways
+
+    # Cycle unpaved-surface tones (CYCLE_STYLE only)
+    ART_OCHRE           = "#a06030"  # cycle-track / cycle-path
+    ART_OCHRE_DARK      = "#7a4820"  # cycle gravel surface
+
+    # Topo / context fills (period-paper tones)
+    ART_WATER           = "#a8c8e8"
+    ART_WATER_OUTLINE   = "#5a8fb8"
+    ART_FOREST          = "#b9d6b3"
+    ART_GLACIER         = "#f0f8ff"
+    ART_GLACIER_OUTLINE = "#a0c0d0"
+    ART_FARMLAND        = "#f0e8c8"
+    ART_BUILT           = "#e8d8c8"
+    ART_BOUNDARY        = "#7a4a8a"
+    ART_PEAK            = "#8b4513"
+
+    # Utility tones
+    ART_GREY_LIGHT      = "#9aa0a6"  # construction
+    ART_GREY_MID        = "#6c757d"  # service tracks
+    ART_GREY_DARK       = "#555555"  # disused / narrow-gauge
+    ART_BLACK           = "#1a1a1a"  # text labels
+    ART_HALO            = "#ffffff"  # halo / paper-white center stripe
+
+    # === Walkable-way palette (white → grey hierarchy) ================
+    # Shade encodes pedestrian-friendliness: near-white = footways /
+    # pedestrian zones (best to walk); dark grey = primary/secondary
+    # roads (walkable but busy). motorway + trunk are NEVER drawn —
+    # pedestrians are legally banned from Autobahn + Schnellstraße.
+    # EVERY other highway class is walkable.
+    WALK_WHITE    = "#f4f4f1"  # footway/path/pedestrian/living_street/steps/bridleway
+    WALK_GREY_LT  = "#d2d2cd"  # track / service / residential
+    WALK_GREY_MID = "#a6a6a0"  # tertiary / unclassified
+    WALK_GREY_DK  = "#767670"  # primary / secondary
+    WALK_CASING   = "#2a2a2a"  # shared dark casing (50% opacity) under the tier
+
+    # === Hiking-path palette (green) ==================================
+    # SAC difficulty encoded by shade; the dashed line pattern stays
+    # reserved for ONE semantic: "this way is difficult and should be
+    # avoided" (SAC T3+ only). trail_visibility is not visually encoded.
+    HIKE_GREEN_LT = "#8bc34a"  # SAC T1 (hiking)             — solid
+    HIKE_GREEN    = "#558b2f"  # SAC T2 (mountain_hiking)    — solid
+    HIKE_GREEN_RT = "#33691e"  # route=hiking long-distance  — solid + halo
+    HIKE_GREEN_DK = "#2e5016"  # SAC T3 (demanding_mountain) — DASHED
+    HIKE_GREEN_DP = "#16280a"  # SAC T4+ (alpine_*)          — DASH_DOT_DASH
+
+    # === Line-pattern vocabulary ======================================
+    # MapLibre v5 line-dasharray is a LITERAL-ARRAY paint property
+    # (NOT data-driven), so each pattern variant becomes its own layer
+    # where filter coverage requires.
+    DASH_LONG           = [4, 2]            # secondary / footway / disused
+    DASH_SHORT          = [3, 2]            # construction / gravel track
+    DASH_DOT            = [0.1, 2]          # cable-car / low-visibility
+    DASH_DOT_DASH       = [1, 2, 4, 2]      # funicular / hard-to-find path
+    DASH_FINE           = [0.1, 3]          # narrow-gauge stipple
+    DASH_TIGHT          = [1, 1]            # steps
+
+    # === Line-width zoom ramps ========================================
+    # Inner array of a MapLibre `interpolate linear zoom` expression.
+    # Spread with `*W_*` when used inside a layer dict.
+    # Bumped at z=6-8 so the headline tier (mainline rail) reads as the
+    # visual focal point at country/regional zoom against busy alpine
+    # satellite imagery. Tuned 2026-05-14 iteration 2.
+    W_HEADLINE          = [6, 2.6, 10, 3.4, 14, 4.6, 18, 6.0]
+    W_HEADLINE_CASING   = [6, 4.6, 10, 5.6, 14, 7.5, 18, 9.5]
+    W_HEADLINE_STRIPE   = [14, 1.4, 18, 2.0]
+    W_BRANCH            = [8, 1.8, 12, 2.6, 16, 3.6, 18, 4.5]
+    W_BRANCH_CASING     = [8, 3.0, 12, 4.2, 16, 5.5, 18, 6.5]
+    W_URBAN             = [10, 1.5, 14, 2.6, 18, 3.6]
+    W_URBAN_CASING      = [10, 2.9, 14, 4.2, 18, 5.4]
+    W_LONGDIST          = [6, 2.0, 10, 2.6, 14, 3.6, 18, 4.5]
+    W_LONGDIST_CASING   = [6, 3.4, 10, 4.4, 14, 5.8, 18, 7.0]
+    W_TRAIL             = [9, 1.0, 12, 1.8, 16, 3.0, 18, 4.0]
+    W_AUX               = [9, 0.8, 14, 1.6]
+    W_AUX_SLIM          = [10, 1.0, 14, 2.0]
+
+    # Walkable-street tier width ramps (white → grey hierarchy).
+    W_WALK_MAJOR        = [9, 0.6, 12, 1.6, 16, 3.2, 18, 4.6]   # primary / secondary
+    W_WALK_MID          = [11, 0.5, 14, 1.3, 18, 2.6]           # tertiary / unclassified
+    W_WALK_LOCAL        = [11, 0.4, 14, 1.0, 18, 2.0]           # track / service / residential
+    W_WALK_FOOT         = [12, 0.4, 14, 0.9, 18, 1.8]           # footway / path / pedestrian
+    W_WALK_CASING       = [9, 1.4, 12, 2.6, 16, 4.6, 18, 6.2]   # shared casing (widest + ~1.5)
+
+    # Per-mode GTFS stop circle-radius ramps
+    R_STOP_BIG          = [6, 1.8, 10, 2.8, 14, 4.5, 18, 6.5]  # rail / subway
+    R_STOP_MED          = [8, 1.6, 12, 2.4, 14, 3.6, 18, 5.0]  # tram / cable
+    R_STOP_SMALL        = [10, 1.4, 12, 2.0, 14, 3.0, 18, 4.2]  # bus / ferry
+
+    # RAILWAY_STYLE — for the ecovoyage 5-theme combined map. Per-mode
+    # rail tier split (mainline/branch/subway/light-rail/tram/
+    # narrow-gauge/funicular/aerialway each a distinct Artaria color)
+    # without the white halos of the satellite-overlay variant (this
+    # style draws onto a transparent base, not satellite imagery).
     RAILWAY_STYLE = [
-        {"id": "rail-tunnel", "type": "line",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "LineString"],
-                    ["!=", ["get", "tunnel"], None]],
-         "paint": {"line-color": "#888888", "line-width": 1.0,
-                   "line-dasharray": [2, 2]}},
-        {"id": "rail-construction", "type": "line",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "LineString"],
-                    ["!=", ["get", "construction"], None]],
-         "paint": {"line-color": "#aaaaaa", "line-width": 1.0,
-                   "line-dasharray": [4, 2]}},
+        # === Auxiliary (drawn first; visually subordinate) ===========
         {"id": "rail-disused", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
@@ -1148,97 +1295,141 @@ def _theme_styles():
                      ["!=", ["get", "abandoned"], None],
                      ["!=", ["get", "disused"], None],
                      ["!=", ["get", "razed"], None]]],
-         "paint": {"line-color": "#cccccc", "line-width": 0.8}},
+         "paint": {"line-color": ART_GREY_DARK, "line-width": 0.8,
+                   "line-dasharray": DASH_LONG, "line-opacity": 0.6}},
+        {"id": "rail-construction", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["!=", ["get", "construction"], None]],
+         "paint": {"line-color": ART_GREY_LIGHT, "line-width": 1.0,
+                   "line-dasharray": DASH_SHORT}},
+        {"id": "rail-tunnel", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["!=", ["get", "tunnel"], None],
+                    ["==", ["get", "railway"], "rail"]],
+         "paint": {"line-color": ART_KK_RED, "line-width": 1.0,
+                   "line-dasharray": DASH_LONG, "line-opacity": 0.55}},
         {"id": "rail-service", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["==", ["get", "railway"], "rail"],
                     ["!=", ["get", "service"], None]],
-         "paint": {"line-color": "#888888", "line-width": 0.8}},
+         "paint": {"line-color": ART_GREY_MID, "line-width": 0.8,
+                   "line-dasharray": DASH_SHORT}},
+        # === Aerialway / cable-car (cable lift, gondola, chair-lift) =
+        {"id": "rail-aerialway", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["!=", ["get", "aerialway"], None]],
+         "paint": {"line-color": ART_VIOLET_LIGHT, "line-width": 1.0,
+                   "line-dasharray": DASH_DOT, "line-opacity": 0.85}},
+        # === Narrow gauge / monorail (period stipple pattern) ========
+        {"id": "rail-narrow-gauge", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "railway"],
+                     ["literal", ["narrow_gauge", "monorail"]]]],
+         "paint": {"line-color": ART_GREY_DARK, "line-width": 1.0,
+                   "line-dasharray": DASH_FINE}},
+        # === Funicular / cogwheel — k.k. Böhm.Nordbahn-style violet ==
+        {"id": "rail-funicular", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "railway"], "funicular"]],
+         "paint": {"line-color": ART_VIOLET, "line-width": 1.2,
+                   "line-dasharray": DASH_DOT_DASH}},
+        # === Tram — k.u. green =======================================
+        {"id": "rail-tram", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "railway"], "tram"]],
+         "paint": {"line-color": ART_KU_GREEN, "line-width": 1.3}},
+        # === Light rail — k.u. green lighter (S-Bahn / Stadtbahn) ====
+        {"id": "rail-light-rail", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "railway"], "light_rail"]],
+         "paint": {"line-color": ART_KU_GREEN_LIGHT, "line-width": 1.4}},
+        # === Subway — k.u. green darker (U-Bahn) =====================
+        {"id": "rail-subway", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "railway"], "subway"]],
+         "paint": {"line-color": ART_KU_GREEN_DARK, "line-width": 1.4}},
+        # === Branch rail — k.k. darker red ===========================
         {"id": "rail-branch", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["==", ["get", "railway"], "rail"],
                     ["!=", ["get", "usage"], "main"],
                     ["==", ["get", "service"], None]],
-         "paint": {"line-color": "#d97a23", "line-width": 1.1}},
+         "paint": {"line-color": ART_KK_RED_DARK, "line-width": 1.2}},
+        # === Mainline rail — k.k. red, headline of the map ===========
         {"id": "rail-mainline", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["==", ["get", "railway"], "rail"],
                     ["==", ["get", "usage"], "main"],
                     ["==", ["get", "service"], None]],
-         "paint": {"line-color": "#1f6bb5", "line-width": 1.6}},
-        {"id": "rail-urban", "type": "line",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "LineString"],
-                    ["in", ["get", "railway"],
-                     ["literal", ["light_rail","subway","tram",
-                                  "narrow_gauge","monorail","funicular"]]]],
-         "paint": {"line-color": "#8b3aa8", "line-width": 1.3}},
-        {"id": "rail-preserved", "type": "line",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "LineString"],
-                    ["in", ["get", "railway"],
-                     ["literal", ["preserved","miniature"]]]],
-         "paint": {"line-color": "#5a7c2f", "line-width": 0.9}},
+         "paint": {"line-color": ART_KK_RED, "line-width": 1.8}},
+        # === Bridge accent (railway only) ============================
         {"id": "rail-bridge", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["!=", ["get", "bridge"], None],
                     ["==", ["get", "railway"], "rail"]],
-         "paint": {"line-color": "#1f6bb5", "line-width": 2.0,
-                   "line-opacity": 0.9}},
+         "paint": {"line-color": ART_KK_RED, "line-width": 2.4,
+                   "line-opacity": 0.95}},
+        # === Stations / halts — black-bordered operator-color dots ===
         {"id": "rail-station", "type": "circle",
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
                     ["any",
                      ["==", ["get", "railway"], "station"],
                      ["==", ["get", "public_transport"], "station"]]],
-         "paint": {"circle-color": "#1f6bb5", "circle-radius": 3,
-                   "circle-stroke-color": "#ffffff",
-                   "circle-stroke-width": 1}},
+         "paint": {"circle-color": ART_KK_RED, "circle-radius": 3,
+                   "circle-stroke-color": ART_HALO,
+                   "circle-stroke-width": 1.2}},
         {"id": "rail-halt", "type": "circle",
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
                     ["in", ["get", "railway"],
-                     ["literal", ["halt","stop"]]]],
-         "paint": {"circle-color": "#888888", "circle-radius": 2,
-                   "circle-stroke-color": "#ffffff",
+                     ["literal", ["halt", "stop"]]]],
+         "paint": {"circle-color": ART_KK_RED_DARK, "circle-radius": 2,
+                   "circle-stroke-color": ART_HALO,
                    "circle-stroke-width": 0.8}},
     ]
 
+    # CYCLE_STYLE — Artaria teal hierarchy + ochre track/path context.
+    # Roads are pedestrian-deprioritized neutral grey (cyclists pick
+    # them up but they're NOT the visual focus).
     CYCLE_STYLE = [
+        # Road context (pedestrian-deprioritized; subtle grey)
         {"id": "cycle-road", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["in", ["get", "highway"],
-                     ["literal", ["motorway","trunk","primary","secondary",
-                                  "tertiary","unclassified","residential"]]]],
-         "paint": {"line-color": "#cccccc", "line-width": 0.6}},
+                     ["literal", ["secondary", "tertiary",
+                                  "unclassified", "residential"]]]],
+         "paint": {"line-color": WALK_GREY_LT, "line-width": 0.6,
+                   "line-opacity": 0.6}},
+        # Gravel tracks (Forststraße)
         {"id": "cycle-track", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["==", ["get", "highway"], "track"]],
-         "paint": {"line-color": "#9b6b3f", "line-width": 0.8,
-                   "line-dasharray": [3, 2]}},
+         "paint": {"line-color": ART_OCHRE_DARK, "line-width": 0.8,
+                   "line-dasharray": DASH_SHORT}},
+        # Paths / footways (cyclable but pedestrian-coded)
         {"id": "cycle-path", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["in", ["get", "highway"],
-                     ["literal", ["path","footway","bridleway"]]]],
-         "paint": {"line-color": "#a83232", "line-width": 0.6,
-                   "line-dasharray": [2, 2]}},
-        {"id": "cycle-cycleway", "type": "line",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "LineString"],
-                    ["==", ["get", "highway"], "cycleway"]],
-         "paint": {"line-color": "#2a78b8", "line-width": 1.4}},
-        {"id": "cycle-bicycle-road", "type": "line",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "LineString"],
-                    ["==", ["get", "bicycle_road"], "yes"]],
-         "paint": {"line-color": "#1d5a8e", "line-width": 1.6}},
+                     ["literal", ["path", "footway", "bridleway"]]]],
+         "paint": {"line-color": ART_OCHRE, "line-width": 0.6,
+                   "line-dasharray": DASH_LONG, "line-opacity": 0.7}},
+        # Lane markings (in-roadway cycle stripes)
         {"id": "cycle-lane-shared", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
@@ -1247,23 +1438,46 @@ def _theme_styles():
                      ["==", ["get", "cycleway:left"], "lane"],
                      ["==", ["get", "cycleway:right"], "lane"],
                      ["==", ["get", "cycleway:both"], "lane"]]],
-         "paint": {"line-color": "#5aa3d5", "line-width": 1.0,
-                   "line-dasharray": [1, 1]}},
+         "paint": {"line-color": ART_TEAL, "line-width": 1.0,
+                   "line-dasharray": DASH_TIGHT}},
+        # Dedicated cycleways — Artaria teal-dark
+        {"id": "cycle-cycleway", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "highway"], "cycleway"]],
+         "paint": {"line-color": ART_TEAL_DARK, "line-width": 1.4}},
+        # Bicycle roads (preferred infrastructure)
+        {"id": "cycle-bicycle-road", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "bicycle_road"], "yes"]],
+         "paint": {"line-color": ART_TEAL_DARK, "line-width": 1.6}},
+        # Long-distance cycle routes — Artaria teal with halo casing
+        {"id": "cycle-route-casing", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "route"], "bicycle"]],
+         "paint": {"line-color": ART_HALO, "line-width": 2.6,
+                   "line-opacity": 0.85}},
         {"id": "cycle-route", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["==", ["get", "route"], "bicycle"]],
-         "paint": {"line-color": "#22aa55", "line-width": 1.2,
-                   "line-opacity": 0.7}},
+         "paint": {"line-color": ART_TEAL, "line-width": 1.4}},
+        # Bicycle parking marker
         {"id": "cycle-parking", "type": "circle",
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
                     ["==", ["get", "amenity"], "bicycle_parking"]],
-         "paint": {"circle-color": "#22aa55", "circle-radius": 2.5,
-                   "circle-stroke-color": "#ffffff",
+         "paint": {"circle-color": ART_TEAL, "circle-radius": 2.5,
+                   "circle-stroke-color": ART_HALO,
                    "circle-stroke-width": 0.8}},
     ]
 
+    # TOPO_STYLE — period-paper fills + Artaria-uniform lines. Major
+    # roads INTENTIONALLY OMITTED (motorways/trunks/primary cluttered
+    # the visual; pedestrians + cyclists in this notebook don't use
+    # them). Tertiary/secondary roads kept as faint context.
     TOPO_STYLE = [
         {"id": "topo-water", "type": "fill",
          "filter": ["all",
@@ -1271,174 +1485,401 @@ def _theme_styles():
                     ["any",
                      ["==", ["get", "natural"], "water"],
                      ["==", ["get", "landuse"], "reservoir"]]],
-         "paint": {"fill-color": "#a8c8e8", "fill-outline-color": "#5a8fb8"}},
+         "paint": {"fill-color": ART_WATER,
+                   "fill-outline-color": ART_WATER_OUTLINE}},
         {"id": "topo-forest", "type": "fill",
          "filter": ["all",
                     ["==", ["geometry-type"], "Polygon"],
                     ["any",
                      ["==", ["get", "natural"], "wood"],
                      ["==", ["get", "landuse"], "forest"]]],
-         "paint": {"fill-color": "#c5dec5", "fill-opacity": 0.7}},
+         "paint": {"fill-color": ART_FOREST, "fill-opacity": 0.7}},
         {"id": "topo-glacier", "type": "fill",
          "filter": ["all",
                     ["==", ["geometry-type"], "Polygon"],
                     ["==", ["get", "natural"], "glacier"]],
-         "paint": {"fill-color": "#f0f8ff", "fill-outline-color": "#a0c0d0"}},
+         "paint": {"fill-color": ART_GLACIER,
+                   "fill-outline-color": ART_GLACIER_OUTLINE}},
         {"id": "topo-farmland", "type": "fill",
          "filter": ["all",
                     ["==", ["geometry-type"], "Polygon"],
                     ["in", ["get", "landuse"],
-                     ["literal", ["farmland","farmyard","orchard","vineyard","meadow"]]]],
-         "paint": {"fill-color": "#f0e8c8", "fill-opacity": 0.5}},
+                     ["literal", ["farmland", "farmyard", "orchard",
+                                  "vineyard", "meadow"]]]],
+         "paint": {"fill-color": ART_FARMLAND, "fill-opacity": 0.5}},
         {"id": "topo-residential", "type": "fill",
          "filter": ["all",
                     ["==", ["geometry-type"], "Polygon"],
                     ["==", ["get", "landuse"], "residential"]],
-         "paint": {"fill-color": "#e8d8c8", "fill-opacity": 0.6}},
+         "paint": {"fill-color": ART_BUILT, "fill-opacity": 0.6}},
         {"id": "topo-waterway", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["!=", ["get", "waterway"], None]],
-         "paint": {"line-color": "#5a8fb8", "line-width": 0.6}},
-        {"id": "topo-road-major", "type": "line",
+         "paint": {"line-color": ART_WATER_OUTLINE, "line-width": 0.6}},
+        # === WALKABLE STREET TIER (white → grey hierarchy) ==========
+        # Every highway class EXCEPT motorway + trunk is walkable.
+        # Shared dark casing first (continuity backstop + contrast),
+        # then dark→light shades drawn major→foot so the most
+        # pedestrian-friendly ways read on top.
+        {"id": "topo-walk-casing", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["in", ["get", "highway"],
-                     ["literal", ["motorway","trunk","primary"]]]],
-         "paint": {"line-color": "#d0a060", "line-width": 1.4}},
-        {"id": "topo-road-minor", "type": "line",
+                     ["literal", ["primary", "primary_link",
+                                  "secondary", "secondary_link",
+                                  "tertiary", "tertiary_link",
+                                  "unclassified", "residential",
+                                  "living_street", "service", "track",
+                                  "road", "footway", "path",
+                                  "pedestrian", "steps", "bridleway"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": WALK_CASING, "line-width": 1.4,
+                   "line-opacity": 0.5}},
+        # Major roads — primary / secondary (dark grey)
+        {"id": "topo-walk-major", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["in", ["get", "highway"],
-                     ["literal", ["secondary","tertiary","unclassified","residential"]]]],
-         "paint": {"line-color": "#d0d0d0", "line-width": 0.7}},
+                     ["literal", ["primary", "primary_link",
+                                  "secondary", "secondary_link"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": WALK_GREY_DK, "line-width": 1.2}},
+        # Mid roads — tertiary / unclassified (mid grey)
+        {"id": "topo-walk-mid", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["tertiary", "tertiary_link",
+                                  "unclassified"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": WALK_GREY_MID, "line-width": 0.9}},
+        # Local ways — residential / service / track / road (light grey)
+        {"id": "topo-walk-local", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["residential", "living_street",
+                                  "service", "track", "road"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": WALK_GREY_LT, "line-width": 0.7}},
+        # Footways / paths / pedestrian zones (near-white) — excludes
+        # sac_scale-tagged + route=hiking ways (those go green in the
+        # hiking tier).
+        {"id": "topo-walk-foot", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["footway", "path", "pedestrian",
+                                  "steps", "bridleway"]]],
+                    ["==", ["get", "sac_scale"], None],
+                    ["!=", ["get", "route"], "hiking"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": WALK_WHITE, "line-width": 0.7}},
+        # Rail context (slim, Artaria red-dark)
         {"id": "topo-rail", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["!=", ["get", "railway"], None]],
-         "paint": {"line-color": "#555555", "line-width": 0.6}},
+         "paint": {"line-color": ART_KK_RED_DARK, "line-width": 0.6}},
+        # Administrative boundary
         {"id": "topo-boundary", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["==", ["get", "boundary"], "administrative"]],
-         "paint": {"line-color": "#a040c0", "line-width": 0.5,
-                   "line-dasharray": [3, 2], "line-opacity": 0.5}},
+         "paint": {"line-color": ART_BOUNDARY, "line-width": 0.5,
+                   "line-dasharray": DASH_SHORT, "line-opacity": 0.55}},
+        # Peak marker
         {"id": "topo-peak", "type": "circle",
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
                     ["==", ["get", "natural"], "peak"]],
-         "paint": {"circle-color": "#8b4513", "circle-radius": 2.5,
-                   "circle-stroke-color": "#ffffff",
+         "paint": {"circle-color": ART_PEAK, "circle-radius": 2.5,
+                   "circle-stroke-color": ART_HALO,
                    "circle-stroke-width": 0.8}},
+        # Aerialway context (cable-cars / gondolas — Artaria violet)
         {"id": "topo-aerialway", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["!=", ["get", "aerialway"], None]],
-         "paint": {"line-color": "#888888", "line-width": 0.4,
-                   "line-dasharray": [1, 2]}},
+         "paint": {"line-color": ART_VIOLET_LIGHT, "line-width": 0.5,
+                   "line-dasharray": DASH_DOT, "line-opacity": 0.85}},
     ]
 
+    # HIKING_STYLE — Artaria sienna ramp by SAC difficulty + 3
+    # visibility-encoding layers (per OSM-wiki "Hiking trails rendering
+    # proposal 1" classification, reskinned). Long-distance routes
+    # (route=hiking) get a halo casing — the visual headline of the
+    # hiking tier.
     HIKING_STYLE = [
+        # Generic footways/paths (untyped — sac_scale = null) are
+        # WALKABLE WAYS (white), NOT hiking trails. Green is reserved
+        # for sac_scale-tagged trails + route=hiking below.
+        {"id": "hike-trail-footway", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["path", "footway"]]],
+                    ["==", ["get", "sac_scale"], None]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": WALK_WHITE, "line-width": 0.8,
+                   "line-opacity": 0.9}},
+        # Alpine SAC tier (T4-T6) — deep green, DASH_DOT_DASH warning.
+        # Drawn first so easier paths render OVER it at junctions.
+        {"id": "hike-trail-alpine", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["in", ["get", "sac_scale"],
+                     ["literal", ["alpine_hiking",
+                                  "demanding_alpine_hiking",
+                                  "difficult_alpine_hiking"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": HIKE_GREEN_DP, "line-width": 1.0,
+                   "line-dasharray": DASH_DOT_DASH, "line-opacity": 0.95}},
+        # Difficult SAC tier (T3 demanding_mountain_hiking) — dark
+        # green, DASH_LONG.
+        {"id": "hike-trail-difficult", "type": "line",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "LineString"],
+                    ["==", ["get", "sac_scale"],
+                     "demanding_mountain_hiking"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": HIKE_GREEN_DK, "line-width": 1.0,
+                   "line-dasharray": DASH_LONG, "line-opacity": 0.95}},
+        # Easy SAC tier (T1 + T2) — SOLID green. Shade by sac_scale.
         {"id": "hike-trail-easy", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
-                    ["any",
-                     ["==", ["get", "highway"], "path"],
-                     ["==", ["get", "highway"], "footway"]],
-                    ["==", ["get", "sac_scale"], None]],
-         "paint": {"line-color": "#d97a23", "line-width": 0.6,
-                   "line-dasharray": [3, 2]}},
-        {"id": "hike-trail-sac", "type": "line",
+                    ["in", ["get", "sac_scale"],
+                     ["literal", ["hiking", "mountain_hiking"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": [
+                       "match", ["get", "sac_scale"],
+                       "hiking",          HIKE_GREEN_LT,
+                       "mountain_hiking", HIKE_GREEN,
+                       HIKE_GREEN_LT,
+                   ],
+                   "line-width": 1.0, "line-opacity": 0.95}},
+        # Long-distance hiking routes — green with white halo casing.
+        {"id": "hike-route-casing", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
-                    ["!=", ["get", "sac_scale"], None]],
-         "paint": {"line-color": "#a83232", "line-width": 1.0}},
+                    ["==", ["get", "route"], "hiking"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": ART_HALO, "line-width": 2.4,
+                   "line-opacity": 0.85}},
         {"id": "hike-route", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["==", ["get", "route"], "hiking"]],
-         "paint": {"line-color": "#cc4444", "line-width": 1.3,
-                   "line-opacity": 0.7}},
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": HIKE_GREEN_RT, "line-width": 1.3}},
+        # Bridleway — solid white (walkable way, not a hiking trail).
         {"id": "hike-bridleway", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["==", ["get", "highway"], "bridleway"]],
-         "paint": {"line-color": "#8b6f47", "line-width": 0.8,
-                   "line-dasharray": [4, 2]}},
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": WALK_WHITE, "line-width": 0.8}},
+        # Steps — solid white with tight dasharray (walkable way;
+        # mild texture, not a difficult hiking trail).
         {"id": "hike-steps", "type": "line",
          "filter": ["all",
                     ["==", ["geometry-type"], "LineString"],
                     ["==", ["get", "highway"], "steps"]],
-         "paint": {"line-color": "#444444", "line-width": 1.2,
-                   "line-dasharray": [1, 1]}},
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {"line-color": WALK_WHITE, "line-width": 1.2,
+                   "line-dasharray": DASH_TIGHT}},
+        # Peak / saddle / spring / hut / viewpoint markers
         {"id": "hike-peak", "type": "circle",
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
                     ["==", ["get", "natural"], "peak"]],
-         "paint": {"circle-color": "#8b4513", "circle-radius": 3,
-                   "circle-stroke-color": "#ffffff",
+         "paint": {"circle-color": ART_PEAK, "circle-radius": 3,
+                   "circle-stroke-color": ART_HALO,
                    "circle-stroke-width": 1}},
         {"id": "hike-saddle", "type": "circle",
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
                     ["==", ["get", "natural"], "saddle"]],
-         "paint": {"circle-color": "#b08040", "circle-radius": 2.5,
-                   "circle-stroke-color": "#ffffff",
+         "paint": {"circle-color": HIKE_GREEN, "circle-radius": 2.5,
+                   "circle-stroke-color": ART_HALO,
                    "circle-stroke-width": 0.8}},
         {"id": "hike-spring", "type": "circle",
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
                     ["==", ["get", "natural"], "spring"]],
-         "paint": {"circle-color": "#4a90c8", "circle-radius": 2.5,
-                   "circle-stroke-color": "#ffffff",
+         "paint": {"circle-color": ART_WATER_OUTLINE,
+                   "circle-radius": 2.5,
+                   "circle-stroke-color": ART_HALO,
                    "circle-stroke-width": 1}},
         {"id": "hike-hut", "type": "circle",
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
                     ["in", ["get", "tourism"],
-                     ["literal", ["alpine_hut","wilderness_hut"]]]],
-         "paint": {"circle-color": "#cc3333", "circle-radius": 4,
-                   "circle-stroke-color": "#ffffff",
+                     ["literal", ["alpine_hut", "wilderness_hut"]]]],
+         "paint": {"circle-color": ART_KK_RED, "circle-radius": 4,
+                   "circle-stroke-color": ART_HALO,
                    "circle-stroke-width": 1.5}},
         {"id": "hike-viewpoint", "type": "circle",
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
                     ["==", ["get", "tourism"], "viewpoint"]],
-         "paint": {"circle-color": "#22aaaa", "circle-radius": 3,
-                   "circle-stroke-color": "#ffffff",
+         "paint": {"circle-color": ART_TEAL, "circle-radius": 3,
+                   "circle-stroke-color": ART_HALO,
                    "circle-stroke-width": 1}},
     ]
 
-    # ---- TRANSIT_STYLE — GTFS-stops overlay (uniform dots + labels) ----
-    # Used by every map cell that overlays GTFS stops. The dot is now
-    # UNIFORM (white fill + dark stroke) — classic period-map "transit
-    # point" look that reads on every background. The text symbol
-    # layer below renders the stop name at z11+ via versatiles-
-    # glyphs-rs SDF font tiles (wired via the helper's `glyphs_url`
-    # kwarg). MapLibre's default text-allow-overlap=false drops
-    # crowded labels at city zoom — no per-stop importance ranking
-    # needed.
+    # ---- TRANSIT_STYLE — per-mode GTFS-stops overlay -----------------
+    # Six per-mode circle layers tinted by `primary_route_type` (GTFS
+    # route_type rolled up by the materialize_duckdb DAG task with
+    # precedence rail > subway > tram > funicular > cable_car/gondola >
+    # ferry > bus). Each layer's filter selects ONE mode; the filters
+    # are mutually exclusive, so each stop renders exactly once.
     #
-    # The match_kind discriminator is no longer encoded into colour.
-    # It's still inspectable via the unified-analysis cell's
-    # transit.matched_stops query above the map.
+    # Stops with NO matched GTFS route (orphan OSM points) render via a
+    # neutral 'unmatched' layer at the bottom of the stack.
+    #
+    # The text-label symbol layer at the top reads the stop name in
+    # ART_BLACK with ART_HALO halo at z>=11 (versatiles-glyphs-rs SDF
+    # fonts via the helper's `glyphs_url` kwarg). MapLibre's default
+    # text-allow-overlap=false drops crowded labels at city zoom.
+
+    # GTFS route_type discriminator (per spec):
+    #   0 = Tram / Streetcar / Light rail
+    #   1 = Subway / Metro
+    #   2 = Rail
+    #   3 = Bus
+    #   4 = Ferry
+    #   5 = Cable Car
+    #   6 = Gondola / Aerial-suspended cable
+    #   7 = Funicular
+    # Values are STRING ("0".."7") not int, because freestiler drops
+    # nullable-int columns through the parquet → MVT pipeline.
+    _RT_FILTER = lambda rt: ["==",
+                              ["coalesce",
+                               ["get", "primary_route_type"], ""],
+                              str(rt)]
+
     TRANSIT_STYLE = [
-        {"id": "transit-stops", "type": "circle",
+        # Unmatched / null primary_route_type (orphan or pre-rollup).
+        # Empty-string match catches both null and DuckDB's stringified
+        # null ("None" or "" depending on the DuckDB version).
+        {"id": "transit-stops-unmatched", "type": "circle",
          "source": "transit-src", "source-layer": "austria-transit",
-         "filter": ["==", ["geometry-type"], "Point"],
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["any",
+                     ["==", ["coalesce",
+                            ["get", "primary_route_type"], ""], ""],
+                     ["==", ["get", "primary_route_type"], "None"]]],
          "paint": {
-            "circle-radius": [
-                "interpolate", ["linear"], ["zoom"],
-                6, 1.8,
-                10, 2.8,
-                14, 4.5,
-                18, 6.5,
-            ],
-            "circle-color": "#ffffff",
-            "circle-stroke-color": "#1a1a1a",
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              *R_STOP_SMALL],
+            "circle-color": ART_HALO,
+            "circle-stroke-color": ART_GREY_DARK,
+            "circle-stroke-width": 0.9,
+            "circle-opacity": 0.8,
+         }},
+        # Bus stops (route_type=3) — Artaria mustard
+        {"id": "transit-stops-bus", "type": "circle",
+         "source": "transit-src", "source-layer": "austria-transit",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    _RT_FILTER(3)],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              *R_STOP_SMALL],
+            "circle-color": ART_BUS,
+            "circle-stroke-color": ART_HALO,
+            "circle-stroke-width": 1.0,
+            "circle-opacity": 0.95,
+         }},
+        # Ferry piers (route_type=4)
+        {"id": "transit-stops-ferry", "type": "circle",
+         "source": "transit-src", "source-layer": "austria-transit",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    _RT_FILTER(4)],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              *R_STOP_MED],
+            "circle-color": ART_FERRY,
+            "circle-stroke-color": ART_HALO,
+            "circle-stroke-width": 1.0,
+            "circle-opacity": 0.95,
+         }},
+        # Cable car / gondola (route_type=5)
+        {"id": "transit-stops-cable", "type": "circle",
+         "source": "transit-src", "source-layer": "austria-transit",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    _RT_FILTER(5)],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              *R_STOP_MED],
+            "circle-color": ART_VIOLET_LIGHT,
+            "circle-stroke-color": ART_HALO,
+            "circle-stroke-width": 1.0,
+            "circle-opacity": 0.95,
+         }},
+        # Funicular (route_type=7) — Artaria violet
+        {"id": "transit-stops-funicular", "type": "circle",
+         "source": "transit-src", "source-layer": "austria-transit",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    _RT_FILTER(7)],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              *R_STOP_MED],
+            "circle-color": ART_VIOLET,
+            "circle-stroke-color": ART_HALO,
             "circle-stroke-width": 1.2,
             "circle-opacity": 0.95,
          }},
+        # Tram stops (route_type=0) — Artaria k.u. green
+        {"id": "transit-stops-tram", "type": "circle",
+         "source": "transit-src", "source-layer": "austria-transit",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    _RT_FILTER(0)],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              *R_STOP_MED],
+            "circle-color": ART_KU_GREEN,
+            "circle-stroke-color": ART_HALO,
+            "circle-stroke-width": 1.2,
+            "circle-opacity": 0.95,
+         }},
+        # Subway / U-Bahn (route_type=1) — Artaria k.u. green dark
+        {"id": "transit-stops-subway", "type": "circle",
+         "source": "transit-src", "source-layer": "austria-transit",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    _RT_FILTER(1)],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              *R_STOP_BIG],
+            "circle-color": ART_KU_GREEN_DARK,
+            "circle-stroke-color": ART_HALO,
+            "circle-stroke-width": 1.2,
+            "circle-opacity": 0.95,
+         }},
+        # Rail stations (route_type=2) — Artaria k.k. red, biggest dot
+        {"id": "transit-stops-train", "type": "circle",
+         "source": "transit-src", "source-layer": "austria-transit",
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    _RT_FILTER(2)],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              *R_STOP_BIG],
+            "circle-color": ART_KK_RED,
+            "circle-stroke-color": ART_HALO,
+            "circle-stroke-width": 1.4,
+            "circle-opacity": 0.95,
+         }},
+        # Stop names (one symbol layer, all modes)
         {"id": "transit-stops-label", "type": "symbol",
          "source": "transit-src", "source-layer": "austria-transit",
          "minzoom": 11,
@@ -1455,177 +1896,247 @@ def _theme_styles():
             "text-anchor": "top",
             "text-offset": [0, 0.6],
             "text-padding": 2,
-            # MapLibre default text-allow-overlap=false handles
-            # collision avoidance — crowded labels are dropped.
          },
          "paint": {
-            "text-color": "#1a1a1a",
-            "text-halo-color": "#ffffff",
+            "text-color": ART_BLACK,
+            "text-halo-color": ART_HALO,
             "text-halo-width": 1.5,
             "text-halo-blur": 0.5,
          }},
     ]
 
-    # ---- SATELLITE_OVERLAY_STYLE — zoom-banded transport overlay ----
-    # Dedicated style for the satellite-overlay map cell. Inspired by
-    # Artaria's 1911 Eisenbahnkarte von Österreich-Ungarn — railways
-    # are the visual headline (k.k. Staatsbahn red for mainline,
-    # k.u. green for urban transit); cycle network is secondary
-    # (deep teal-ink, halo on the long-distance routes); hiking
-    # network is also secondary (sienna, halo on long-distance
-    # routes); generic footpaths are tertiary (warm ochre dashed).
+    # ---- SATELLITE_OVERLAY_STYLE — zoom-banded transport overlay -----
+    # Dedicated style for the satellite-overlay map cell. Aesthetic
+    # signature: Artaria 1911 Eisenbahnkarte von Österreich-Ungarn.
+    # See the palette constants at the top of this cell for the full
+    # operator-color table.
     #
     # Reads from the `austria-ecovoyage` martin source (single
-    # UNION-ALL-BY-NAME pmtiles with a `theme` discriminator). Every
-    # layer filter anchors `theme` first.
+    # UNION-ALL-BY-NAME pmtiles with a `theme` discriminator: railway,
+    # cycle, hiking, topo). Every layer's filter anchors `theme` first.
     #
-    # Layer ORDER (top of list = bottom of draw stack):
-    #   tertiary footpaths → secondary cycle → secondary hiking →
-    #   primary railways.
+    # DRAW ORDER (top of list = drawn FIRST = visually UNDERNEATH):
+    #   1.  Tertiary/minor paved roads (pedestrian-deprioritized — faint)
+    #   2.  Pedestrian zones (pale ochre)
+    #   3.  Gravel tracks (Forststraße — earthy brown dashed)
+    #   4.  Footways (ochre dashed)
+    #   5.  SAC trails — 3 visibility layers (sienna ramp)
+    #   6.  Hiking long-distance routes (with halo)
+    #   7.  Dedicated cycleways
+    #   8.  Cycle long-distance routes (with halo)
+    #   9.  Rail aux: disused / construction / tunnel / service
+    #   10. Aerialway / cable-car (violet light, dotted)
+    #   11. Narrow-gauge (grey-dark, fine stipple)
+    #   12. Funicular (violet, dot-dash) — with halo
+    #   13. Tram (k.u. green) — with halo
+    #   14. Light rail / S-Bahn (k.u. green light) — with halo
+    #   15. Subway / U-Bahn (k.u. green dark) — with halo
+    #   16. Branch rail (k.k. red dark) — with halo
+    #   17. Mainline rail (k.k. red) — with halo + z14+ centre stripe
+    #   18. Rail station + halt circles (red dots)
+    #   19. Rail station name labels (z12+ symbols)
     #
-    # White casings (halos) ride underneath every long-distance line
-    # tier (mainline rail, branch rail, urban rail, cycle national,
-    # hiking long-distance). The mainline-rail "double-track" effect
-    # at z14+ overlays a thin white center stripe so the line reads
-    # as `casing | red | stripe | red | casing` — period-printed-
-    # map railway track signature.
+    # GTFS-stop layers (mode-tinted from TRANSIT_STYLE) get APPENDED
+    # via the helper's `extra_layers` parameter, so they ride at the
+    # very top of the visual stack.
+    #
+    # White halo casings ride underneath every primary line tier so the
+    # operator color reads cleanly against the busy satellite imagery.
     SATELLITE_OVERLAY_STYLE = [
-        # === TERTIARY (drawn first; underneath everything) ===
+        # ============================================================
+        # === WALKABLE STREET TIER (white → grey hierarchy)          ===
+        # ============================================================
+        # EVERY highway class except motorway + trunk is walkable.
+        # Shade encodes pedestrian-friendliness: near-white footways →
+        # dark-grey primary/secondary roads. A single shared dark
+        # casing (sat-walk-casing) draws first: it is BOTH the
+        # continuity backstop (no gaps where adjacent OSM segments
+        # change highway class) AND the satellite-contrast edge (grey
+        # lines need a dark rim to read against the imagery). Then the
+        # colored shades draw major→foot so the most pedestrian-
+        # friendly ways render on top.
 
-        # Generic footpaths — z11+, thinnest dashed warm ochre
-        {"id": "sat-footway", "type": "line",
+        # Shared dark casing — all walkable highway classes, all
+        # zooms ≥9. Continuity backstop + contrast edge.
+        {"id": "sat-walk-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 9,
+         "filter": ["all",
+                    ["in", ["get", "theme"],
+                     ["literal", ["hiking", "topo"]]],
+                    ["in", ["get", "highway"],
+                     ["literal", ["primary", "primary_link",
+                                  "secondary", "secondary_link",
+                                  "tertiary", "tertiary_link",
+                                  "unclassified", "residential",
+                                  "living_street", "service", "track",
+                                  "road", "footway", "path",
+                                  "pedestrian", "steps", "bridleway"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": WALK_CASING,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_WALK_CASING],
+            "line-opacity": 0.5,
+         }},
+
+        # Major roads — primary / secondary (dark grey). NOT motorway
+        # or trunk: pedestrians are legally banned from those.
+        {"id": "sat-walk-major", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 9,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "topo"],
+                    ["in", ["get", "highway"],
+                     ["literal", ["primary", "primary_link",
+                                  "secondary", "secondary_link"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": WALK_GREY_DK,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_WALK_MAJOR],
+         }},
+
+        # Mid roads — tertiary / unclassified (mid grey)
+        {"id": "sat-walk-mid", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
          "minzoom": 11,
          "filter": ["all",
-                    ["==", ["get", "theme"], "hiking"],
+                    ["==", ["get", "theme"], "topo"],
                     ["in", ["get", "highway"],
-                     ["literal", ["path", "footway", "bridleway", "steps"]]],
+                     ["literal", ["tertiary", "tertiary_link",
+                                  "unclassified"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": WALK_GREY_MID,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_WALK_MID],
+         }},
+
+        # Local ways — residential / living_street / service / track /
+        # road (light grey)
+        {"id": "sat-walk-local", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 11,
+         "filter": ["all",
+                    ["in", ["get", "theme"],
+                     ["literal", ["hiking", "topo"]]],
+                    ["in", ["get", "highway"],
+                     ["literal", ["residential", "living_street",
+                                  "service", "track", "road"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": WALK_GREY_LT,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_WALK_LOCAL],
+         }},
+
+        # Footways / paths / pedestrian zones / steps / bridleway —
+        # near-white (most pedestrian-friendly). Excludes sac_scale-
+        # tagged + route=hiking ways (those render green in the
+        # hiking tier below).
+        {"id": "sat-walk-foot", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 12,
+         "filter": ["all",
+                    ["in", ["get", "theme"],
+                     ["literal", ["hiking", "topo"]]],
+                    ["in", ["get", "highway"],
+                     ["literal", ["footway", "path", "pedestrian",
+                                  "steps", "bridleway"]]],
                     ["==", ["get", "sac_scale"], None],
                     ["!=", ["get", "route"], "hiking"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {
-            "line-color": "#a06030",
+            "line-color": WALK_WHITE,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           11, 0.4, 14, 0.9, 18, 1.6],
-            "line-dasharray": [2, 2],
-            "line-opacity": 0.7,
+                           *W_WALK_FOOT],
          }},
 
-        # === SECONDARY — hiking (long-distance + SAC × visibility) ===
+        # ============================================================
+        # === HIKING TIER: SAC trails (green scale by difficulty) +   ==
+        # ===              long-distance hiking routes                ==
+        # ============================================================
+        # SAC dasharray semantics: SOLID = walkable (T1, T2);
+        # DASHED = "difficult, should be avoided" (T3+ exclusively).
+        # Hiking infrastructure renders GREEN — distinct from the
+        # white/grey walkable streets.
 
-        # SAC-graded trails — three layers encoding the
-        # OSM-wiki "Hiking trails rendering proposal 1" (Rooart 2018,
-        # https://wiki.openstreetmap.org/wiki/File:Hiking_trails_rendering_proposal_1.png).
-        # Colour encodes sac_scale difficulty (T1 red → T2 orange →
-        # T3 purple → T4+ cyan); line pattern encodes trail_visibility
-        # (excellent/missing → solid, good/intermediate → dashed,
-        # bad/horrible/no → dotted). MapLibre v5 line-dasharray is a
-        # literal-array paint property (not data-driven), so the three
-        # visibility classes need three layers. Inside each, line-color
-        # is a `match` on sac_scale.
-        #
-        # Draw order: dotted FIRST (lowest priority — uncertain paths
-        # render behind certain paths), then dashed, then solid on top.
-        # The four-colour palette tracks OpenAndroMaps + the proposal
-        # image swatches.
-
-        # T-scale → colour. Used identically in all three trail layers.
-        # (Defined inline three times for layer-level isolation; the
-        # marimo cell's local scope makes it cheap.)
-
-        # Dotted: trail_visibility = bad / horrible / no — "No clear path"
-        {"id": "sat-hike-trail-dotted", "type": "line",
+        # Alpine SAC tier (T4-T6) — DASH_DOT_DASH warning pattern,
+        # deepest green. Drawn FIRST so easier paths render OVER it
+        # at junctions where a path transitions T3→T4.
+        {"id": "sat-hike-trail-alpine", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 9,
+         "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "hiking"],
-                    ["!=", ["get", "sac_scale"], None],
-                    ["in", ["get", "trail_visibility"],
-                     ["literal", ["bad", "horrible", "no"]]]],
-         "layout": {"line-cap": "round"},
+                    ["in", ["get", "sac_scale"],
+                     ["literal", ["alpine_hiking",
+                                  "demanding_alpine_hiking",
+                                  "difficult_alpine_hiking"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": HIKE_GREEN_DP,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_TRAIL],
+            "line-dasharray": DASH_DOT_DASH,
+            "line-opacity": 0.95,
+         }},
+
+        # Difficult SAC tier (T3 demanding_mountain_hiking) —
+        # DASH_LONG pattern, dark green.
+        {"id": "sat-hike-trail-difficult", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "hiking"],
+                    ["==", ["get", "sac_scale"],
+                     "demanding_mountain_hiking"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": HIKE_GREEN_DK,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_TRAIL],
+            "line-dasharray": DASH_LONG,
+            "line-opacity": 0.95,
+         }},
+
+        # Easy SAC tier (T1 hiking + T2 mountain_hiking) — SOLID green.
+        # Color shade encodes T1 vs T2 via inline match.
+        {"id": "sat-hike-trail-easy", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "hiking"],
+                    ["in", ["get", "sac_scale"],
+                     ["literal", ["hiking", "mountain_hiking"]]]],
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {
             "line-color": [
                 "match", ["get", "sac_scale"],
-                "hiking",                    "#c62828",
-                "mountain_hiking",           "#ef6c00",
-                "demanding_mountain_hiking", "#7b1fa2",
-                "alpine_hiking",             "#03a9f4",
-                "demanding_alpine_hiking",   "#03a9f4",
-                "difficult_alpine_hiking",   "#03a9f4",
-                "#8a6a36",
+                "hiking",          HIKE_GREEN_LT,
+                "mountain_hiking", HIKE_GREEN,
+                HIKE_GREEN_LT,
             ],
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           9, 1.0, 12, 1.8, 16, 3.0, 18, 4.0],
-            "line-dasharray": [0.1, 2],
-            "line-opacity": 0.9,
+                           *W_TRAIL],
+            "line-opacity": 0.95,
          }},
 
-        # Dashed: trail_visibility = good / intermediate —
-        # "Sometimes hard to follow"
-        {"id": "sat-hike-trail-dashed", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 9,
-         "filter": ["all",
-                    ["==", ["get", "theme"], "hiking"],
-                    ["!=", ["get", "sac_scale"], None],
-                    ["in", ["get", "trail_visibility"],
-                     ["literal", ["good", "intermediate"]]]],
-         "paint": {
-            "line-color": [
-                "match", ["get", "sac_scale"],
-                "hiking",                    "#c62828",
-                "mountain_hiking",           "#ef6c00",
-                "demanding_mountain_hiking", "#7b1fa2",
-                "alpine_hiking",             "#03a9f4",
-                "demanding_alpine_hiking",   "#03a9f4",
-                "difficult_alpine_hiking",   "#03a9f4",
-                "#8a6a36",
-            ],
-            "line-width": ["interpolate", ["linear"], ["zoom"],
-                           9, 1.0, 12, 1.8, 16, 3.0, 18, 4.0],
-            "line-dasharray": [3, 2],
-            "line-opacity": 0.9,
-         }},
-
-        # Solid: trail_visibility = excellent (or untagged) —
-        # "Always easy to follow"; the default fallback for ways
-        # without an explicit trail_visibility tag (per the proposal
-        # T1 hiking is well-marked by default).
-        {"id": "sat-hike-trail-solid", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 9,
-         "filter": ["all",
-                    ["==", ["get", "theme"], "hiking"],
-                    ["!=", ["get", "sac_scale"], None],
-                    ["any",
-                     ["==", ["get", "trail_visibility"], "excellent"],
-                     ["==", ["get", "trail_visibility"], None]]],
-         "paint": {
-            "line-color": [
-                "match", ["get", "sac_scale"],
-                "hiking",                    "#c62828",
-                "mountain_hiking",           "#ef6c00",
-                "demanding_mountain_hiking", "#7b1fa2",
-                "alpine_hiking",             "#03a9f4",
-                "demanding_alpine_hiking",   "#03a9f4",
-                "difficult_alpine_hiking",   "#03a9f4",
-                "#8a6a36",
-            ],
-            "line-width": ["interpolate", ["linear"], ["zoom"],
-                           9, 1.0, 12, 1.8, 16, 3.0, 18, 4.0],
-            "line-opacity": 0.9,
-         }},
-
-        # Hiking long-distance routes — z6+, sienna with white halo
+        # Hiking long-distance routes — deep blue with white halo.
+        # Visual headline of the hiking tier; visible from country
+        # zoom upward.
         {"id": "sat-hike-route-casing", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
          "minzoom": 6,
          "filter": ["all",
                     ["==", ["get", "theme"], "hiking"],
                     ["==", ["get", "route"], "hiking"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {
-            "line-color": "#ffffff",
+            "line-color": ART_HALO,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 3.0, 10, 4.2, 14, 5.8, 18, 7.0],
+                           *W_LONGDIST_CASING],
             "line-opacity": 0.85,
          }},
         {"id": "sat-hike-route", "type": "line",
@@ -1634,24 +2145,32 @@ def _theme_styles():
          "filter": ["all",
                     ["==", ["get", "theme"], "hiking"],
                     ["==", ["get", "route"], "hiking"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {
-            "line-color": "#9c5a1f",
+            "line-color": HIKE_GREEN_RT,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 1.6, 10, 2.4, 14, 3.6, 18, 4.5],
+                           *W_LONGDIST],
          }},
 
-        # === SECONDARY — cycle network ===
-        #
-        # RCA finding 2026-05-14: the Austrian OSM data has only ~45
-        # `route=bicycle` features (only 1 of which carries
-        # network=lcn). The icn/ncn/rcn split that other countries
-        # use is essentially empty here. So we render TWO cycle
-        # layers: one for every `route=bicycle` (any network — those
-        # 45 named routes get the prominent halo'd teal-ink treatment
-        # from country zoom upward) + one for `highway=cycleway`
-        # dedicated infrastructure (visible at city zoom).
+        # ============================================================
+        # === CYCLE TIER: dedicated cycleways + long-distance routes ==
+        # ============================================================
 
-        # Named cycle routes (route=bicycle, any network) — z6+,
+        # Dedicated cycleways (highway=cycleway) — Artaria teal-dark
+        {"id": "sat-cycleway", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 11,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "cycle"],
+                    ["==", ["get", "highway"], "cycleway"]],
+         "paint": {
+            "line-color": ART_TEAL_DARK,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           11, 1.2, 14, 2.0, 18, 3.0],
+            "line-opacity": 0.9,
+         }},
+
+        # Long-distance cycle routes (route=bicycle, any network) —
         # teal-ink with halo
         {"id": "sat-cycle-route-casing", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
@@ -1660,9 +2179,9 @@ def _theme_styles():
                     ["==", ["get", "theme"], "cycle"],
                     ["==", ["get", "route"], "bicycle"]],
          "paint": {
-            "line-color": "#ffffff",
+            "line-color": ART_HALO,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 3.0, 10, 4.2, 14, 5.8, 18, 7.0],
+                           *W_LONGDIST_CASING],
             "line-opacity": 0.85,
          }},
         {"id": "sat-cycle-route", "type": "line",
@@ -1672,28 +2191,65 @@ def _theme_styles():
                     ["==", ["get", "theme"], "cycle"],
                     ["==", ["get", "route"], "bicycle"]],
          "paint": {
-            "line-color": "#1a4a6e",
+            "line-color": ART_TEAL,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 1.6, 10, 2.4, 14, 3.6, 18, 4.5],
+                           *W_LONGDIST],
          }},
 
-        # Dedicated cycleways (highway=cycleway) — z11+, navy ink
-        {"id": "sat-cycleway", "type": "line",
+        # ============================================================
+        # === RAILWAY AUXILIARY (disused / construction / tunnel /  ===
+        # === service — drawn before primary tiers)                  ===
+        # ============================================================
+
+        # Disused / abandoned / razed rail — grey-dark dashed
+        {"id": "sat-rail-disused", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 11,
+         "minzoom": 10,
          "filter": ["all",
-                    ["==", ["get", "theme"], "cycle"],
-                    ["==", ["get", "highway"], "cycleway"]],
+                    ["==", ["get", "theme"], "railway"],
+                    ["any",
+                     ["!=", ["get", "abandoned"], None],
+                     ["!=", ["get", "disused"], None],
+                     ["!=", ["get", "razed"], None]]],
          "paint": {
-            "line-color": "#0a2a4a",
+            "line-color": ART_GREY_DARK,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           11, 1.2, 14, 2.0, 18, 3.0],
-            "line-opacity": 0.9,
+                           *W_AUX_SLIM],
+            "line-dasharray": DASH_LONG,
+            "line-opacity": 0.6,
          }},
 
-        # === PRIMARY — railways (drawn LAST; on top of everything) ===
+        # Rail construction — gray dashed
+        {"id": "sat-rail-construction", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 9,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["!=", ["get", "construction"], None]],
+         "paint": {
+            "line-color": ART_GREY_LIGHT,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_AUX],
+            "line-dasharray": DASH_SHORT,
+            "line-opacity": 0.85,
+         }},
 
-        # Service tracks (sidings) — z13+, thin gray dashed
+        # Rail tunnels — dashed Artaria red, partially transparent
+        {"id": "sat-rail-tunnel", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["!=", ["get", "tunnel"], None]],
+         "paint": {
+            "line-color": ART_KK_RED,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_AUX_SLIM],
+            "line-dasharray": DASH_LONG,
+            "line-opacity": 0.55,
+         }},
+
+        # Rail service tracks (sidings) — grey dashed
         {"id": "sat-rail-service", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
          "minzoom": 13,
@@ -1702,130 +2258,260 @@ def _theme_styles():
                     ["==", ["get", "railway"], "rail"],
                     ["!=", ["get", "service"], None]],
          "paint": {
-            "line-color": "#6c757d",
+            "line-color": ART_GREY_MID,
             "line-width": ["interpolate", ["linear"], ["zoom"],
                            13, 0.5, 16, 1.2],
-            "line-dasharray": [3, 2],
+            "line-dasharray": DASH_SHORT,
             "line-opacity": 0.8,
          }},
 
-        # Rail construction — z9+, gray dashed
-        {"id": "sat-rail-construction", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 9,
-         "filter": ["all",
-                    ["==", ["get", "theme"], "railway"],
-                    ["!=", ["get", "construction"], None]],
-         "paint": {
-            "line-color": "#9aa0a6",
-            "line-width": ["interpolate", ["linear"], ["zoom"],
-                           9, 0.8, 14, 1.6],
-            "line-dasharray": [4, 3],
-            "line-opacity": 0.85,
-         }},
+        # ============================================================
+        # === NON-RAIL & SPECIAL RAILWAYS                            ===
+        # ============================================================
 
-        # Rail tunnels — z10+, dashed red, partially transparent
-        {"id": "sat-rail-tunnel", "type": "line",
+        # Aerialway / cable-car / gondola — Artaria violet-light dot.
+        # Aerialway features are tagged theme=topo (NOT railway) in the
+        # unified austria-ecovoyage pmtiles bake; the filter matches
+        # that. RCA 2026-05-14.
+        {"id": "sat-aerialway", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
          "minzoom": 10,
          "filter": ["all",
-                    ["==", ["get", "theme"], "railway"],
-                    ["!=", ["get", "tunnel"], None]],
+                    ["==", ["get", "theme"], "topo"],
+                    ["!=", ["get", "aerialway"], None]],
          "paint": {
-            "line-color": "#c93e3e",
+            "line-color": ART_VIOLET_LIGHT,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           10, 1.0, 14, 2.0],
-            "line-dasharray": [2, 2],
-            "line-opacity": 0.55,
+                           10, 1.2, 14, 2.2, 18, 3.0],
+            "line-dasharray": DASH_DOT,
+            "line-opacity": 0.95,
          }},
 
-        # Urban rail (tram, light_rail, subway, narrow_gauge,
-        # monorail, funicular) — z10+, k.u. green with halo
-        {"id": "sat-rail-urban-casing", "type": "line",
+        # Narrow-gauge / monorail — grey-dark fine stipple
+        {"id": "sat-rail-narrow-gauge", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
                     ["in", ["get", "railway"],
-                     ["literal", ["light_rail", "subway", "tram",
-                                  "narrow_gauge", "monorail", "funicular"]]]],
+                     ["literal", ["narrow_gauge", "monorail"]]]],
          "paint": {
-            "line-color": "#ffffff",
+            "line-color": ART_GREY_DARK,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           10, 2.8, 14, 4.2, 18, 5.4],
-            "line-opacity": 0.85,
+                           *W_URBAN],
+            "line-dasharray": DASH_FINE,
+            "line-opacity": 0.9,
          }},
-        {"id": "sat-rail-urban", "type": "line",
+
+        # Funicular / Zahnradbahn — Artaria violet dot-dash, halo
+        {"id": "sat-rail-funicular-casing", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
-                    ["in", ["get", "railway"],
-                     ["literal", ["light_rail", "subway", "tram",
-                                  "narrow_gauge", "monorail", "funicular"]]]],
+                    ["==", ["get", "railway"], "funicular"]],
          "paint": {
-            "line-color": "#2d6c4a",
+            "line-color": ART_HALO,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           10, 1.4, 14, 2.6, 18, 3.6],
+                           *W_URBAN_CASING],
+            "line-opacity": 0.85,
+         }},
+        {"id": "sat-rail-funicular", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "funicular"]],
+         "paint": {
+            "line-color": ART_VIOLET,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_URBAN],
+            "line-dasharray": DASH_DOT_DASH,
          }},
 
-        # Branch rail (rail without usage=main, no service tag) — z8+,
-        # deeper red with halo
+        # ============================================================
+        # === URBAN RAIL TIERS (tram / light-rail / subway)          ===
+        # Each gets its own halo casing + distinct k.u. green hue.
+        # ============================================================
+
+        # Tram — Artaria k.u. green
+        {"id": "sat-rail-tram-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "tram"]],
+         "paint": {
+            "line-color": ART_HALO,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_URBAN_CASING],
+            "line-opacity": 0.85,
+         }},
+        {"id": "sat-rail-tram", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "tram"]],
+         "paint": {
+            "line-color": ART_KU_GREEN,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_URBAN],
+         }},
+
+        # Light rail / S-Bahn — Artaria k.u. green light
+        {"id": "sat-rail-light-rail-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "light_rail"]],
+         "paint": {
+            "line-color": ART_HALO,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_URBAN_CASING],
+            "line-opacity": 0.85,
+         }},
+        {"id": "sat-rail-light-rail", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "light_rail"]],
+         "paint": {
+            "line-color": ART_KU_GREEN_LIGHT,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_URBAN],
+         }},
+
+        # Subway / U-Bahn — Artaria k.u. green dark
+        {"id": "sat-rail-subway-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "subway"]],
+         "paint": {
+            "line-color": ART_HALO,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_URBAN_CASING],
+            "line-opacity": 0.85,
+         }},
+        {"id": "sat-rail-subway", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "subway"]],
+         "paint": {
+            "line-color": ART_KU_GREEN_DARK,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_URBAN],
+         }},
+
+        # ============================================================
+        # === LOW-ZOOM RAIL CONTINUITY BACKSTOP (z=6-9)              ===
+        # ============================================================
+        # At country/regional zoom the per-tier mainline/branch split
+        # causes visible discontinuities because individual OSM way
+        # segments along a single mainline carry mixed usage tags
+        # (main / branch / null / service). This base layer absorbs
+        # ALL railway=rail in a SINGLE rendering for z=6-9 — one
+        # continuous bold k.k. red line per corridor. At z>=10 the
+        # per-tier mainline/branch/service layers take over.
+
+        {"id": "sat-rail-base-casing", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6, "maxzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "rail"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": ART_HALO,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 4.6, 10, 5.6],
+            "line-opacity": 0.95,
+         }},
+        {"id": "sat-rail-base", "type": "line",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 6, "maxzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "rail"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": ART_KK_RED,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           6, 2.6, 10, 3.4],
+         }},
+
+        # ============================================================
+        # === HEAVY RAIL: branch + mainline (Artaria k.k. red, z>=10)===
+        # ============================================================
+
+        # Branch rail (rail without usage=main, no service tag) —
+        # k.k. red dark with halo. minzoom=10 — at lower zooms the
+        # rail-base layer above takes over.
         {"id": "sat-rail-branch-casing", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 8,
+         "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
                     ["==", ["get", "railway"], "rail"],
                     ["!=", ["get", "usage"], "main"],
                     ["==", ["get", "service"], None]],
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {
-            "line-color": "#ffffff",
+            "line-color": ART_HALO,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           8, 2.8, 12, 4.0, 16, 5.5, 18, 6.5],
+                           *W_BRANCH_CASING],
             "line-opacity": 0.85,
          }},
         {"id": "sat-rail-branch", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 8,
+         "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
                     ["==", ["get", "railway"], "rail"],
                     ["!=", ["get", "usage"], "main"],
                     ["==", ["get", "service"], None]],
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {
-            "line-color": "#a02c2c",
+            "line-color": ART_KK_RED_DARK,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           8, 1.4, 12, 2.4, 16, 3.6, 18, 4.5],
+                           *W_BRANCH],
          }},
 
-        # Mainline rail (rail usage=main) — z6+, k.k. red with halo.
-        # The visual headline of the entire map; widest line in the
-        # whole style.
+        # Mainline rail (rail usage=main) — Artaria k.k. red with halo.
+        # The visual headline; widest line. minzoom=10 (rail-base
+        # above handles z=6-9 continuously).
         {"id": "sat-rail-mainline-casing", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 6,
+         "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
                     ["==", ["get", "railway"], "rail"],
                     ["==", ["get", "usage"], "main"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {
-            "line-color": "#ffffff",
+            "line-color": ART_HALO,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 3.6, 10, 5.0, 14, 7.5, 18, 9.5],
+                           *W_HEADLINE_CASING],
             "line-opacity": 0.95,
          }},
         {"id": "sat-rail-mainline", "type": "line",
          "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 6,
+         "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
                     ["==", ["get", "railway"], "rail"],
                     ["==", ["get", "usage"], "main"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {
-            "line-color": "#c93e3e",
+            "line-color": ART_KK_RED,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           6, 1.8, 10, 2.8, 14, 4.4, 18, 6.0],
+                           *W_HEADLINE],
          }},
 
         # Mainline rail double-track center stripe — z14+, thin white
@@ -1840,10 +2526,73 @@ def _theme_styles():
                     ["==", ["get", "theme"], "railway"],
                     ["==", ["get", "railway"], "rail"],
                     ["==", ["get", "usage"], "main"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {
-            "line-color": "#ffffff",
+            "line-color": ART_HALO,
             "line-width": ["interpolate", ["linear"], ["zoom"],
-                           14, 1.4, 18, 2.0],
+                           *W_HEADLINE_STRIPE],
+         }},
+
+        # ============================================================
+        # === STATION + HALT CIRCLES (Artaria operator-color dots)   ===
+        # ============================================================
+
+        # Rail station — k.k. red dot, halo'd
+        {"id": "sat-rail-station", "type": "circle",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 10,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "station"]],
+         "paint": {
+            "circle-color": ART_KK_RED,
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              10, 3, 14, 5, 18, 6.5],
+            "circle-stroke-color": ART_HALO,
+            "circle-stroke-width": 1.5,
+            "circle-opacity": 0.95,
+         }},
+
+        # Rail halt / stop — k.k. red dark, smaller
+        {"id": "sat-rail-halt", "type": "circle",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 11,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["in", ["get", "railway"],
+                     ["literal", ["halt", "stop"]]]],
+         "paint": {
+            "circle-color": ART_KK_RED_DARK,
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              11, 2, 14, 3.5, 18, 5],
+            "circle-stroke-color": ART_HALO,
+            "circle-stroke-width": 1.0,
+            "circle-opacity": 0.9,
+         }},
+
+        # Station name labels — black text with halo, z12+
+        {"id": "sat-rail-station-label", "type": "symbol",
+         "source": "src", "source-layer": "austria-ecovoyage",
+         "minzoom": 12,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "railway"],
+                    ["==", ["get", "railway"], "station"]],
+         "layout": {
+            "text-field": ["get", "name"],
+            "text-font": ["Noto Sans Regular"],
+            "text-size": [
+                "interpolate", ["linear"], ["zoom"],
+                12, 11, 16, 13, 18, 15,
+            ],
+            "text-anchor": "top",
+            "text-offset": [0, 0.7],
+            "text-padding": 3,
+         },
+         "paint": {
+            "text-color": ART_BLACK,
+            "text-halo-color": ART_HALO,
+            "text-halo-width": 1.5,
+            "text-halo-blur": 0.5,
          }},
     ]
     return (
