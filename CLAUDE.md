@@ -383,6 +383,41 @@ preferred. If not → see step 4's "raw HTTP MCP fallback" below
 (drive the same `localhost:9232` endpoint via curl-based MCP
 handshake — NOT a fall-back to the wrong-pod selkies CDP).
 
+#### Step 0b — Serve the notebook in `marimo run` app mode, NOT edit mode
+
+**The `navigate_page`-to-the-edit-URL approach in this gate does NOT
+work** and you must not waste a turn on it. `marimo edit` (the
+supervisord `marimo` service on port 2718 / host 32718) lets only ONE
+browser connection hold the kernel. The operator's own browser tabs
+hold it; a fresh CDP `navigate_page` to the edit URL lands on marimo's
+**"Notebook already connected — Take over session"** gate and renders
+ZERO cells. Clicking "Take over session" does not stick — the
+operator's tabs reclaim the kernel (a reconnection war). `marimo edit`
+also does not auto-run cells on a fresh navigation.
+
+The working technique: serve the notebook with **`marimo run`** (app
+mode — auto-executes every cell on load, no kernel-contention gate,
+its own kernel per connection) on a free container port, and drive
+THAT with CDP:
+
+```bash
+# inside the versa container — app mode on an unused port (2719)
+podman exec -d ov-versa-ecovoyage bash -lc \
+  '/home/user/.pixi/envs/default/bin/marimo run \
+     /workspace/notebooks/gtfs-austria.py \
+     --host 0.0.0.0 --port 2719 --headless --no-token \
+     > /tmp/marimo-run.log 2>&1'
+```
+
+`ov-versa-ecovoyage` and the browser pod `ov-sway-browser-vnc-ecovoyage`
+are BOTH on the `ov` podman network, so the CDP browser reaches the
+app directly by container name — **no host-port mapping, no tailscale
+needed**: `navigate_page` to `http://ov-versa-ecovoyage:2719/` (plain
+HTTP, container-network DNS). App mode also runs the DAG-trigger cell
+(it adopts the same-month success run), so the map iframes appear
+within a couple of minutes — poll for the iframe rather than assuming
+it is immediate. `pkill -f "marimo run"` in the container when done.
+
 The notebook-change acceptance battery, in order:
 
 1. **`ov status versa -i ecovoyage`** — still required. `Active:
@@ -1006,6 +1041,77 @@ The 6 self-authored Airflow DAGs are: `notebook_osm_pipeline`,
 `notebook_osm_shortbread_pipeline`. List + status via the JWT recipe
 above; never assume they're present — re-seeded notebooks can change
 the set.
+
+## Austria notebooks — satellite-overlay map + 3-tier tile architecture
+
+Alongside the seeded Monaco notebook the workspace carries two
+Austria-scoped notebooks (NOT covered by the Monaco-centric sections
+above):
+
+- **`notebooks/osm-austria.py`** — self-authors the OSM DAG
+  `notebook_austria_pipeline`. quackosm converts the ~750 MB Austria
+  PBF → `austria.parquet`, then freestiler bakes `austria-ecovoyage`
+  (the full 4-theme polygons+lines consolidated tile) plus the THREE
+  importance-tiered line tiles the satellite-overlay map consumes
+  (below). Every derivation task is monthly-cached via `_needs_regen`
+  — `rm` the target `.pmtiles` to force a rebuild, then re-trigger the
+  DAG.
+- **`notebooks/gtfs-austria.py`** — self-authors the GTFS DAG
+  `notebook_austria_gtfs_pipeline` (Transitous Austria railway feed →
+  `austria.duckdb` `transit.*` tables → `austria-transit.pmtiles`,
+  GTFS stops as points carrying `is_station_label` / `hub_score` /
+  `hub_rank`). Renders the **satellite-overlay map** — the
+  Artaria-1911-styled transport overlay on versatiles satellite
+  imagery + mapterhorn 3D terrain.
+
+### Satellite-overlay map — martin sources
+
+`SATELLITE_OVERLAY_STYLE` + `TRANSIT_STYLE` (gtfs-austria.py) read FOUR
+martin vector sources. The OSM line network is split into THREE
+importance tiers so each zoom loads only what it needs:
+
+| martin source | built by (osm-austria.py task) | min_zoom | carries |
+|---|---|---|---|
+| `austria-rail` | `freestiler_rail_convert` | 0 | railways + aerialways (ropeways) + ferry routes — the continuity headline, every zoom |
+| `austria-routes` | `freestiler_routes_convert` | 6 | long-distance hiking + cycle routes |
+| `austria-paths` | `freestiler_paths_convert` | 12 | bulk walkable-street / cycleway / SAC-trail context |
+| `austria-transit` | gtfs-austria.py `freestiler_transit_convert` | 0 | GTFS stops — one station-representative dot + progressive `hub_rank` label (the former ~7,600 per-platform circles were removed) |
+
+`build_pipeline_maplibre_html` force-sets `source` / `source-layer`
+ONLY for layers that use the default `src`; a layer with an explicit
+non-`src` source (`routes-src` / `paths-src` / `transit-src`) is left
+alone — that is how one style reads multiple martin sources. Each
+caller passes `source_maxzoom` matching the tile's baked `max_zoom`
+(all four = 14) so MapLibre overzooms instead of fetching dead tiles.
+
+### freestiler tiling — NO `drop_rate`, ever
+
+freestiler's `drop_rate` is a RANDOM exponential feature-thinning knob;
+on multi-segment lines it drops segments and FRAGMENTS long strokes.
+The satellite-overlay tiles use `drop_rate=None` and get their size
+from three deterministic levers instead:
+
+- **Importance tiers + per-tier `min_zoom`** — a heavy tier is simply
+  NOT built below its min_zoom (deterministic exclusion, not a random
+  drop). `austria-paths` tiles literally do not exist below z12.
+- **`simplification=True`** (freestiler default) — per-zoom geometry
+  snap-to-pixel-grid.
+- **`coalesce=True`** — merges features with identical attributes into
+  long continuous lines. Made far more effective by a **minimal column
+  projection** (`_LINE_FIELDS` in osm-austria.py): the line tiles carry
+  only the ~12 columns the style filters on, not the ~60-column ORM
+  tag set, so segments differing only in a dropped tag (voltage,
+  operator, name…) coalesce into ONE stroke. This took the rail tile
+  from ~39k z6 features / ~18 MB down to ~60 / ~3 MB.
+
+Side effect of aggressive coalesce: some country-spanning features →
+a benign `"Geometry exceeds allowed extent"` MapLibre console warning
+(2× typical). MapLibre clips + renders correctly; `freestile_query`
+exposes no tile-buffer knob — this warning is expected, NOT an R1
+trigger. The full `freestiler` API surface (`freestile_query` kwargs:
+`min_zoom` / `max_zoom` / `base_zoom` / `drop_rate` / `simplification`
+/ `coalesce` / `cluster_*`) lives in
+`/home/user/.pixi/envs/default/lib/python3.13/site-packages/freestiler/__init__.py`.
 
 ## Stale references in this file
 
