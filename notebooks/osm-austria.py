@@ -1146,6 +1146,7 @@ def build_pipeline_maplibre_html(
     max_pitch: int = 60,
     hillshade: bool = True,
     glyphs_url: str | None = None,
+    extra_js: str | None = None,
 ) -> str:
     """MapLibre HTML template for a martin vector-tile source.
 
@@ -1208,6 +1209,14 @@ def build_pipeline_maplibre_html(
     convention (matched by the versatiles-frontend layer's /fonts/
     re-export) is the source-of-truth protocol. Default `None`
     preserves byte-identical output for every existing caller.
+
+    `extra_js` is an optional block of JavaScript appended inside the
+    map's <script> immediately after the `window.map_<var>` hook. The
+    map instance is in scope as `map_<var>` (also on `window`). No
+    caller in this OSM-only notebook uses it; kept here for R3 parity
+    with gtfs-austria.py's duplicate copy of this helper, whose
+    chronomap cell wires a station-click handler through it. Default
+    `None` preserves byte-identical output for every existing caller.
     """
     import json as _json
     layer_prefix = source_name
@@ -1355,6 +1364,10 @@ def build_pipeline_maplibre_html(
     # is the URL convention. Empty when None — byte-identical to pre-glyphs.
     glyphs_js = f'    glyphs: "{glyphs_url}",\n' if glyphs_url else ""
 
+    # Optional caller-supplied JavaScript, appended after the window
+    # hook so the `map_<var>` instance is already in scope.
+    extra_js_block = f"\n{extra_js}" if extra_js else ""
+
     return f"""<!DOCTYPE html>
 <html><head>
 <link href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" rel="stylesheet"/>
@@ -1376,7 +1389,7 @@ const map_{js_var} = new maplibregl.Map({{
 {pitch_js}  attributionControl: false
 }});
 map_{js_var}.addControl(new maplibregl.NavigationControl({{ showZoom: true, showCompass: true }}), 'top-right');{terrain_control_js}
-window.map_{js_var} = map_{js_var};
+window.map_{js_var} = map_{js_var};{extra_js_block}
 </script>
 </body></html>"""
 

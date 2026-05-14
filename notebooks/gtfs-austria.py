@@ -81,7 +81,7 @@ def _(airflow_public, mo):
     | `gtfs.*` | EVERY *.parquet the feed shipped — `stops`, `routes`, `trips`, **`stop_times` (the full timetable)**, `shapes`, `calendar`, `calendar_dates`, `agency`, plus any optionals (`transfers`, `fare_*`, `frequencies`, `pathways`, …) | THIS notebook's DAG |
     | `transit.*` | `osm_stops`, `osm_route_masters`, `osm_routes`, `matched_stops`, `matched_routes`, `matched_trips` | THIS notebook's wiki-compliant joins |
 
-    Maps below — three viewpoints on the same unified dataset:
+    Maps below — four viewpoints on the same unified dataset:
 
     - **Unified transit map** — `austria-railway` PMTiles (tracks)
       + `austria-transit` PMTiles (GTFS stops as points) overlaid on
@@ -124,6 +124,14 @@ def _(airflow_public, mo):
         (https://github.com/versatiles-org/versatiles-glyphs-rs)
         served by the versatiles-frontend layer at
         `{{VERSATILES_ASSETS_PUBLIC_URL}}/fonts/`.
+    - **Chronomap** — a
+      [chronotrains](https://github.com/benjamintd/chronotrains)-style
+      per-station reachability overlay: click a station dot and 1–5 h
+      travel-time isochrone bands radiate from it. Computed from the
+      REAL GTFS timetable (actual ride + transfer waiting times) by a
+      time-dependent Connection Scan Algorithm — a GPU-accelerated
+      polars fixpoint in the GTFS DAG's `compute_chrono_isochrones`
+      task — and baked to the `austria-chrono` PMTiles archive.
 
     ## GTFS↔OSM unification model — see [OSM wiki: GTFS](https://wiki.openstreetmap.org/wiki/GTFS)
 
@@ -295,6 +303,23 @@ def _(Path, os, textwrap):
             and Airflow's per-task retries wait for it to land.
             """
             return not _needs_regen(path)
+
+
+        # === Chronomap (chronotrains-style isochrones) tunables ==========
+        # The compute_chrono_isochrones task derives per-origin travel-time
+        # isochrones from the REAL Austria railway GTFS timetable — actual
+        # scheduled ride times + actual transfer waiting times — via a
+        # time-dependent Connection Scan Algorithm earliest-arrival
+        # fixpoint, expressed as a GPU-accelerated polars join/group-by
+        # loop. chronotrains' 9 km/h short-hop and flat 20-min interchange
+        # approximations are deliberately NOT used. Every knob lives here —
+        # change one line to retune.
+        CHRONO_ORIGIN_COUNT = 25           # top-N stations by hub_rank to seed
+        CHRONO_DEPART_S = 8 * 3600         # reference departure time-of-day (08:00)
+        CHRONO_DEFAULT_TRANSFER_S = 0      # transfer seconds when transfers.txt is silent
+        CHRONO_MAX_LEGS = 20               # CSA fixpoint iteration cap (safety bound)
+        CHRONO_BANDS_H = [1, 2, 3, 4, 5]   # cumulative isochrone bands, hours
+        CHRONO_HULL_BUFFER_DEG = 0.03      # ~3 km smoothing buffer on each band hull
 
 
         @dag(
@@ -1425,21 +1450,586 @@ def _(Path, os, textwrap):
                 return str(out)
 
             @task
-            def reload_martin_transit(pmtiles_path: str) -> str:
-                # Reload martin so it picks up the new austria-transit
-                # PMTiles. Uses the same flock + readiness-probe primitives
-                # as the OSM DAG's reload_martin task. The OSM DAG runs
-                # its own reload_martin first (over the 6 OSM-side tiles);
-                # this reload picks up the 1 new transit tile. Two
-                # serialized restarts are fine — flock keeps them
-                # ordered, /catalog membership check verifies end-state.
+            def compute_chrono_isochrones(db_path: str) -> str:
+                # Chronotrains-style per-station travel-time isochrones,
+                # computed from the REAL Austria railway timetable.
+                #
+                # chronotrains (github.com/benjamintd/chronotrains) builds
+                # a static station graph with 9 km/h short-hop edges and a
+                # flat 20-min interchange penalty. Per the operator we
+                # REPLACE those approximations with the actual schedule:
+                # ride times AND transfer waiting times come straight from
+                # gtfs.stop_times. The routing is a time-dependent
+                # Connection Scan Algorithm (CSA) earliest-arrival
+                # computation seeded at CHRONO_DEPART_S — inherently
+                # multi-hop and trip/route-aware (each connection belongs
+                # to a trip, hence a route).
+                #
+                # The CSA is a vectorised polars fixpoint: each iteration
+                # relaxes EVERY connection once (join + group_by-min),
+                # adding journeys with one more leg. It runs on the GPU via
+                # cudf-polars when available (engine="gpu"), CPU otherwise.
+                # Output: one buffered convex-hull polygon per (origin
+                # station, hour band) -> austria-chrono-isochrones.parquet,
+                # the freestiler intermediate for the austria-chrono tile.
+                #
+                # Reads austria.duckdb READ-ONLY; the DAG chain orders this
+                # task after the match_* writers so no DuckDB write lock is
+                # held by another process (R4 — deterministic ordering).
+                import duckdb
+                import polars as pl
+
+                TILES_WORK.mkdir(parents=True, exist_ok=True)
+                out = TILES_WORK / "austria-chrono-isochrones.parquet"
+                if not _needs_regen(out):
+                    return str(out)
+
+                # ---- GPU engine probe (once) ----------------------------
+                try:
+                    pl.LazyFrame({"_p": [1]}).select(
+                        pl.col("_p").sum()
+                    ).collect(engine="gpu")
+                    _engine = "gpu"
+                except Exception as _exc:  # noqa: BLE001
+                    _engine = "cpu"
+                    print(
+                        "[compute_chrono_isochrones] GPU engine unavailable "
+                        f"({_exc!r}) - falling back to CPU"
+                    )
+                print(f"[compute_chrono_isochrones] polars engine={_engine}")
+
+                def _collect(lf):
+                    # GPU collect with a per-call CPU fallback — one
+                    # iteration failing over must not abort the run.
+                    if _engine == "gpu":
+                        try:
+                            return lf.collect(engine="gpu")
+                        except Exception:  # noqa: BLE001
+                            return lf.collect()
+                    return lf.collect()
+
+                def _to_seconds(df, src, dst):
+                    # Normalise a GTFS clock field to seconds-after-
+                    # midnight, branching on dtype:
+                    #   * Utf8  -> "H:MM:SS" string (may exceed 24h for
+                    #     overnight services) -> parse to seconds.
+                    #   * numeric -> gtfs_parquet hands GTFS times over as
+                    #     integer MILLISECONDS after midnight (verified
+                    #     against the at_Railway feed: 43800000 = 12:10:00,
+                    #     2220000 = 00:37:00) -> scale down by 1000.
+                    if df[src].dtype == pl.Utf8:
+                        _parts = pl.col(src).str.split(":")
+                        return df.with_columns(
+                            (
+                                _parts.list.get(0, null_on_oob=True)
+                                .cast(pl.Int64, strict=False).fill_null(0)
+                                * 3600
+                                + _parts.list.get(1, null_on_oob=True)
+                                .cast(pl.Int64, strict=False).fill_null(0)
+                                * 60
+                                + _parts.list.get(2, null_on_oob=True)
+                                .cast(pl.Int64, strict=False).fill_null(0)
+                            ).alias(dst)
+                        )
+                    return df.with_columns(
+                        (pl.col(src).cast(pl.Int64) // 1000).alias(dst)
+                    )
+
+                horizon = CHRONO_DEPART_S + max(CHRONO_BANDS_H) * 3600
+
+                # ---- Pull the real timetable from DuckDB (read-only) ----
+                con = duckdb.connect(db_path, read_only=True)
+
+                # Reference service = the single busiest service_id (the
+                # dominant weekday pattern). Format-agnostic — no calendar-
+                # date parsing — and deterministic. Documented modelling
+                # choice: a representative service, not a calendar date.
+                _ref_service = con.sql(
+                    "SELECT service_id FROM gtfs.trips "
+                    "GROUP BY service_id ORDER BY count(*) DESC LIMIT 1"
+                ).fetchone()[0]
+                _ref_sql = str(_ref_service).replace("'", "''")
+                print(
+                    "[compute_chrono_isochrones] reference service_id="
+                    f"{_ref_service!r}"
+                )
+
+                # Consecutive stop_times pairs per trip -> connections,
+                # rolled up stop -> station_feature_id. Clock fields are
+                # pulled raw (parsed in polars by _to_seconds).
+                conns = con.sql(f"""
+                    WITH ref_trips AS (
+                        SELECT trip_id
+                        FROM gtfs.trips
+                        WHERE service_id = '{_ref_sql}'
+                    ),
+                    seq AS (
+                        SELECT
+                            st.trip_id,
+                            st.stop_id,
+                            st.departure_time             AS dep_raw,
+                            LEAD(st.stop_id)      OVER w   AS next_stop_id,
+                            LEAD(st.arrival_time) OVER w   AS arr_raw
+                        FROM gtfs.stop_times st
+                        JOIN ref_trips USING (trip_id)
+                        WINDOW w AS (
+                            PARTITION BY st.trip_id
+                            ORDER BY st.stop_sequence
+                        )
+                    )
+                    SELECT
+                        s.trip_id,
+                        sm_from.station_feature_id AS from_station,
+                        sm_to.station_feature_id   AS to_station,
+                        s.dep_raw,
+                        s.arr_raw
+                    FROM seq s
+                    JOIN transit.station_members sm_from
+                      ON sm_from.stop_id = s.stop_id
+                    JOIN transit.station_members sm_to
+                      ON sm_to.stop_id = s.next_stop_id
+                    WHERE s.next_stop_id IS NOT NULL
+                      AND sm_from.station_feature_id IS NOT NULL
+                      AND sm_to.station_feature_id IS NOT NULL
+                      AND sm_from.station_feature_id
+                          <> sm_to.station_feature_id
+                """).pl()
+
+                # Station catalogue (one row per parent station) +
+                # top-N origins by hub_rank.
+                stations = con.sql("""
+                    SELECT
+                        station_feature_id,
+                        any_value(station_name) AS station_name,
+                        any_value(station_lon)  AS station_lon,
+                        any_value(station_lat)  AS station_lat
+                    FROM transit.station_members
+                    WHERE station_feature_id IS NOT NULL
+                    GROUP BY station_feature_id
+                """).pl()
+                origins = con.sql(f"""
+                    SELECT station_feature_id
+                    FROM transit.station_hub_scores
+                    ORDER BY hub_rank
+                    LIMIT {CHRONO_ORIGIN_COUNT}
+                """).pl()
+
+                # Real transfer times from transfers.txt when the feed
+                # shipped one (same-station entries, rolled to station
+                # level); otherwise CHRONO_DEFAULT_TRANSFER_S.
+                _has_transfers = con.sql(
+                    "SELECT count(*) FROM information_schema.tables "
+                    "WHERE table_schema = 'gtfs' "
+                    "AND table_name = 'transfers'"
+                ).fetchone()[0] > 0
+                if _has_transfers:
+                    transfers = con.sql("""
+                        SELECT
+                            sm_f.station_feature_id AS station_feature_id,
+                            min(TRY_CAST(tr.min_transfer_time AS BIGINT))
+                                AS transfer_s
+                        FROM gtfs.transfers tr
+                        JOIN transit.station_members sm_f
+                          ON sm_f.stop_id = tr.from_stop_id
+                        JOIN transit.station_members sm_t
+                          ON sm_t.stop_id = tr.to_stop_id
+                        WHERE sm_f.station_feature_id
+                              = sm_t.station_feature_id
+                          AND tr.min_transfer_time IS NOT NULL
+                        GROUP BY sm_f.station_feature_id
+                    """).pl()
+                else:
+                    transfers = pl.DataFrame(
+                        schema={
+                            "station_feature_id": pl.Utf8,
+                            "transfer_s": pl.Int64,
+                        }
+                    )
+                con.close()
+                print(
+                    "[compute_chrono_isochrones] connections="
+                    f"{conns.height}, stations={stations.height}, "
+                    f"origins={origins.height}, "
+                    f"transfers.txt={'yes' if _has_transfers else 'no'}"
+                )
+
+                # ---- Parse clock fields + assign integer node ids -------
+                conns = conns.filter(
+                    pl.col("dep_raw").is_not_null()
+                    & pl.col("arr_raw").is_not_null()
+                )
+                if conns["dep_raw"].dtype == pl.Utf8:
+                    conns = conns.filter(
+                        (pl.col("dep_raw").str.len_chars() > 0)
+                        & (pl.col("arr_raw").str.len_chars() > 0)
+                    )
+                conns = _to_seconds(conns, "dep_raw", "dep")
+                conns = _to_seconds(conns, "arr_raw", "arr_c")
+                conns = conns.filter(pl.col("arr_c") >= pl.col("dep"))
+
+                station_ids = stations.select(
+                    "station_feature_id"
+                ).with_row_index("st")
+                trip_ids = conns.select(
+                    "trip_id"
+                ).unique().with_row_index("trip")
+
+                conns_df = (
+                    conns
+                    .join(
+                        station_ids.rename({
+                            "station_feature_id": "from_station",
+                            "st": "from_st",
+                        }),
+                        on="from_station",
+                    )
+                    .join(
+                        station_ids.rename({
+                            "station_feature_id": "to_station",
+                            "st": "to_st",
+                        }),
+                        on="to_station",
+                    )
+                    .join(trip_ids, on="trip_id")
+                    .select("trip", "from_st", "to_st", "dep", "arr_c")
+                    .filter(
+                        (pl.col("dep") >= CHRONO_DEPART_S)
+                        & (pl.col("dep") <= horizon)
+                    )
+                )
+
+                origin_st = (
+                    origins
+                    .join(station_ids, on="station_feature_id")
+                    .get_column("st")
+                    .to_list()
+                )
+                if not origin_st:
+                    raise RuntimeError(
+                        "compute_chrono_isochrones: no origin stations "
+                        "resolved from transit.station_hub_scores"
+                    )
+
+                transfer_i = (
+                    transfers
+                    .join(station_ids, on="station_feature_id")
+                    .select(
+                        pl.col("st").alias("from_st"),
+                        pl.col("transfer_s").cast(pl.Int64),
+                    )
+                )
+
+                # ---- Time-dependent CSA earliest-arrival fixpoint -------
+                # State A: arr(origin, st) -> earliest arrival seconds.
+                # State B: reached(origin, trip, board_dep) -> earliest
+                #          departure-time at which the origin is aboard
+                #          that trip. A connection of a reached trip is
+                #          ridable iff it departs at/after board_dep —
+                #          which is exactly what keeps staying on a train
+                #          free of any transfer time.
+                arr = pl.DataFrame(
+                    {
+                        "origin": origin_st,
+                        "st": origin_st,
+                        "sec": [CHRONO_DEPART_S] * len(origin_st),
+                    },
+                    schema={
+                        "origin": pl.UInt32,
+                        "st": pl.UInt32,
+                        "sec": pl.Int64,
+                    },
+                )
+                reached = pl.DataFrame(
+                    schema={
+                        "origin": pl.UInt32,
+                        "trip": pl.UInt32,
+                        "board_dep": pl.Int64,
+                    }
+                )
+
+                _legs = 0
+                for _legs in range(1, CHRONO_MAX_LEGS + 1):
+                    _sig = (
+                        arr.height,
+                        int(arr["sec"].sum()),
+                        reached.height,
+                    )
+
+                    # Transfer rule: board a connection that departs
+                    # at/after you can be ready at its from-station. The
+                    # interchange transfer time is NOT charged at the
+                    # journey origin (you board; you didn't alight from
+                    # anything).
+                    trans = (
+                        conns_df.lazy()
+                        .join(
+                            arr.lazy(),
+                            left_on="from_st",
+                            right_on="st",
+                        )
+                        .join(
+                            transfer_i.lazy(),
+                            on="from_st",
+                            how="left",
+                        )
+                        .with_columns(
+                            pl.when(
+                                (pl.col("from_st") == pl.col("origin"))
+                                & (pl.col("sec") == CHRONO_DEPART_S)
+                            )
+                            .then(pl.lit(0, dtype=pl.Int64))
+                            .otherwise(
+                                pl.col("transfer_s").fill_null(
+                                    CHRONO_DEFAULT_TRANSFER_S
+                                )
+                            )
+                            .alias("eff_transfer")
+                        )
+                        .filter(
+                            pl.col("sec") + pl.col("eff_transfer")
+                            <= pl.col("dep")
+                        )
+                    )
+
+                    # Ride rule: stay aboard a trip already boarded — every
+                    # connection of a reached trip departing at/after the
+                    # boarding time, expanded in ONE iteration (so leg
+                    # count = transfers + 1, not stop count).
+                    ride = (
+                        conns_df.lazy()
+                        .join(reached.lazy(), on="trip")
+                        .filter(pl.col("dep") >= pl.col("board_dep"))
+                    )
+
+                    new_arr = (
+                        pl.concat([
+                            arr.lazy().select("origin", "st", "sec"),
+                            trans.select(
+                                "origin",
+                                pl.col("to_st").alias("st"),
+                                pl.col("arr_c").alias("sec"),
+                            ),
+                            ride.select(
+                                "origin",
+                                pl.col("to_st").alias("st"),
+                                pl.col("arr_c").alias("sec"),
+                            ),
+                        ])
+                        .group_by("origin", "st")
+                        .agg(pl.col("sec").min())
+                        .filter(pl.col("sec") <= horizon)
+                    )
+                    new_reached = (
+                        pl.concat([
+                            reached.lazy().select(
+                                "origin", "trip", "board_dep"
+                            ),
+                            trans.select(
+                                "origin",
+                                "trip",
+                                pl.col("dep").alias("board_dep"),
+                            ),
+                        ])
+                        .group_by("origin", "trip")
+                        .agg(pl.col("board_dep").min())
+                        .filter(pl.col("board_dep") <= horizon)
+                    )
+
+                    arr = _collect(new_arr)
+                    reached = _collect(new_reached)
+
+                    if (
+                        arr.height,
+                        int(arr["sec"].sum()),
+                        reached.height,
+                    ) == _sig:
+                        print(
+                            "[compute_chrono_isochrones] CSA converged "
+                            f"after {_legs} legs"
+                        )
+                        break
+                else:
+                    print(
+                        "[compute_chrono_isochrones] CSA hit "
+                        f"CHRONO_MAX_LEGS={CHRONO_MAX_LEGS} "
+                        "(result may be incomplete — raise the cap)"
+                    )
+
+                # ---- Reduce to per-origin reachability ------------------
+                fid = station_ids.rename(
+                    {"station_feature_id": "_fid", "st": "_st"}
+                )
+                reach = (
+                    arr
+                    .with_columns(
+                        (pl.col("sec") - CHRONO_DEPART_S).alias(
+                            "travel_seconds"
+                        )
+                    )
+                    .filter(pl.col("travel_seconds") >= 0)
+                    .join(
+                        fid.rename(
+                            {"_st": "st", "_fid": "dest_station_id"}
+                        ),
+                        on="st",
+                    )
+                    .join(
+                        fid.rename(
+                            {"_st": "origin", "_fid": "origin_station_id"}
+                        ),
+                        on="origin",
+                    )
+                    .join(
+                        stations.rename({
+                            "station_feature_id": "dest_station_id",
+                            "station_lon": "dest_lon",
+                            "station_lat": "dest_lat",
+                        }).select(
+                            "dest_station_id", "dest_lon", "dest_lat"
+                        ),
+                        on="dest_station_id",
+                    )
+                    .join(
+                        stations.rename({
+                            "station_feature_id": "origin_station_id",
+                            "station_name": "origin_name",
+                        }).select("origin_station_id", "origin_name"),
+                        on="origin_station_id",
+                    )
+                    .select(
+                        "origin_station_id",
+                        "origin_name",
+                        "dest_station_id",
+                        "dest_lon",
+                        "dest_lat",
+                        "travel_seconds",
+                    )
+                )
+                if reach.height == 0:
+                    raise RuntimeError(
+                        "compute_chrono_isochrones: CSA produced no "
+                        "reachable stations — check the GTFS timetable"
+                    )
+                _reach_max_h = reach.select(
+                    pl.col("travel_seconds").max() / 3600.0
+                ).item()
+                print(
+                    "[compute_chrono_isochrones] reachability pairs="
+                    f"{reach.height}, max travel={_reach_max_h:.1f} h"
+                )
+
+                # ---- Isochrone polygons (one per origin x band) ---------
+                # DuckDB Spatial: per band, the CUMULATIVE point set
+                # (every dest within k hours) -> convex hull -> buffered
+                # for a smooth filled zone. The freestiler intermediate
+                # parquet carries STRING attributes only (the parquet ->
+                # MVT round-trip drops numeric-nullable / bool columns —
+                # the same constraint the transit tile documents).
+                reach_parquet = TILES_WORK / "austria-chrono-reach.parquet"
+                reach.write_parquet(reach_parquet)
+                _bands_values = ", ".join(
+                    f"({h})" for h in CHRONO_BANDS_H
+                )
+                con2 = duckdb.connect()
+                con2.sql("INSTALL spatial; LOAD spatial;")
+                con2.sql(f"""
+                    COPY (
+                        WITH reach AS (
+                            SELECT * FROM read_parquet('{reach_parquet}')
+                        ),
+                        bands(band_hours) AS (VALUES {_bands_values}),
+                        per_band AS (
+                            SELECT
+                                r.origin_station_id,
+                                any_value(r.origin_name) AS origin_name,
+                                b.band_hours,
+                                count(*)                 AS n_dest,
+                                ST_ConvexHull(ST_Collect(LIST(
+                                    ST_Point(r.dest_lon, r.dest_lat)
+                                ))) AS hull
+                            FROM reach r
+                            JOIN bands b
+                              ON r.travel_seconds <= b.band_hours * 3600
+                            GROUP BY r.origin_station_id, b.band_hours
+                        )
+                        SELECT
+                            origin_station_id || '-'
+                                || CAST(band_hours AS VARCHAR) AS osm_id,
+                            ST_Buffer(hull, {CHRONO_HULL_BUFFER_DEG})
+                                AS geometry,
+                            'chrono'                           AS theme,
+                            origin_station_id,
+                            origin_name,
+                            CAST(band_hours AS VARCHAR)         AS band_hours
+                        FROM per_band
+                    ) TO '{out}' (FORMAT 'parquet')
+                """)
+                _n_polys = con2.sql(
+                    f"SELECT count(*) FROM read_parquet('{out}')"
+                ).fetchone()[0]
+                con2.close()
+                print(
+                    "[compute_chrono_isochrones] wrote "
+                    f"{_n_polys} isochrone polygons -> {out}"
+                )
+                return str(out)
+
+            @task
+            def freestiler_chrono_convert(chrono_parquet_path: str) -> str:
+                # Bake the per-origin isochrone polygons to PMTiles —
+                # EXACTLY the freestiler -> PMTiles path every other
+                # on-map dataset uses (cf. freestiler_transit_convert).
+                # martin auto-discovers the archive; the chronomap cell
+                # consumes it as the `austria-chrono` vector source.
+                # max_zoom=10 — these are coarse country-scale polygons.
+                import freestiler
+                TILES.mkdir(parents=True, exist_ok=True)
+                out = TILES / "austria-chrono.pmtiles"
+                if not _needs_regen(out):
+                    return str(out)
+                query = f"""
+                    SELECT osm_id,
+                           geometry,
+                           theme,
+                           origin_station_id,
+                           origin_name,
+                           band_hours
+                    FROM read_parquet('{chrono_parquet_path}')
+                """
+                freestiler.freestile_query(
+                    query=query,
+                    output=str(out),
+                    layer_name="austria-chrono",
+                    min_zoom=0,
+                    max_zoom=10,
+                    drop_rate=None,
+                    simplification=True,
+                    coalesce=False,
+                )
+                return str(out)
+
+            @task
+            def reload_martin(pmtiles_paths: list) -> list:
+                # Reload martin so it picks up the freshly-baked PMTiles
+                # (austria-transit + austria-chrono). Uses the same flock +
+                # readiness-probe primitives as the OSM DAG's reload_martin
+                # task — and now takes a LIST of paths, exactly like that
+                # task does, so the two reload surfaces no longer diverge
+                # (R3). The OSM DAG runs its own reload_martin first (over
+                # the OSM-side tiles); this reload picks up THIS DAG's
+                # transit + chrono tiles. Serialized restarts are fine —
+                # flock keeps them ordered, /catalog membership verifies
+                # end-state.
                 import fcntl
                 import json as _json
                 import socket
                 import subprocess
                 import time as _time
                 import urllib.request
-                expected = pmtiles_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                expected = [
+                    p.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                    for p in pmtiles_paths
+                ]
                 with open("/tmp/ov-martin-restart.lock", "w") as _lock:
                     fcntl.flock(_lock.fileno(), fcntl.LOCK_EX)
                     subprocess.run(
@@ -1464,12 +2054,13 @@ def _(Path, os, textwrap):
                 ) as _resp:
                     _catalog = _json.load(_resp)
                 available = sorted(_catalog.get("tiles", {}).keys())
-                if expected not in available:
+                missing = [s for s in expected if s not in available]
+                if missing:
                     raise RuntimeError(
-                        f"martin /catalog missing source {expected!r} "
+                        f"martin /catalog missing sources {missing} "
                         f"after reload; available={available}",
                     )
-                return pmtiles_path
+                return pmtiles_paths
 
             # ---- Chain ----
             # DuckDB enforces single-writer semantics: only ONE process may
@@ -1485,7 +2076,9 @@ def _(Path, os, textwrap):
             #
             # download_gtfs → gtfs_to_parquet → materialize_duckdb
             #     → match_stops → match_routes → match_trips
-            #          ↘ freestiler_transit_convert → reload_martin_transit
+            #          ↘ freestiler_transit_convert ─┐
+            #          ↘ compute_chrono_isochrones ──┤
+            #                → freestiler_chrono_convert ┘→ reload_martin
             gtfs_dir = gtfs_to_parquet(download_gtfs())
             db = materialize_duckdb(gtfs_dir)
             stops_task = match_gtfs_stops_to_osm(db)
@@ -1498,7 +2091,18 @@ def _(Path, os, textwrap):
             stops_task >> routes_task >> trips_task
             # The transit tile only needs match_stops' parquet export — it
             # branches off here independent of routes/trips diagnostics.
-            reload_martin_transit(freestiler_transit_convert(stops_task))
+            transit_tile = freestiler_transit_convert(stops_task)
+            # Chronomap isochrones: a time-dependent CSA over the real GTFS
+            # timetable. Reads austria.duckdb READ-ONLY but is ORDERED AFTER
+            # trips_task so every match_* writer has closed its write
+            # connection first — DuckDB forbids a read-only open from one
+            # process while another holds the file open read-write.
+            # Deterministic ordering, not a sleep (R4).
+            chrono_isochrones = compute_chrono_isochrones(db)
+            trips_task >> chrono_isochrones
+            chrono_tile = freestiler_chrono_convert(chrono_isochrones)
+            # ONE reload picks up both freshly-baked tiles.
+            reload_martin([transit_tile, chrono_tile])
 
 
         notebook_austria_gtfs_pipeline()
@@ -1661,6 +2265,7 @@ def build_pipeline_maplibre_html(
     max_pitch: int = 60,
     hillshade: bool = True,
     glyphs_url: str | None = None,
+    extra_js: str | None = None,
 ) -> str:
     """MapLibre HTML template for a martin vector-tile source.
 
@@ -1684,6 +2289,13 @@ def build_pipeline_maplibre_html(
     protocol. Default `None` preserves byte-identical output for
     every existing caller — text layers fall back to MapLibre's
     empty-glyphs behaviour (text simply doesn't render).
+
+    `extra_js` is an optional block of JavaScript appended inside the
+    map's <script> immediately after the `window.map_<var>` hook. The
+    map instance is in scope as `map_<var>` (also on `window`). Used
+    by the chronomap cell to wire a station-click handler that
+    re-filters the isochrone band layers. Default `None` preserves
+    byte-identical output for every existing caller.
     """
     import json as _json
     layer_prefix = source_name
@@ -1824,6 +2436,10 @@ def build_pipeline_maplibre_html(
     # when None — produces byte-identical output to pre-glyphs.
     glyphs_js = f'    glyphs: "{glyphs_url}",\n' if glyphs_url else ""
 
+    # Optional caller-supplied JavaScript, appended after the window
+    # hook so the `map_<var>` instance is already in scope.
+    extra_js_block = f"\n{extra_js}" if extra_js else ""
+
     return f"""<!DOCTYPE html>
 <html><head>
 <link href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" rel="stylesheet"/>
@@ -1845,7 +2461,7 @@ const map_{js_var} = new maplibregl.Map({{
 {pitch_js}  attributionControl: false
 }});
 map_{js_var}.addControl(new maplibregl.NavigationControl({{ showZoom: true, showCompass: true }}), 'top-right');{terrain_control_js}
-window.map_{js_var} = map_{js_var};
+window.map_{js_var} = map_{js_var};{extra_js_block}
 </script>
 </body></html>"""
 
@@ -3244,7 +3860,50 @@ def _theme_styles():
         # sat-rail-station / sat-rail-halt above still draw the OSM
         # infrastructure dots.
     ]
+    # ---- CHRONO_STYLE — chronotrains-style travel-time isochrones ----
+    # Style for the chronomap cell. Five CUMULATIVE travel-time bands
+    # (<=1h … <=5h) computed from the real GTFS timetable by the GTFS
+    # DAG's compute_chrono_isochrones task and baked to the
+    # `austria-chrono` martin source.
+    #
+    # Both layers per band carry an EXPLICIT `"source": "chrono-src"`
+    # so build_pipeline_maplibre_html's force-set logic leaves them
+    # untouched (it only rewrites layers whose source is the default
+    # `"src"`). The chronomap cell passes `chrono-src` via
+    # extra_sources.
+    #
+    # DRAW ORDER: band 5 (largest, <=5h) is appended FIRST so it sits
+    # visually UNDERNEATH band 1 (smallest, <=1h) — concentric zones,
+    # innermost on top. Each band's filter starts pinned to
+    # origin_station_id == "" (matches nothing) so the map opens
+    # clean; the cell's click handler (extra_js) rewrites the
+    # origin_station_id term to the clicked station's feature id.
+    _CHRONO_BAND_COLORS = {
+        5: "#d73027",  # <=5h — red
+        4: "#fc8d59",  # <=4h — orange
+        3: "#fee08b",  # <=3h — yellow
+        2: "#91cf60",  # <=2h — light green
+        1: "#1a9850",  # <=1h — green
+    }
+    CHRONO_STYLE = []
+    for _band in (5, 4, 3, 2, 1):
+        _col = _CHRONO_BAND_COLORS[_band]
+        _flt = ["all",
+                ["==", ["get", "band_hours"], str(_band)],
+                ["==", ["get", "origin_station_id"], ""]]
+        CHRONO_STYLE.append(
+            {"id": f"chrono-band-{_band}", "type": "fill",
+             "source": "chrono-src", "source-layer": "austria-chrono",
+             "filter": _flt,
+             "paint": {"fill-color": _col, "fill-opacity": 0.28}})
+        CHRONO_STYLE.append(
+            {"id": f"chrono-band-{_band}-outline", "type": "line",
+             "source": "chrono-src", "source-layer": "austria-chrono",
+             "filter": _flt,
+             "paint": {"line-color": _col, "line-width": 1.0,
+                       "line-opacity": 0.9}})
     return (
+        CHRONO_STYLE,
         CYCLE_STYLE,
         HIKING_STYLE,
         RAILWAY_STYLE,
@@ -3262,7 +3921,7 @@ def _(dag_run_states, mo):
     # under one roof (schemas: osm.*, gtfs.*, transit.*).
     #
     # mo.stop() waits gracefully for the GTFS DAG: its terminal task
-    # (reload_martin_transit) only succeeds after materialize_duckdb
+    # (reload_martin) only succeeds after materialize_duckdb
     # has populated the duckdb file, so DAG-success implies queryable
     # DB. materialize_duckdb itself blocks on austria.parquet being
     # this-month-fresh (via @task retries) — so GTFS DAG success
@@ -3726,6 +4385,166 @@ def _(
             pitch=45,
             max_pitch=85,
             glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
+        ),
+        height="500px",
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## Chronomap — how far by train, hour by hour
+
+    A [chronotrains](https://github.com/benjamintd/chronotrains)-style
+    per-station reachability overlay: **click any station dot** and
+    concentric 1–5 h travel-time bands radiate outward, shading every
+    region you can reach from there within each hour.
+
+    Unlike chronotrains — which builds a static station graph with a
+    9 km/h "short-hop" assumption and a flat 20-minute interchange
+    penalty — this map is computed from the **real Austria railway
+    GTFS timetable**. The GTFS DAG's `compute_chrono_isochrones` task
+    runs a time-dependent **Connection Scan Algorithm** earliest-
+    arrival search: every edge is an actual scheduled connection, so
+    ride times *and* the waiting time between transfers come straight
+    from `gtfs.stop_times` — you board the next service that really
+    departs. The search is a vectorised **polars** join/group-by
+    fixpoint, run on the **GPU** (cudf-polars) when the host has one.
+
+    Isochrones are precomputed for the **top 25 transfer hubs** (by
+    `hub_rank`) — measured from an 08:00 reference departure on the
+    busiest service day — then baked to the `austria-chrono` PMTiles
+    archive, exactly like every other dataset on these maps. Clicking
+    a non-hub station simply shows no bands; zoom in to reveal more
+    hub dots.
+    """)
+    return
+
+
+@app.cell
+def _(
+    CHRONO_STYLE,
+    Path,
+    TRANSIT_STYLE,
+    dag_run_states,
+    martin,
+    mo,
+    versatiles_assets,
+):
+    # Chronomap cell — chronotrains-style per-station travel-time
+    # isochrones over the REAL GTFS timetable.
+    #
+    # Two martin sources:
+    #   * `chrono-src` = austria-chrono — the precomputed isochrone
+    #     polygons (one per origin x hour band), baked z0-10 by the GTFS
+    #     DAG's compute_chrono_isochrones + freestiler_chrono_convert
+    #     tasks. Rendered by CHRONO_STYLE (passed as `style_layers`, so it
+    #     sits UNDERNEATH the station dots).
+    #   * `transit-src` = austria-transit — the GTFS station dots, baked
+    #     z14. Rendered by TRANSIT_STYLE (passed as `extra_layers`, ON
+    #     TOP) — these are the click targets.
+    #
+    # source_name="austria-transit" so the helper's `js_var` is
+    # `austria_transit` and the in-page map instance is `map_austria_-
+    # transit` — the name `_CHRONO_CLICK_JS` (passed via the helper's
+    # `extra_js` kwarg) reaches for. The CHRONO_STYLE band layers open
+    # filtered to origin_station_id == "" (nothing); the click handler
+    # rewrites that filter to the clicked station's feature id.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    _chrono_pmtiles = Path("/workspace/tiles/pmtiles/austria-chrono.pmtiles")
+    mo.stop(
+        not _chrono_pmtiles.exists() or _chrono_pmtiles.stat().st_size == 0,
+        "`austria-chrono.pmtiles` not yet present — the GTFS DAG's "
+        "`compute_chrono_isochrones` + `freestiler_chrono_convert` tasks "
+        "produce it (re-run the DAG if this notebook predates them).",
+    )
+    # Station-click handler + legend, injected via build_pipeline_-
+    # maplibre_html's `extra_js` kwarg. Coupled to source_name=
+    # "austria-transit" (hence map var `map_austria_transit` / container
+    # `map-austria-transit`) and to the chrono-band-* layer ids from
+    # CHRONO_STYLE.
+    _CHRONO_CLICK_JS = """
+    (function () {
+      var M = map_austria_transit;
+      M.on('load', function () {
+    var box = document.getElementById('map-austria-transit');
+    box.style.position = 'relative';
+    var leg = document.createElement('div');
+    leg.style.cssText = 'position:absolute;left:8px;bottom:8px;z-index:2;'
+      + 'background:rgba(255,255,255,0.88);padding:6px 9px;'
+      + 'border-radius:4px;font:11px/1.5 sans-serif;color:#222;'
+      + 'box-shadow:0 1px 4px rgba(0,0,0,0.35);';
+    var rows = [['#1a9850', '1 h'], ['#91cf60', '2 h'],
+                ['#fee08b', '3 h'], ['#fc8d59', '4 h'],
+                ['#d73027', '5 h']];
+    var html = '<b>Reachable by train</b>'
+      + '<div id="chrono-hint" style="color:#666;">click a station dot</div>';
+    for (var i = 0; i < rows.length; i++) {
+      html += '<div><span style="display:inline-block;width:11px;'
+        + 'height:11px;margin-right:5px;background:' + rows[i][0]
+        + ';"></span>&le; ' + rows[i][1] + '</div>';
+    }
+    leg.innerHTML = html;
+    box.appendChild(leg);
+      });
+      function applyOrigin(fid, name) {
+    for (var b = 1; b <= 5; b++) {
+      var flt = ['all',
+        ['==', ['get', 'band_hours'], String(b)],
+        ['==', ['get', 'origin_station_id'], fid]];
+      M.setFilter('chrono-band-' + b, flt);
+      M.setFilter('chrono-band-' + b + '-outline', flt);
+    }
+    var hint = document.getElementById('chrono-hint');
+    if (hint) { hint.textContent = 'from: ' + (name || fid); }
+      }
+      M.on('click', 'transit-station-dot', function (e) {
+    if (!e.features || !e.features.length) { return; }
+    var p = e.features[0].properties || {};
+    applyOrigin(p.station_feature_id, p.station_name);
+      });
+      M.on('mouseenter', 'transit-station-dot', function () {
+    M.getCanvas().style.cursor = 'pointer';
+      });
+      M.on('mouseleave', 'transit-station-dot', function () {
+    M.getCanvas().style.cursor = '';
+      });
+    })();
+    """
+    mo.iframe(
+        build_pipeline_maplibre_html(
+            martin,
+            "austria-transit",
+            layer_name="austria-transit",
+            center=[13.34, 47.6],
+            zoom=7,
+            style_layers=CHRONO_STYLE,
+            source_maxzoom=14,
+            extra_sources={
+                "chrono-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-chrono",
+                    "maxzoom": 10,
+                },
+                "transit-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-transit",
+                    "maxzoom": 14,
+                },
+            },
+            extra_layers=TRANSIT_STYLE,
+            satellite_background=True,
+            terrain=True,
+            hillshade=False,
+            pitch=0,
+            max_pitch=85,
+            glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
+            extra_js=_CHRONO_CLICK_JS,
         ),
         height="500px",
     )
