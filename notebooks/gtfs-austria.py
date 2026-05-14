@@ -126,12 +126,15 @@ def _(airflow_public, mo):
         `{{VERSATILES_ASSETS_PUBLIC_URL}}/fonts/`.
     - **Chronomap** — a
       [chronotrains](https://github.com/benjamintd/chronotrains)-style
-      per-station reachability overlay: click a station dot and 1–5 h
-      travel-time isochrone bands radiate from it. Computed from the
-      REAL GTFS timetable (actual ride + transfer waiting times) by a
-      time-dependent Connection Scan Algorithm — a GPU-accelerated
-      polars fixpoint in the GTFS DAG's `compute_chrono_isochrones`
-      task — and baked to the `austria-chrono` PMTiles archive.
+      per-station reachability overlay: click a marked station and
+      concentric 1–12 h travel-time isochrone bands radiate from it.
+      Computed from the REAL GTFS timetable (multi-hop journeys, actual
+      ride + transfer waiting times) by a time-dependent Connection
+      Scan Algorithm — a smart-multipath, frontier-relaxation,
+      GPU-accelerated polars loop in the GTFS DAG's
+      `compute_chrono_isochrones` task — from each of the top 25 hubs
+      to EVERY other station, baked to the `austria-chrono` PMTiles
+      archive.
 
     ## GTFS↔OSM unification model — see [OSM wiki: GTFS](https://wiki.openstreetmap.org/wiki/GTFS)
 
@@ -310,16 +313,24 @@ def _(Path, os, textwrap):
         # isochrones from the REAL Austria railway GTFS timetable — actual
         # scheduled ride times + actual transfer waiting times — via a
         # time-dependent Connection Scan Algorithm earliest-arrival
-        # fixpoint, expressed as a GPU-accelerated polars join/group-by
-        # loop. chronotrains' 9 km/h short-hop and flat 20-min interchange
-        # approximations are deliberately NOT used. Every knob lives here —
-        # change one line to retune.
-        CHRONO_ORIGIN_COUNT = 25           # top-N stations by hub_rank to seed
-        CHRONO_DEPART_S = 8 * 3600         # reference departure time-of-day (08:00)
-        CHRONO_DEFAULT_TRANSFER_S = 0      # transfer seconds when transfers.txt is silent
-        CHRONO_MAX_LEGS = 20               # CSA fixpoint iteration cap (safety bound)
-        CHRONO_BANDS_H = [1, 2, 3, 4, 5]   # cumulative isochrone bands, hours
-        CHRONO_HULL_BUFFER_DEG = 0.03      # ~3 km smoothing buffer on each band hull
+        # computation, expressed as a GPU-accelerated polars relaxation.
+        # chronotrains' 9 km/h short-hop and flat 20-min interchange
+        # approximations are deliberately NOT used.
+        #
+        # The relaxation is a SMART MULTIPATH algorithm: all
+        # CHRONO_ORIGIN_COUNT origins are routed simultaneously in one
+        # vectorised pass, and each iteration relaxes ONLY from the
+        # frontier — the labels that improved last round — instead of
+        # re-scanning the whole state. The connection table is joined
+        # against the small per-iteration delta, not the full arrival
+        # set, which is what keeps the 12 h horizon (origins → ALL
+        # reachable stations) cheap. Every knob lives here.
+        CHRONO_ORIGIN_COUNT = 25             # top-N stations by hub_rank to seed
+        CHRONO_DEPART_S = 8 * 3600           # reference departure time-of-day (08:00)
+        CHRONO_DEFAULT_TRANSFER_S = 0        # transfer seconds when transfers.txt is silent
+        CHRONO_MAX_LEGS = 40                 # CSA fixpoint iteration cap (safety bound)
+        CHRONO_BANDS_H = list(range(1, 13))  # cumulative isochrone bands: every hour to 12 h
+        CHRONO_HULL_BUFFER_DEG = 0.03        # ~3 km smoothing buffer on each band hull
 
 
         @dag(
@@ -1719,15 +1730,28 @@ def _(Path, os, textwrap):
                     )
                 )
 
-                # ---- Time-dependent CSA earliest-arrival fixpoint -------
+                # ---- Smart multipath CSA earliest-arrival relaxation ----
+                # All CHRONO_ORIGIN_COUNT origins are routed at once. Each
+                # iteration relaxes ONLY from the frontier — the labels
+                # that improved last round — never the whole state. A
+                # connection can yield a new label only if a new/earlier
+                # arrival at its from-station made it boardable, or a
+                # new/earlier boarding of its trip made it ridable; so the
+                # connection table is joined against the small delta, not
+                # the full arrival set. Correct label-correcting CSA, with
+                # the redundant re-scans removed — what keeps origins → ALL
+                # reachable stations over a 12 h horizon cheap.
+                #
                 # State A: arr(origin, st) -> earliest arrival seconds.
                 # State B: reached(origin, trip, board_dep) -> earliest
-                #          departure-time at which the origin is aboard
-                #          that trip. A connection of a reached trip is
-                #          ridable iff it departs at/after board_dep —
-                #          which is exactly what keeps staying on a train
-                #          free of any transfer time.
-                arr = pl.DataFrame(
+                #          departure-time the origin is aboard that trip
+                #          (a connection of a reached trip is ridable iff
+                #          it departs at/after board_dep — which keeps
+                #          staying on a train free of transfer time).
+                # Frontier: arr_delta / reached_delta — the rows that
+                #          improved this iteration, i.e. next iteration's
+                #          relaxation source.
+                _seed = pl.DataFrame(
                     {
                         "origin": origin_st,
                         "st": origin_st,
@@ -1739,6 +1763,8 @@ def _(Path, os, textwrap):
                         "sec": pl.Int64,
                     },
                 )
+                arr = _seed
+                arr_delta = _seed                  # the whole seed is "new"
                 reached = pl.DataFrame(
                     schema={
                         "origin": pl.UInt32,
@@ -1746,24 +1772,20 @@ def _(Path, os, textwrap):
                         "board_dep": pl.Int64,
                     }
                 )
+                reached_delta = reached
 
                 _legs = 0
                 for _legs in range(1, CHRONO_MAX_LEGS + 1):
-                    _sig = (
-                        arr.height,
-                        int(arr["sec"].sum()),
-                        reached.height,
-                    )
-
-                    # Transfer rule: board a connection that departs
-                    # at/after you can be ready at its from-station. The
-                    # interchange transfer time is NOT charged at the
-                    # journey origin (you board; you didn't alight from
-                    # anything).
-                    trans = (
+                    # Transfer rule — relaxed ONLY from the arrival
+                    # frontier (arr_delta): board a connection that
+                    # departs at/after you can be ready at its
+                    # from-station. The interchange transfer time is NOT
+                    # charged at the journey origin (you board; you didn't
+                    # alight from anything).
+                    trans = _collect(
                         conns_df.lazy()
                         .join(
-                            arr.lazy(),
+                            arr_delta.lazy(),
                             left_on="from_st",
                             right_on="st",
                         )
@@ -1789,63 +1811,97 @@ def _(Path, os, textwrap):
                             pl.col("sec") + pl.col("eff_transfer")
                             <= pl.col("dep")
                         )
+                        .select("origin", "trip", "to_st", "dep", "arr_c")
                     )
 
-                    # Ride rule: stay aboard a trip already boarded — every
-                    # connection of a reached trip departing at/after the
-                    # boarding time, expanded in ONE iteration (so leg
-                    # count = transfers + 1, not stop count).
-                    ride = (
+                    # Ride rule — relaxed ONLY from the boarding frontier
+                    # (reached_delta): a whole reached trip's remaining run
+                    # expands in ONE iteration (so leg count = transfers +
+                    # 1, not stop count).
+                    ride = _collect(
                         conns_df.lazy()
-                        .join(reached.lazy(), on="trip")
+                        .join(reached_delta.lazy(), on="trip")
                         .filter(pl.col("dep") >= pl.col("board_dep"))
+                        .select("origin", "to_st", "arr_c")
                     )
 
-                    new_arr = (
+                    # Candidate arrivals (both rules) -> best per
+                    # (origin, st), pruned to the 12 h horizon, then diffed
+                    # against the running state: arr_delta keeps only rows
+                    # that STRICTLY beat the current label (or are new).
+                    arr_delta = _collect(
                         pl.concat([
-                            arr.lazy().select("origin", "st", "sec"),
-                            trans.select(
+                            trans.lazy().select(
                                 "origin",
                                 pl.col("to_st").alias("st"),
                                 pl.col("arr_c").alias("sec"),
                             ),
-                            ride.select(
+                            ride.lazy().select(
                                 "origin",
                                 pl.col("to_st").alias("st"),
                                 pl.col("arr_c").alias("sec"),
                             ),
                         ])
+                        .filter(pl.col("sec") <= horizon)
                         .group_by("origin", "st")
                         .agg(pl.col("sec").min())
-                        .filter(pl.col("sec") <= horizon)
+                        .join(
+                            arr.lazy().rename({"sec": "sec_old"}),
+                            on=["origin", "st"],
+                            how="left",
+                        )
+                        .filter(
+                            pl.col("sec_old").is_null()
+                            | (pl.col("sec") < pl.col("sec_old"))
+                        )
+                        .select("origin", "st", "sec")
                     )
-                    new_reached = (
-                        pl.concat([
-                            reached.lazy().select(
-                                "origin", "trip", "board_dep"
-                            ),
-                            trans.select(
-                                "origin",
-                                "trip",
-                                pl.col("dep").alias("board_dep"),
-                            ),
-                        ])
+
+                    # Candidate boardings -> reached_delta (same diff).
+                    reached_delta = _collect(
+                        trans.lazy()
+                        .select(
+                            "origin",
+                            "trip",
+                            pl.col("dep").alias("board_dep"),
+                        )
+                        .filter(pl.col("board_dep") <= horizon)
                         .group_by("origin", "trip")
                         .agg(pl.col("board_dep").min())
-                        .filter(pl.col("board_dep") <= horizon)
+                        .join(
+                            reached.lazy().rename(
+                                {"board_dep": "board_dep_old"}
+                            ),
+                            on=["origin", "trip"],
+                            how="left",
+                        )
+                        .filter(
+                            pl.col("board_dep_old").is_null()
+                            | (pl.col("board_dep")
+                               < pl.col("board_dep_old"))
+                        )
+                        .select("origin", "trip", "board_dep")
                     )
 
-                    arr = _collect(new_arr)
-                    reached = _collect(new_reached)
+                    # Fold the frontier into the running state.
+                    arr = _collect(
+                        pl.concat([arr.lazy(), arr_delta.lazy()])
+                        .group_by("origin", "st")
+                        .agg(pl.col("sec").min())
+                    )
+                    reached = _collect(
+                        pl.concat([reached.lazy(), reached_delta.lazy()])
+                        .group_by("origin", "trip")
+                        .agg(pl.col("board_dep").min())
+                    )
 
                     if (
-                        arr.height,
-                        int(arr["sec"].sum()),
-                        reached.height,
-                    ) == _sig:
+                        arr_delta.height == 0
+                        and reached_delta.height == 0
+                    ):
                         print(
                             "[compute_chrono_isochrones] CSA converged "
-                            f"after {_legs} legs"
+                            f"after {_legs} legs (frontier exhausted)"
                         )
                         break
                 else:
@@ -1893,12 +1949,19 @@ def _(Path, os, textwrap):
                         stations.rename({
                             "station_feature_id": "origin_station_id",
                             "station_name": "origin_name",
-                        }).select("origin_station_id", "origin_name"),
+                            "station_lon": "origin_lon",
+                            "station_lat": "origin_lat",
+                        }).select(
+                            "origin_station_id", "origin_name",
+                            "origin_lon", "origin_lat",
+                        ),
                         on="origin_station_id",
                     )
                     .select(
                         "origin_station_id",
                         "origin_name",
+                        "origin_lon",
+                        "origin_lat",
                         "dest_station_id",
                         "dest_lon",
                         "dest_lat",
@@ -1918,13 +1981,18 @@ def _(Path, os, textwrap):
                     f"{reach.height}, max travel={_reach_max_h:.1f} h"
                 )
 
-                # ---- Isochrone polygons (one per origin x band) ---------
-                # DuckDB Spatial: per band, the CUMULATIVE point set
-                # (every dest within k hours) -> convex hull -> buffered
-                # for a smooth filled zone. The freestiler intermediate
-                # parquet carries STRING attributes only (the parquet ->
-                # MVT round-trip drops numeric-nullable / bool columns —
-                # the same constraint the transit tile documents).
+                # ---- Isochrone RINGS + clickable origin markers ---------
+                # DuckDB Spatial. Per band: the CUMULATIVE point set
+                # (every dest within k hours) -> buffered convex hull. The
+                # rendered geometry is then the RING — this band's hull
+                # MINUS the previous band's — so every pixel carries
+                # exactly ONE band colour (no muddy 12-layer translucent
+                # stack). Plus one POINT per origin station, theme
+                # 'chrono-origin', so the chronomap can render the
+                # clickable stations as distinct markers. The freestiler
+                # intermediate parquet carries STRING attributes only (the
+                # parquet -> MVT round-trip drops numeric-nullable / bool
+                # columns — the same constraint the transit tile documents).
                 reach_parquet = TILES_WORK / "austria-chrono-reach.parquet"
                 reach.write_parquet(reach_parquet)
                 _bands_values = ", ".join(
@@ -1943,34 +2011,82 @@ def _(Path, os, textwrap):
                                 r.origin_station_id,
                                 any_value(r.origin_name) AS origin_name,
                                 b.band_hours,
-                                count(*)                 AS n_dest,
-                                ST_ConvexHull(ST_Collect(LIST(
+                                ST_Buffer(ST_ConvexHull(ST_Collect(LIST(
                                     ST_Point(r.dest_lon, r.dest_lat)
-                                ))) AS hull
+                                ))), {CHRONO_HULL_BUFFER_DEG}) AS hull
                             FROM reach r
                             JOIN bands b
                               ON r.travel_seconds <= b.band_hours * 3600
                             GROUP BY r.origin_station_id, b.band_hours
+                        ),
+                        -- Enforce EXACT nesting: nested(k) = the union of
+                        -- hull(1..k). Buffering each hull SEPARATELY can
+                        -- leave tiny approximation slivers where a blunter
+                        -- inner hull's buffered arc pokes past a sharper
+                        -- outer one; the cumulative union heals that so the
+                        -- rings below are guaranteed disjoint annuli.
+                        nested AS (
+                            SELECT
+                                p.origin_station_id,
+                                any_value(p.origin_name) AS origin_name,
+                                p.band_hours,
+                                ST_Union_Agg(p2.hull) AS nhull
+                            FROM per_band p
+                            JOIN per_band p2
+                              ON p2.origin_station_id = p.origin_station_id
+                             AND p2.band_hours <= p.band_hours
+                            GROUP BY p.origin_station_id, p.band_hours
+                        ),
+                        rings AS (
+                            SELECT
+                                origin_station_id, origin_name, band_hours,
+                                CASE WHEN prev_nhull IS NULL THEN nhull
+                                     ELSE ST_Difference(nhull, prev_nhull)
+                                END AS geometry
+                            FROM (
+                                SELECT *, LAG(nhull) OVER (
+                                    PARTITION BY origin_station_id
+                                    ORDER BY band_hours
+                                ) AS prev_nhull
+                                FROM nested
+                            )
+                        ),
+                        origins AS (
+                            SELECT DISTINCT
+                                origin_station_id, origin_name,
+                                origin_lon, origin_lat
+                            FROM reach
                         )
                         SELECT
                             origin_station_id || '-'
                                 || CAST(band_hours AS VARCHAR) AS osm_id,
-                            ST_Buffer(hull, {CHRONO_HULL_BUFFER_DEG})
-                                AS geometry,
+                            geometry,
                             'chrono'                           AS theme,
                             origin_station_id,
                             origin_name,
                             CAST(band_hours AS VARCHAR)         AS band_hours
-                        FROM per_band
+                        FROM rings
+                        WHERE geometry IS NOT NULL
+                          AND NOT ST_IsEmpty(geometry)
+                        UNION ALL
+                        SELECT
+                            origin_station_id || '-origin'     AS osm_id,
+                            ST_Point(origin_lon, origin_lat)    AS geometry,
+                            'chrono-origin'                    AS theme,
+                            origin_station_id,
+                            origin_name,
+                            '0'                                AS band_hours
+                        FROM origins
                     ) TO '{out}' (FORMAT 'parquet')
                 """)
-                _n_polys = con2.sql(
+                _n_feat = con2.sql(
                     f"SELECT count(*) FROM read_parquet('{out}')"
                 ).fetchone()[0]
                 con2.close()
                 print(
                     "[compute_chrono_isochrones] wrote "
-                    f"{_n_polys} isochrone polygons -> {out}"
+                    f"{_n_feat} chrono features (isochrone rings + origin "
+                    f"markers) -> {out}"
                 )
                 return str(out)
 
@@ -3861,48 +3977,101 @@ def _theme_styles():
         # infrastructure dots.
     ]
     # ---- CHRONO_STYLE — chronotrains-style travel-time isochrones ----
-    # Style for the chronomap cell. Five CUMULATIVE travel-time bands
-    # (<=1h … <=5h) computed from the real GTFS timetable by the GTFS
-    # DAG's compute_chrono_isochrones task and baked to the
-    # `austria-chrono` martin source.
+    # Style for the chronomap cell. TWELVE travel-time bands (every hour
+    # to <=12h) computed from the real GTFS timetable by the GTFS DAG's
+    # compute_chrono_isochrones task and baked to the `austria-chrono`
+    # martin source. The compute task emits each band as a RING
+    # (hull(k) minus hull(k-1)), so every pixel carries exactly ONE band
+    # colour and a healthy fill-opacity stays legible — no muddy
+    # 12-layer translucent stack.
     #
-    # Both layers per band carry an EXPLICIT `"source": "chrono-src"`
-    # so build_pipeline_maplibre_html's force-set logic leaves them
-    # untouched (it only rewrites layers whose source is the default
-    # `"src"`). The chronomap cell passes `chrono-src` via
-    # extra_sources.
+    # The chronomap cell passes `source_name="austria-chrono"`, so the
+    # helper's single `src` source IS austria-chrono; these layers use
+    # `"source": "src"` and the helper force-sets source-layer to
+    # `austria-chrono` for them.
     #
-    # DRAW ORDER: band 5 (largest, <=5h) is appended FIRST so it sits
-    # visually UNDERNEATH band 1 (smallest, <=1h) — concentric zones,
+    # DRAW ORDER: band 12 (largest) is appended FIRST so it sits
+    # visually UNDERNEATH band 1 (smallest) — concentric zones,
     # innermost on top. Each band's filter starts pinned to
-    # origin_station_id == "" (matches nothing) so the map opens
-    # clean; the cell's click handler (extra_js) rewrites the
-    # origin_station_id term to the clicked station's feature id.
+    # origin_station_id == "" (matches nothing) so the map opens clean;
+    # the cell's click handler (extra_js) rewrites the origin_station_id
+    # term to the clicked station's feature id.
+    #
+    # 12-step ramp: RdYlGn reversed (green = nearest) + one darker red.
     _CHRONO_BAND_COLORS = {
-        5: "#d73027",  # <=5h — red
-        4: "#fc8d59",  # <=4h — orange
-        3: "#fee08b",  # <=3h — yellow
-        2: "#91cf60",  # <=2h — light green
-        1: "#1a9850",  # <=1h — green
+        1: "#006837", 2: "#1a9850", 3: "#66bd63", 4: "#a6d96a",
+        5: "#d9ef8b", 6: "#ffffbf", 7: "#fee08b", 8: "#fdae61",
+        9: "#f46d43", 10: "#d73027", 11: "#a50026", 12: "#6d0026",
     }
     CHRONO_STYLE = []
-    for _band in (5, 4, 3, 2, 1):
-        _col = _CHRONO_BAND_COLORS[_band]
-        _flt = ["all",
-                ["==", ["get", "band_hours"], str(_band)],
-                ["==", ["get", "origin_station_id"], ""]]
-        CHRONO_STYLE.append(
-            {"id": f"chrono-band-{_band}", "type": "fill",
-             "source": "chrono-src", "source-layer": "austria-chrono",
-             "filter": _flt,
-             "paint": {"fill-color": _col, "fill-opacity": 0.28}})
-        CHRONO_STYLE.append(
-            {"id": f"chrono-band-{_band}-outline", "type": "line",
-             "source": "chrono-src", "source-layer": "austria-chrono",
-             "filter": _flt,
-             "paint": {"line-color": _col, "line-width": 1.0,
-                       "line-opacity": 0.9}})
+    for _band in range(12, 0, -1):   # band 12 first → drawn underneath
+        CHRONO_STYLE.append({
+            "id": f"chrono-band-{_band}", "type": "fill",
+            "source": "src", "source-layer": "austria-chrono",
+            "filter": ["all",
+                       ["==", ["get", "theme"], "chrono"],
+                       ["==", ["get", "band_hours"], str(_band)],
+                       ["==", ["get", "origin_station_id"], ""]],
+            "paint": {
+                "fill-color": _CHRONO_BAND_COLORS[_band],
+                "fill-opacity": 0.5,
+                "fill-outline-color": "#33333a",
+            }})
+
+    # ---- CHRONO_ORIGIN_STYLE — the clickable origin markers ----------
+    # The compute task also emits one POINT per origin station
+    # (theme='chrono-origin'). These markers are the ONLY station
+    # markers on the chronomap, so every marker the user sees IS a
+    # station with a precomputed chronomap — "easily identifiable and
+    # clickable" by construction. `chrono-origin-selected` highlights
+    # the currently-chosen origin (filter rewritten by the click
+    # handler). Drawn ON TOP of the bands via the cell's `extra_layers`.
+    CHRONO_ORIGIN_STYLE = [
+        {"id": "chrono-origin", "type": "circle",
+         "source": "src", "source-layer": "austria-chrono",
+         "filter": ["==", ["get", "theme"], "chrono-origin"],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              3, 3.5, 7, 5.5, 11, 8, 14, 10],
+            "circle-color": "#ffffff",
+            "circle-stroke-color": "#1b3a5c",
+            "circle-stroke-width": 2.4,
+            "circle-opacity": 1.0,
+         }},
+        {"id": "chrono-origin-selected", "type": "circle",
+         "source": "src", "source-layer": "austria-chrono",
+         "filter": ["all",
+                    ["==", ["get", "theme"], "chrono-origin"],
+                    ["==", ["get", "origin_station_id"], ""]],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              3, 5.5, 7, 8, 11, 11, 14, 13],
+            "circle-color": "#ffcc00",
+            "circle-stroke-color": "#1b3a5c",
+            "circle-stroke-width": 3.0,
+            "circle-opacity": 1.0,
+         }},
+        {"id": "chrono-origin-label", "type": "symbol",
+         "source": "src", "source-layer": "austria-chrono",
+         "filter": ["==", ["get", "theme"], "chrono-origin"],
+         "layout": {
+            "text-field": ["get", "origin_name"],
+            "text-font": ["noto_sans_regular"],
+            "text-size": ["interpolate", ["linear"], ["zoom"],
+                          4, 9, 8, 11, 12, 13],
+            "text-anchor": "top",
+            "text-offset": [0, 0.8],
+            "text-padding": 2,
+         },
+         "paint": {
+            "text-color": "#1a1a1a",
+            "text-halo-color": "#ffffff",
+            "text-halo-width": 1.6,
+            "text-halo-blur": 0.4,
+         }},
+    ]
     return (
+        CHRONO_ORIGIN_STYLE,
         CHRONO_STYLE,
         CYCLE_STYLE,
         HIKING_STYLE,
@@ -4397,9 +4566,11 @@ def _(mo):
     ## Chronomap — how far by train, hour by hour
 
     A [chronotrains](https://github.com/benjamintd/chronotrains)-style
-    per-station reachability overlay: **click any station dot** and
-    concentric 1–5 h travel-time bands radiate outward, shading every
-    region you can reach from there within each hour.
+    per-station reachability overlay: **click a marked station** and
+    concentric **1–12 h** travel-time bands radiate outward, shading
+    every region you can reach from there within each hour. The only
+    markers on this map are the stations that *have* a precomputed
+    chronomap — every marker is clickable; the chosen one turns gold.
 
     Unlike chronotrains — which builds a static station graph with a
     9 km/h "short-hop" assumption and a flat 20-minute interchange
@@ -4407,26 +4578,29 @@ def _(mo):
     GTFS timetable**. The GTFS DAG's `compute_chrono_isochrones` task
     runs a time-dependent **Connection Scan Algorithm** earliest-
     arrival search: every edge is an actual scheduled connection, so
-    ride times *and* the waiting time between transfers come straight
-    from `gtfs.stop_times` — you board the next service that really
-    departs. The search is a vectorised **polars** join/group-by
-    fixpoint, run on the **GPU** (cudf-polars) when the host has one.
+    multi-hop journeys, the actual ride times *and* the real waiting
+    time between transfers all come straight from `gtfs.stop_times` —
+    you board the next service that really departs.
 
-    Isochrones are precomputed for the **top 25 transfer hubs** (by
-    `hub_rank`) — measured from an 08:00 reference departure on the
-    busiest service day — then baked to the `austria-chrono` PMTiles
-    archive, exactly like every other dataset on these maps. Clicking
-    a non-hub station simply shows no bands; zoom in to reveal more
-    hub dots.
+    The search is a **smart multipath** relaxation: all top-25 origins
+    are routed simultaneously, and each iteration relaxes only from the
+    frontier (the labels that just improved) rather than re-scanning
+    the whole state — a vectorised **polars** join/group-by loop on the
+    **GPU** (cudf-polars) when the host has one. From each of the **top
+    25 transfer hubs** (by `hub_rank`, measured from an 08:00 reference
+    departure on the busiest service day) it reaches **every other
+    station in the network** within 12 h, then bakes the per-band
+    isochrone rings + origin markers to the `austria-chrono` PMTiles
+    archive — exactly like every other dataset on these maps.
     """)
     return
 
 
 @app.cell
 def _(
+    CHRONO_ORIGIN_STYLE,
     CHRONO_STYLE,
     Path,
-    TRANSIT_STYLE,
     dag_run_states,
     martin,
     mo,
@@ -4435,22 +4609,24 @@ def _(
     # Chronomap cell — chronotrains-style per-station travel-time
     # isochrones over the REAL GTFS timetable.
     #
-    # Two martin sources:
-    #   * `chrono-src` = austria-chrono — the precomputed isochrone
-    #     polygons (one per origin x hour band), baked z0-10 by the GTFS
-    #     DAG's compute_chrono_isochrones + freestiler_chrono_convert
-    #     tasks. Rendered by CHRONO_STYLE (passed as `style_layers`, so it
-    #     sits UNDERNEATH the station dots).
-    #   * `transit-src` = austria-transit — the GTFS station dots, baked
-    #     z14. Rendered by TRANSIT_STYLE (passed as `extra_layers`, ON
-    #     TOP) — these are the click targets.
+    # ONE martin source: `austria-chrono` (baked z0-10 by the GTFS DAG's
+    # compute_chrono_isochrones + freestiler_chrono_convert tasks). It
+    # carries two feature kinds, discriminated by `theme`:
+    #   * theme='chrono'        — the 12 isochrone RINGS per origin,
+    #     rendered by CHRONO_STYLE (passed as `style_layers`, drawn
+    #     UNDERNEATH).
+    #   * theme='chrono-origin' — one POINT per origin station, rendered
+    #     by CHRONO_ORIGIN_STYLE (passed as `extra_layers`, drawn ON TOP)
+    #     — the ONLY markers on the map, so every marker is a clickable
+    #     station with a chronomap.
     #
-    # source_name="austria-transit" so the helper's `js_var` is
-    # `austria_transit` and the in-page map instance is `map_austria_-
-    # transit` — the name `_CHRONO_CLICK_JS` (passed via the helper's
-    # `extra_js` kwarg) reaches for. The CHRONO_STYLE band layers open
-    # filtered to origin_station_id == "" (nothing); the click handler
-    # rewrites that filter to the clicked station's feature id.
+    # source_name="austria-chrono" → the helper's single `src` source IS
+    # austria-chrono, the in-page map instance is `map_austria_chrono`
+    # and the container is `map-austria-chrono` — the names
+    # `_CHRONO_CLICK_JS` (passed via the helper's `extra_js` kwarg)
+    # reaches for. The band layers open filtered to origin_station_id ==
+    # "" (nothing); the click handler rewrites that to the clicked
+    # origin and highlights it via `chrono-origin-selected`.
     mo.stop(
         dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
         f"Waiting for notebook_austria_gtfs_pipeline (state="
@@ -4463,55 +4639,59 @@ def _(
         "`compute_chrono_isochrones` + `freestiler_chrono_convert` tasks "
         "produce it (re-run the DAG if this notebook predates them).",
     )
-    # Station-click handler + legend, injected via build_pipeline_-
-    # maplibre_html's `extra_js` kwarg. Coupled to source_name=
-    # "austria-transit" (hence map var `map_austria_transit` / container
-    # `map-austria-transit`) and to the chrono-band-* layer ids from
-    # CHRONO_STYLE.
+    # Origin-click handler + 12-band legend, injected via
+    # build_pipeline_maplibre_html's `extra_js` kwarg. Coupled to
+    # source_name="austria-chrono" (hence map var `map_austria_chrono` /
+    # container `map-austria-chrono`) and to the chrono-band-* /
+    # chrono-origin-selected layer ids from CHRONO_STYLE /
+    # CHRONO_ORIGIN_STYLE.
     _CHRONO_CLICK_JS = """
     (function () {
-      var M = map_austria_transit;
+      var M = map_austria_chrono;
+      var COLORS = ['#006837','#1a9850','#66bd63','#a6d96a','#d9ef8b',
+                    '#ffffbf','#fee08b','#fdae61','#f46d43','#d73027',
+                    '#a50026','#6d0026'];
       M.on('load', function () {
-    var box = document.getElementById('map-austria-transit');
+    var box = document.getElementById('map-austria-chrono');
     box.style.position = 'relative';
     var leg = document.createElement('div');
     leg.style.cssText = 'position:absolute;left:8px;bottom:8px;z-index:2;'
-      + 'background:rgba(255,255,255,0.88);padding:6px 9px;'
-      + 'border-radius:4px;font:11px/1.5 sans-serif;color:#222;'
+      + 'background:rgba(255,255,255,0.9);padding:6px 9px;'
+      + 'border-radius:4px;font:11px/1.45 sans-serif;color:#222;'
       + 'box-shadow:0 1px 4px rgba(0,0,0,0.35);';
-    var rows = [['#1a9850', '1 h'], ['#91cf60', '2 h'],
-                ['#fee08b', '3 h'], ['#fc8d59', '4 h'],
-                ['#d73027', '5 h']];
     var html = '<b>Reachable by train</b>'
-      + '<div id="chrono-hint" style="color:#666;">click a station dot</div>';
-    for (var i = 0; i < rows.length; i++) {
+      + '<div id="chrono-hint" style="color:#666;">'
+      + 'click a marked station</div>';
+    for (var i = 0; i < 12; i++) {
       html += '<div><span style="display:inline-block;width:11px;'
-        + 'height:11px;margin-right:5px;background:' + rows[i][0]
-        + ';"></span>&le; ' + rows[i][1] + '</div>';
+        + 'height:11px;margin-right:5px;background:' + COLORS[i]
+        + ';"></span>&le; ' + (i + 1) + ' h</div>';
     }
     leg.innerHTML = html;
     box.appendChild(leg);
       });
       function applyOrigin(fid, name) {
-    for (var b = 1; b <= 5; b++) {
-      var flt = ['all',
+    for (var b = 1; b <= 12; b++) {
+      M.setFilter('chrono-band-' + b, ['all',
+        ['==', ['get', 'theme'], 'chrono'],
         ['==', ['get', 'band_hours'], String(b)],
-        ['==', ['get', 'origin_station_id'], fid]];
-      M.setFilter('chrono-band-' + b, flt);
-      M.setFilter('chrono-band-' + b + '-outline', flt);
+        ['==', ['get', 'origin_station_id'], fid]]);
     }
+    M.setFilter('chrono-origin-selected', ['all',
+      ['==', ['get', 'theme'], 'chrono-origin'],
+      ['==', ['get', 'origin_station_id'], fid]]);
     var hint = document.getElementById('chrono-hint');
     if (hint) { hint.textContent = 'from: ' + (name || fid); }
       }
-      M.on('click', 'transit-station-dot', function (e) {
+      M.on('click', 'chrono-origin', function (e) {
     if (!e.features || !e.features.length) { return; }
     var p = e.features[0].properties || {};
-    applyOrigin(p.station_feature_id, p.station_name);
+    applyOrigin(p.origin_station_id, p.origin_name);
       });
-      M.on('mouseenter', 'transit-station-dot', function () {
+      M.on('mouseenter', 'chrono-origin', function () {
     M.getCanvas().style.cursor = 'pointer';
       });
-      M.on('mouseleave', 'transit-station-dot', function () {
+      M.on('mouseleave', 'chrono-origin', function () {
     M.getCanvas().style.cursor = '';
       });
     })();
@@ -4519,25 +4699,13 @@ def _(
     mo.iframe(
         build_pipeline_maplibre_html(
             martin,
-            "austria-transit",
-            layer_name="austria-transit",
+            "austria-chrono",
+            layer_name="austria-chrono",
             center=[13.34, 47.6],
             zoom=7,
             style_layers=CHRONO_STYLE,
-            source_maxzoom=14,
-            extra_sources={
-                "chrono-src": {
-                    "type": "vector",
-                    "url": f"{martin}/austria-chrono",
-                    "maxzoom": 10,
-                },
-                "transit-src": {
-                    "type": "vector",
-                    "url": f"{martin}/austria-transit",
-                    "maxzoom": 14,
-                },
-            },
-            extra_layers=TRANSIT_STYLE,
+            source_maxzoom=10,
+            extra_layers=CHRONO_ORIGIN_STYLE,
             satellite_background=True,
             terrain=True,
             hillshade=False,
