@@ -826,6 +826,353 @@ def _(Path, os, textwrap):
                     LEFT JOIN transit.station_members sm USING (stop_id)
                 """)
 
+                # Transfer-hub importance score per station:
+                #   hub_score = sum over LINE-pairs of
+                #                 reach(km) x feasibility x terminus_factor
+                #             + sum over TERMINATING lines of reach(km)
+                # A line that TERMINATES at a station concentrates
+                # transfer demand there (every rider must alight) far more
+                # than one merely passing through, so it counts twice:
+                #  * terminus_factor — each terminating line in a pair
+                #    adds 1.0 to that pair's multiplier (neither=1x,
+                #    one=2x, both=3x);
+                #  * the standalone terminus term — each terminating line
+                #    adds its full reach regardless of transfer
+                #    feasibility, so a terminus strictly outranks a
+                #    through-station of the same line even when its line
+                #    pairs have no schedule overlap.
+                # hub_rank drives symbol-sort-key in the map's
+                # transit-stops-label layer so MapLibre places the
+                # important hubs first.
+                #
+                # Two corrections make the score representative on this
+                # all-days feed (RCA findings):
+                #  * The Transitous feed fragments every line into many
+                #    per-variant route_ids (23k route_ids, ~1.9 trips
+                #    each), so pair LINES (route_short_name, long_name
+                #    fallback) — not route_ids — or the score collapses to
+                #    route_id-fragmentation noise.
+                #  * Counting all trips across all service days inflates
+                #    frequency. Expand calendar + calendar_dates to count
+                #    each line's operating days and divide, yielding a
+                #    representative departures-per-day rate so headway /
+                #    overlap stay discriminating instead of saturating.
+                # Computed at station granularity — platforms are folded
+                # to station_feature_id BEFORE the line-pair self-join, so
+                # a line pair is never double-counted.
+                con.sql("""
+                    CREATE OR REPLACE MACRO transit.haversine_km(
+                        lat1, lon1, lat2, lon2
+                    ) AS
+                        2 * 6371.0 * asin(sqrt(
+                            pow(sin(radians(lat2 - lat1) / 2), 2)
+                            + cos(radians(lat1)) * cos(radians(lat2))
+                              * pow(sin(radians(lon2 - lon1) / 2), 2)
+                        ))
+                """)
+                con.sql("""
+                    CREATE OR REPLACE TABLE transit.station_hub_scores AS
+                    WITH
+                      lines AS (
+                        SELECT
+                            route_id,
+                            COALESCE(
+                                NULLIF(trim(route_short_name), ''),
+                                NULLIF(trim(route_long_name), ''),
+                                route_id
+                            ) AS line_id
+                        FROM gtfs.routes
+                      ),
+                      -- calendar.txt expansion: (service_id, date) the
+                      -- weekly pattern is active over its date range.
+                      cal_days AS (
+                        SELECT
+                            c.service_id,
+                            gs.d::DATE AS service_date
+                        FROM gtfs.calendar c,
+                             generate_series(
+                                 c.start_date::TIMESTAMP,
+                                 c.end_date::TIMESTAMP,
+                                 INTERVAL '1 day'
+                             ) AS gs(d)
+                        WHERE [c.sunday, c.monday, c.tuesday, c.wednesday,
+                               c.thursday, c.friday, c.saturday]
+                              [dayofweek(gs.d::DATE) + 1] = 1
+                      ),
+                      -- apply calendar_dates.txt exceptions
+                      -- (1 = service added, 2 = service removed).
+                      service_dates AS (
+                        (SELECT service_id, service_date FROM cal_days
+                         EXCEPT
+                         SELECT service_id, date FROM gtfs.calendar_dates
+                         WHERE exception_type = 2)
+                        UNION
+                        (SELECT service_id, date FROM gtfs.calendar_dates
+                         WHERE exception_type = 1)
+                      ),
+                      service_day_count AS (
+                        SELECT service_id,
+                               count(DISTINCT service_date) AS n_days
+                        FROM service_dates
+                        GROUP BY service_id
+                      ),
+                      -- every trip tagged with its line + operating-day count
+                      trip_meta AS (
+                        SELECT
+                            t.trip_id,
+                            l.line_id,
+                            t.service_id,
+                            COALESCE(sdc.n_days, 0) AS svc_days
+                        FROM gtfs.trips t
+                        JOIN lines l USING (route_id)
+                        LEFT JOIN service_day_count sdc USING (service_id)
+                      ),
+                      -- distinct calendar days each line runs anywhere
+                      line_service AS (
+                        SELECT DISTINCT line_id, service_id FROM trip_meta
+                      ),
+                      line_days AS (
+                        SELECT ls.line_id,
+                               count(DISTINCT sd.service_date)
+                                   AS line_service_days
+                        FROM line_service ls
+                        JOIN service_dates sd USING (service_id)
+                        GROUP BY ls.line_id
+                      ),
+                      -- per (station, line): within-day operating envelope
+                      -- (dep_sec is seconds-since-midnight, so min/max over
+                      -- all days is still the daily envelope; GTFS >24h
+                      -- overnight values preserved) + total feed-window
+                      -- departures (each trip counted once per operating
+                      -- day). gtfs-parquet stores departure_time as BIGINT
+                      -- milliseconds-since-midnight, not a string.
+                      station_line AS (
+                        SELECT
+                            sm.station_feature_id,
+                            tm.line_id,
+                            min(st.departure_time / 1000.0) AS first_dep,
+                            max(st.departure_time / 1000.0) AS last_dep,
+                            sum(tm.svc_days)                AS weighted_departures
+                        FROM gtfs.stop_times st
+                        JOIN trip_meta tm               USING (trip_id)
+                        JOIN transit.station_members sm USING (stop_id)
+                        WHERE st.departure_time IS NOT NULL
+                        GROUP BY sm.station_feature_id, tm.line_id
+                      ),
+                      -- normalise to a representative departures-per-day
+                      -- rate, then a real daily headway.
+                      station_line_hw AS (
+                        SELECT
+                            sl.station_feature_id,
+                            sl.line_id,
+                            sl.first_dep,
+                            sl.last_dep,
+                            CASE
+                                WHEN sl.weighted_departures
+                                     / greatest(ld.line_service_days, 1) > 1
+                                THEN ((sl.last_dep - sl.first_dep) / 60.0)
+                                     / (sl.weighted_departures
+                                        / greatest(ld.line_service_days, 1)
+                                        - 1)
+                                ELSE NULL
+                            END AS avg_headway_min
+                        FROM station_line sl
+                        LEFT JOIN line_days ld USING (line_id)
+                      ),
+                      -- per line: geographic reach (km) — greater bbox
+                      -- diagonal over all stops of all the line's route_id
+                      -- fragments.
+                      line_bbox AS (
+                        SELECT
+                            tm.line_id,
+                            min(s.stop_lat) AS min_lat,
+                            max(s.stop_lat) AS max_lat,
+                            min(s.stop_lon) AS min_lon,
+                            max(s.stop_lon) AS max_lon
+                        FROM gtfs.stop_times st
+                        JOIN trip_meta tm USING (trip_id)
+                        JOIN gtfs.stops s USING (stop_id)
+                        GROUP BY tm.line_id
+                      ),
+                      line_reach AS (
+                        SELECT
+                            line_id,
+                            greatest(
+                                transit.haversine_km(min_lat, min_lon, max_lat, max_lon),
+                                transit.haversine_km(max_lat, min_lon, min_lat, max_lon)
+                            ) AS reach_km
+                        FROM line_bbox
+                      ),
+                      -- first + last stop of every trip — the line's
+                      -- endpoints. A (station, line) is a TERMINUS pair
+                      -- when the station owns an endpoint stop of any of
+                      -- the line's trips (the line starts or ends here,
+                      -- vs merely passing through).
+                      trip_ends AS (
+                        SELECT
+                            trip_id,
+                            arg_min(stop_id, stop_sequence) AS first_stop,
+                            arg_max(stop_id, stop_sequence) AS last_stop
+                        FROM gtfs.stop_times
+                        WHERE stop_sequence IS NOT NULL
+                        GROUP BY trip_id
+                      ),
+                      trip_endpoints AS (
+                        SELECT trip_id, first_stop AS endpoint_stop
+                        FROM trip_ends
+                        UNION ALL
+                        SELECT trip_id, last_stop FROM trip_ends
+                      ),
+                      station_line_terminus AS (
+                        SELECT DISTINCT
+                            sm.station_feature_id,
+                            tm.line_id
+                        FROM trip_endpoints ep
+                        JOIN trip_meta tm               USING (trip_id)
+                        JOIN transit.station_members sm
+                          ON sm.stop_id = ep.endpoint_stop
+                      ),
+                      sl AS (
+                        SELECT
+                            h.station_feature_id,
+                            h.line_id,
+                            h.first_dep,
+                            h.last_dep,
+                            h.avg_headway_min,
+                            COALESCE(lr.reach_km, 0.0) AS reach_km,
+                            CASE WHEN slt.station_feature_id IS NOT NULL
+                                 THEN 1 ELSE 0 END AS is_terminus
+                        FROM station_line_hw h
+                        LEFT JOIN line_reach lr USING (line_id)
+                        LEFT JOIN station_line_terminus slt
+                          USING (station_feature_id, line_id)
+                      ),
+                      pairs AS (
+                        SELECT
+                            a.station_feature_id,
+                            a.reach_km        AS reach_a,
+                            b.reach_km        AS reach_b,
+                            a.avg_headway_min AS hw_a,
+                            b.avg_headway_min AS hw_b,
+                            a.is_terminus     AS term_a,
+                            b.is_terminus     AS term_b,
+                            greatest(0,
+                                least(a.last_dep, b.last_dep)
+                                - greatest(a.first_dep, b.first_dep)
+                            ) / 60.0 AS overlap_min
+                        FROM sl a
+                        JOIN sl b
+                          ON a.station_feature_id = b.station_feature_id
+                         AND a.line_id < b.line_id
+                      ),
+                      weighted AS (
+                        SELECT
+                            station_feature_id,
+                            greatest(reach_a, reach_b) AS reach_score_km,
+                            least(1.0, greatest(0.0, overlap_min / 60.0))
+                                AS overlap_quality,
+                            CASE
+                                WHEN hw_a IS NOT NULL AND hw_b IS NOT NULL
+                                THEN least(1.0, greatest(0.0,
+                                         60.0 / greatest(1.0,
+                                             (hw_a + hw_b) / 2.0)))
+                                ELSE 0.5
+                            END AS headway_quality,
+                            -- +1.0 per terminating line in the pair
+                            1.0 + term_a + term_b AS terminus_factor
+                        FROM pairs
+                      ),
+                      pair_weight AS (
+                        SELECT
+                            station_feature_id,
+                            reach_score_km,
+                            reach_score_km * overlap_quality
+                                * headway_quality
+                                * terminus_factor AS pair_weight
+                        FROM weighted
+                      ),
+                      station_hub AS (
+                        SELECT
+                            station_feature_id,
+                            sum(pair_weight)    AS hub_score,
+                            count(*)            AS n_route_pairs,
+                            max(reach_score_km) AS max_reach_km
+                        FROM pair_weight
+                        GROUP BY station_feature_id
+                      ),
+                      line_counts AS (
+                        SELECT
+                            station_feature_id,
+                            count(DISTINCT line_id) AS n_routes,
+                            count(DISTINCT line_id) FILTER (
+                                WHERE is_terminus = 1
+                            ) AS n_terminating_lines,
+                            -- standalone terminus importance: each line
+                            -- ending here contributes its full reach,
+                            -- independent of whether any transfer is
+                            -- temporally feasible. This is what makes a
+                            -- terminus strictly outrank a through-station
+                            -- of the same line even when the station's
+                            -- line pairs have no schedule overlap (the
+                            -- terminus_factor multiplier alone can't lift
+                            -- a zero pair-score).
+                            COALESCE(sum(reach_km) FILTER (
+                                WHERE is_terminus = 1
+                            ), 0.0) AS terminus_reach_sum
+                        FROM sl
+                        GROUP BY station_feature_id
+                      ),
+                      scored AS (
+                        SELECT
+                            h.station_feature_id,
+                            -- transfer-feasibility term + standalone
+                            -- terminus term (weight 1.0 = one unit of
+                            -- reach per terminating line).
+                            h.hub_score + rc.terminus_reach_sum AS hub_score,
+                            rc.n_routes,
+                            rc.n_terminating_lines,
+                            h.n_route_pairs,
+                            h.max_reach_km
+                        FROM station_hub h
+                        JOIN line_counts rc USING (station_feature_id)
+                      )
+                    SELECT
+                        station_feature_id,
+                        hub_score,
+                        n_routes,
+                        n_terminating_lines,
+                        n_route_pairs,
+                        max_reach_km,
+                        ROW_NUMBER() OVER (
+                            ORDER BY hub_score DESC,
+                                     n_routes DESC,
+                                     station_feature_id
+                        ) AS hub_rank
+                    FROM scored
+                """)
+                # hub-score summary — mirrors the roll-up log above.
+                # grain MUST hold: one row per scored station_feature_id.
+                hub = con.sql("""
+                    SELECT
+                        count(*)                           AS total_rows,
+                        count(DISTINCT station_feature_id) AS distinct_stations,
+                        round(max(hub_score), 1)           AS top_score,
+                        round(median(hub_score), 1)        AS median_score
+                    FROM transit.station_hub_scores
+                """).fetchone()
+                top5 = con.sql("""
+                    SELECT station_feature_id, round(hub_score, 1)
+                    FROM transit.station_hub_scores
+                    ORDER BY hub_rank
+                    LIMIT 5
+                """).fetchall()
+                print(
+                    f"[match_gtfs_stops_to_osm] hub-score: "
+                    f"stations_scored={hub[0]}, distinct={hub[1]}, "
+                    f"top_score={hub[2]}, median_score={hub[3]} "
+                    f"(grain OK = {hub[0] == hub[1]}); top5={top5}"
+                )
+
                 # Export the joined view as parquet for freestiler
                 # ingestion (freestiler can't ATTACH a duckdb file mid-
                 # query, so we round-trip through parquet — the same
@@ -906,11 +1253,25 @@ def _(Path, os, textwrap):
                                     ST_Point(sm.station_lon, sm.station_lat)
                                 ), s.stop_id
                             ) = 1 THEN 'true' ELSE 'false' END
-                                AS is_station_label
+                                AS is_station_label,
+                            -- Transfer-hub importance, per station_feature_id
+                            -- (so every member row carries the station's
+                            -- value). hub_rank drives symbol-sort-key in
+                            -- transit-stops-label. CAST to VARCHAR for the
+                            -- same MVT-round-trip reason as the columns
+                            -- above; COALESCE so a station with <2 routes
+                            -- (no route pairs, absent from
+                            -- station_hub_scores) still sorts last.
+                            COALESCE(CAST(hs.hub_score AS VARCHAR), '0')
+                                AS hub_score,
+                            COALESCE(CAST(hs.hub_rank AS VARCHAR), '999999')
+                                AS hub_rank
                         FROM gtfs.stops s
                         LEFT JOIN transit.matched_stops m USING (stop_id)
                         LEFT JOIN stop_route_types rt USING (stop_id)
                         LEFT JOIN transit.station_members sm USING (stop_id)
+                        LEFT JOIN transit.station_hub_scores hs
+                          ON hs.station_feature_id = sm.station_feature_id
                     ) TO '{transit_parquet}' (FORMAT 'parquet')
                 """)
                 con.close()
@@ -1072,9 +1433,20 @@ def _(Path, os, textwrap):
                            primary_route_type,
                            station_feature_id,
                            station_name,
-                           is_station_label
+                           is_station_label,
+                           hub_score,
+                           hub_rank
                     FROM read_parquet('{transit_parquet_path}')
                 """
+                # drop_rate MUST stay None (disables feature thinning).
+                # The transit-stops-label map layer filters to the single
+                # is_station_label='true' member row per station; an
+                # exponential drop_rate randomly thins features below
+                # base_zoom and can drop exactly that representative row,
+                # making station labels (and the hub_rank-driven
+                # symbol-sort-key prioritisation) appear erratically. The
+                # stop set is small (~7.6k points), so keeping every
+                # feature at every zoom costs little and is correct.
                 freestiler.freestile_query(
                     query=query,
                     output=str(out),
@@ -1082,7 +1454,7 @@ def _(Path, os, textwrap):
                     min_zoom=0,
                     max_zoom=14,
                     base_zoom=14,
-                    drop_rate=2.0,
+                    drop_rate=None,
                     coalesce=True,
                 )
                 return str(out)
@@ -2250,6 +2622,9 @@ def _theme_styles():
         # labelled, with the parent-station name — so a big station shows
         # ONE label, not one per platform. Every platform still renders
         # its own dot via the per-mode circle layers above.
+        # symbol-sort-key = hub_rank: MapLibre places lower sort-keys
+        # first, so the most important transfer hubs (rank 1, 2, …) win
+        # collisions and minor junctions drop out when labels crowd.
         {"id": "transit-stops-label", "type": "symbol",
          "source": "transit-src", "source-layer": "austria-transit",
          "minzoom": 11,
@@ -2257,8 +2632,9 @@ def _theme_styles():
                     ["==", ["geometry-type"], "Point"],
                     ["==", ["get", "is_station_label"], "true"]],
          "layout": {
+            "symbol-sort-key": ["to-number", ["get", "hub_rank"]],
             "text-field": ["get", "station_name"],
-            "text-font": ["Noto Sans Regular"],
+            "text-font": ["noto_sans_regular"],
             "text-size": [
                 "interpolate", ["linear"], ["zoom"],
                 11, 10,
@@ -2951,7 +3327,7 @@ def _theme_styles():
                     ["==", ["get", "railway"], "station"]],
          "layout": {
             "text-field": ["get", "name"],
-            "text-font": ["Noto Sans Regular"],
+            "text-font": ["noto_sans_regular"],
             "text-size": [
                 "interpolate", ["linear"], ["zoom"],
                 12, 11, 16, 13, 18, 15,
@@ -3099,6 +3475,58 @@ def _(df_route_stops):
 
 
 @app.cell
+def _(dag_run_states, mo):
+    # Top transfer hubs — ranks every parent station by hub_score, the
+    # transfer-hub importance metric the GTFS DAG's
+    # match_gtfs_stops_to_osm task computes into
+    # transit.station_hub_scores (sum over LINE-pairs at the station of
+    # line reach in km x transfer feasibility x terminus factor).
+    # hub_rank from this same table drives symbol-sort-key in the
+    # transit map's transit-stops-label layer, so the labels that
+    # survive a crowded viewport are the genuine interchange hubs.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    import duckdb as _duckdb_hub
+    _hub_con = _duckdb_hub.connect(
+        "/workspace/duckdb/austria.duckdb",
+        read_only=True,
+    )
+    _hub_con.sql("INSTALL spatial; LOAD spatial;")
+    _top_hubs = _hub_con.sql("""
+        SELECT
+            h.hub_rank,
+            min(m.station_name)        AS station_name,
+            h.station_feature_id,
+            round(h.hub_score, 1)      AS hub_score,
+            h.n_routes,
+            h.n_terminating_lines,
+            h.n_route_pairs,
+            round(h.max_reach_km, 1)   AS max_reach_km
+        FROM transit.station_hub_scores h
+        JOIN transit.station_members m
+          ON m.station_feature_id = h.station_feature_id
+        GROUP BY h.hub_rank, h.station_feature_id, h.hub_score,
+                 h.n_routes, h.n_terminating_lines, h.n_route_pairs,
+                 h.max_reach_km
+        ORDER BY h.hub_rank
+        LIMIT 25
+    """).pl()
+    _hub_con.close()
+    mo.vstack([
+        mo.md("**Top 25 transfer hubs** "
+              "(hub_score = sum over line-pairs at the station of line "
+              "reach in km x transfer feasibility x terminus factor; "
+              "hub_rank drives label-placement priority in the "
+              "transit map)"),
+        _top_hubs,
+    ])
+    return
+
+
+@app.cell
 def _(dag_run_states, martin, mo):
     # Unified transit map — austria-railway PMTiles as the base (the
     # tracks themselves, from the OSM DAG) + austria-transit PMTiles
@@ -3231,83 +3659,6 @@ def _(
 
 
 @app.cell
-def _(
-    Path,
-    SATELLITE_OVERLAY_STYLE,
-    TRANSIT_STYLE,
-    dag_run_states,
-    martin,
-    mo,
-    versatiles_assets,
-):
-    # Satellite-overlay map — versatiles satellite imagery as the
-    # background; transport overlay drawn with a dedicated zoom-banded
-    # style (`SATELLITE_OVERLAY_STYLE`) tuned for the satellite
-    # background. The aesthetic is inspired by Artaria's 1911
-    # Eisenbahnkarte von Österreich-Ungarn — railways are the visual
-    # headline (k.k. Staatsbahn red mainline + double-track stripe at
-    # city zoom, k.u. green for urban transit), cycle network is
-    # secondary (deep teal-ink with halo on long-distance routes),
-    # hiking network is also secondary (sienna with halo on
-    # long-distance routes), generic footpaths are tertiary.
-    #
-    # GTFS stops overlay (`TRANSIT_STYLE`) uses uniform white-fill /
-    # dark-stroke circles at every zoom + a Noto Sans text label per
-    # stop at z11+ (collision-avoided by MapLibre's default). The
-    # match_kind discriminator is no longer encoded into colour —
-    # it remains queryable in the unified-analysis cell above.
-    #
-    # Text labels need an SDF glyph source: wired here via the helper's
-    # `glyphs_url` kwarg, pointing at the versatiles-frontend layer's
-    # /fonts/ re-export (which serves versatiles-fonts in the
-    # versatiles-glyphs-rs URL convention).
-    #
-    # 3D terrain + sky + camera pitch + TerrainControl are ON (same
-    # mapterhorn DEM source the transit map cell uses) so the satellite
-    # imagery drapes over the elevation model and the user can tilt the
-    # view. The hillshade layer is OFF — relief shading is redundant
-    # with the satellite's own shadow rendering and would only obscure
-    # the imagery.
-    mo.stop(
-        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
-        f"Waiting for notebook_austria_gtfs_pipeline (state="
-        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
-    )
-    _ecovoyage_pmtiles = Path("/workspace/tiles/pmtiles/austria-ecovoyage.pmtiles")
-    mo.stop(
-        not _ecovoyage_pmtiles.exists() or _ecovoyage_pmtiles.stat().st_size == 0,
-        "`austria-ecovoyage.pmtiles` not yet present — open and run "
-        "`osm-austria.py` first. Its OSM DAG produces this tile via "
-        "the `freestiler_ecovoyage_convert` task.",
-    )
-    mo.iframe(
-        build_pipeline_maplibre_html(
-            martin,
-            "austria-ecovoyage",
-            layer_name="austria-ecovoyage",
-            center=[13.3, 47.7],
-            zoom=7,
-            style_layers=SATELLITE_OVERLAY_STYLE,
-            extra_sources={
-                "transit-src": {
-                    "type": "vector",
-                    "url": f"{martin}/austria-transit",
-                },
-            },
-            extra_layers=TRANSIT_STYLE,
-            satellite_background=True,
-            terrain=True,
-            hillshade=False,
-            pitch=45,
-            max_pitch=85,
-            glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
-        ),
-        height="500px",
-    )
-    return
-
-
-@app.cell
 def _(dag_run_states, mo):
     # Tag-distribution diagnostics — what OSM tag values actually
     # exist in the data the satellite-overlay style filters against.
@@ -3417,6 +3768,83 @@ def _(dag_run_states, mo):
               "matrix (colour = difficulty, pattern = visibility):"),
         _sac_visibility_dist,
     ])
+    return
+
+
+@app.cell
+def _(
+    Path,
+    SATELLITE_OVERLAY_STYLE,
+    TRANSIT_STYLE,
+    dag_run_states,
+    martin,
+    mo,
+    versatiles_assets,
+):
+    # Satellite-overlay map — versatiles satellite imagery as the
+    # background; transport overlay drawn with a dedicated zoom-banded
+    # style (`SATELLITE_OVERLAY_STYLE`) tuned for the satellite
+    # background. The aesthetic is inspired by Artaria's 1911
+    # Eisenbahnkarte von Österreich-Ungarn — railways are the visual
+    # headline (k.k. Staatsbahn red mainline + double-track stripe at
+    # city zoom, k.u. green for urban transit), cycle network is
+    # secondary (deep teal-ink with halo on long-distance routes),
+    # hiking network is also secondary (sienna with halo on
+    # long-distance routes), generic footpaths are tertiary.
+    #
+    # GTFS stops overlay (`TRANSIT_STYLE`) uses uniform white-fill /
+    # dark-stroke circles at every zoom + a Noto Sans text label per
+    # stop at z11+ (collision-avoided by MapLibre's default). The
+    # match_kind discriminator is no longer encoded into colour —
+    # it remains queryable in the unified-analysis cell above.
+    #
+    # Text labels need an SDF glyph source: wired here via the helper's
+    # `glyphs_url` kwarg, pointing at the versatiles-frontend layer's
+    # /fonts/ re-export (which serves versatiles-fonts in the
+    # versatiles-glyphs-rs URL convention).
+    #
+    # 3D terrain + sky + camera pitch + TerrainControl are ON (same
+    # mapterhorn DEM source the transit map cell uses) so the satellite
+    # imagery drapes over the elevation model and the user can tilt the
+    # view. The hillshade layer is OFF — relief shading is redundant
+    # with the satellite's own shadow rendering and would only obscure
+    # the imagery.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    _ecovoyage_pmtiles = Path("/workspace/tiles/pmtiles/austria-ecovoyage.pmtiles")
+    mo.stop(
+        not _ecovoyage_pmtiles.exists() or _ecovoyage_pmtiles.stat().st_size == 0,
+        "`austria-ecovoyage.pmtiles` not yet present — open and run "
+        "`osm-austria.py` first. Its OSM DAG produces this tile via "
+        "the `freestiler_ecovoyage_convert` task.",
+    )
+    mo.iframe(
+        build_pipeline_maplibre_html(
+            martin,
+            "austria-ecovoyage",
+            layer_name="austria-ecovoyage",
+            center=[13.3, 47.7],
+            zoom=7,
+            style_layers=SATELLITE_OVERLAY_STYLE,
+            extra_sources={
+                "transit-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-transit",
+                },
+            },
+            extra_layers=TRANSIT_STYLE,
+            satellite_background=True,
+            terrain=True,
+            hillshade=False,
+            pitch=45,
+            max_pitch=85,
+            glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
+        ),
+        height="500px",
+    )
     return
 
 
