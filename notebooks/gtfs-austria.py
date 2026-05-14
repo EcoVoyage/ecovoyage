@@ -261,6 +261,17 @@ def _(Path, os, textwrap):
         # station spacing. 1 deg lat ≈ 111320 m at 47.5°N → 0.002695.
         _STATION_SNAP_DEG = 0.002695  # ≈ 300 m at Austrian latitude
 
+        # Bare generic station-type names (no place qualifier) that an
+        # OSM station node sometimes carries — the place is left to map
+        # context. When the resolved anchor name is one of these, the
+        # GTFS parent-station name ("Innsbruck Hauptbahnhof") is the
+        # better display label. Used by both the tier-1 name pick AND
+        # the per-station name consolidation in transit.station_members.
+        _GENERIC_NAME_SET = (
+            "'hauptbahnhof', 'bahnhof', 'bahnhst', 'bahnhst.', 'hbf', "
+            "'bf', 'bf.', 'station', 'bahnsteig'"
+        )
+
         # Wiki-compliant predicate for OSM relations that ARE route masters
         # (i.e. GTFS routes.txt matching candidates per PTv2).
         _ROUTE_MASTER_WHERE = """tags['type'] = 'route_master'
@@ -631,8 +642,24 @@ def _(Path, os, textwrap):
                             COALESCE(pa.anchor_feature_id,
                                      'gtfs/' || s.parent_station)
                                 AS station_feature_id,
-                            COALESCE(pa.anchor_name, pa.parent_name)
-                                AS station_name,
+                            -- Identity (id + location) comes from the
+                            -- OSM anchor. Name normally does too — but
+                            -- some OSM station nodes carry only a bare
+                            -- generic name ("Hauptbahnhof", "Bahnhof",
+                            -- ...) with the place qualifier left to map
+                            -- context. The GTFS parent-station row's name
+                            -- ("Innsbruck Hauptbahnhof") is the better
+                            -- display label, so prefer it whenever the
+                            -- OSM name is one of those bare terms. A
+                            -- final consolidation pass below then
+                            -- propagates this good name to the SAME
+                            -- station's tier-2/3 members.
+                            CASE
+                              WHEN lower(trim(pa.anchor_name))
+                                   IN ({_GENERIC_NAME_SET})
+                              THEN COALESCE(pa.parent_name, pa.anchor_name)
+                              ELSE COALESCE(pa.anchor_name, pa.parent_name)
+                            END AS station_name,
                             COALESCE(pa.anchor_lon, pa.parent_lon)
                                 AS station_lon,
                             COALESCE(pa.anchor_lat, pa.parent_lat)
@@ -721,11 +748,42 @@ def _(Path, os, textwrap):
                           AND s.stop_id NOT IN (
                                 SELECT stop_id FROM tier3 WHERE stop_id IS NOT NULL
                             )
+                      ),
+                      resolved AS (
+                        SELECT * FROM tier1
+                        UNION ALL SELECT * FROM tier2
+                        UNION ALL SELECT * FROM tier3
+                        UNION ALL SELECT * FROM tier4
+                      ),
+                      -- Per-station name consolidation: a station_feature_id
+                      -- can be reached by several tiers (a platform via
+                      -- gtfs_parent, a nearby orphan stop via spatial),
+                      -- and only tier 1 knows the GTFS parent name. Pick
+                      -- ONE name per station_feature_id — the non-generic
+                      -- one if any member contributed it — so every member
+                      -- of a station shows the same, best label.
+                      station_name_final AS (
+                        SELECT
+                            station_feature_id,
+                            COALESCE(
+                                max(station_name) FILTER (
+                                    WHERE lower(trim(station_name))
+                                          NOT IN ({_GENERIC_NAME_SET})
+                                ),
+                                max(station_name)
+                            ) AS station_name
+                        FROM resolved
+                        GROUP BY station_feature_id
                       )
-                    SELECT * FROM tier1
-                    UNION ALL SELECT * FROM tier2
-                    UNION ALL SELECT * FROM tier3
-                    UNION ALL SELECT * FROM tier4
+                    SELECT
+                        r.stop_id,
+                        r.station_feature_id,
+                        snf.station_name,
+                        r.station_lon,
+                        r.station_lat,
+                        r.resolution_kind
+                    FROM resolved r
+                    JOIN station_name_final snf USING (station_feature_id)
                 """)
                 # resolution_kind histogram — mirrors the match-rate log
                 # above. grain MUST hold: one row per GTFS stop_id.
