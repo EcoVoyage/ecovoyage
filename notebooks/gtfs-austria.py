@@ -132,16 +132,17 @@ def _(airflow_public, mo):
       ride + transfer waiting times) by a time-dependent Connection
       Scan Algorithm — a smart-multipath, frontier-relaxation,
       GPU-accelerated polars loop in the GTFS DAG's
-      `compute_chrono_isochrones` task — from each of the top 25 hubs
-      to EVERY other station, baked to the `austria-chrono` PMTiles
-      archive.
-    - **Fastest connections** — the fastest journey between the top 25
-      hubs, drawn as the actual route through every intermediate
-      station. Click a hub marker → its fastest connection to each
-      other hub lights up (coloured by travel time, hover for time +
-      transfers). Reconstructed by backtracking the chronomap CSA's
-      predecessor chain in the `compute_fastest_connections` task,
-      baked to the `austria-fastlink` PMTiles archive.
+      `compute_chrono_isochrones` task — from each route-optimised
+      transfer hub to EVERY other station, baked to the
+      `austria-chrono` PMTiles archive.
+    - **Fastest connections** — the fastest journey between the
+      route-optimised transfer hubs, drawn as the actual route through
+      every intermediate station. Click a hub marker → its fastest
+      connection to each other hub lights up (coloured by travel time,
+      hover for time + transfers). Reconstructed by backtracking the
+      chronomap CSA's predecessor chain in the
+      `compute_fastest_connections` task, baked to the
+      `austria-fastlink` PMTiles archive.
     - **Route builder** — left-click a station to start a route,
       shift+click to add stops; the journey through your picked
       stations is drawn with the cumulative leg-by-leg itinerary. Each
@@ -332,25 +333,66 @@ def _(Path, os, textwrap):
         # chronotrains' 9 km/h short-hop and flat 20-min interchange
         # approximations are deliberately NOT used.
         #
-        # The relaxation is a SMART MULTIPATH algorithm: all
-        # CHRONO_ORIGIN_COUNT origins are routed simultaneously in one
-        # vectorised pass, and each iteration relaxes ONLY from the
-        # frontier — the labels that improved last round — instead of
-        # re-scanning the whole state. The connection table is joined
-        # against the small per-iteration delta, not the full arrival
-        # set, which is what keeps the 12 h horizon (origins → ALL
-        # reachable stations) cheap. Every knob lives here.
-        CHRONO_ORIGIN_COUNT = 25             # top-N stations by hub_rank to seed
+        # The relaxation is a SMART MULTIPATH algorithm: every hub
+        # origin is routed simultaneously in one vectorised pass, and
+        # each iteration relaxes ONLY from the frontier — the labels
+        # that improved last round — instead of re-scanning the whole
+        # state. The connection table is joined against the small
+        # per-iteration delta, not the full arrival set, which is what
+        # keeps the 12 h horizon (origins → ALL reachable stations)
+        # cheap. Every knob lives here.
         CHRONO_DEPART_S = 8 * 3600           # reference departure time-of-day (08:00)
         CHRONO_DEFAULT_TRANSFER_S = 0        # transfer seconds when transfers.txt is silent
         CHRONO_MAX_LEGS = 40                 # CSA fixpoint iteration cap (safety bound)
         CHRONO_BANDS_H = list(range(1, 13))  # cumulative isochrone bands: every hour to 12 h
         CHRONO_HULL_BUFFER_DEG = 0.03        # ~3 km smoothing buffer on each band hull
-        # Hub→hub departure-time profile grid (route builder). Only 25
-        # hubs, so a full profile across the service day stays small +
-        # tile-able — lets a station→hub leg's arrival be matched to a
+        # Hub→hub departure-time profile grid (route builder). A full
+        # profile across the service day per hub stays small + tile-
+        # able — lets a station→hub leg's arrival be matched to a
         # hub→hub leg's departure.
         CHRONO_HUB_PROFILE_TIMES = list(range(5 * 3600, 22 * 3600, 1800))
+
+        # === Hub-and-spoke transfer-hub selection (compute_optimal_hubs)
+        # A "hub" is a station where you ACTUALLY change trains —
+        # Innsbruck -> Budapest you switch at Wien Hbf, not Wien
+        # Meidling, because no single train runs Meidling -> Budapest.
+        # The hub set that seeds the CSA passes is chosen by a greedy
+        # that, at each step, ranks the live candidate stations by two
+        # factors, both on the same [1, n] scale, and picks argmin of
+        # the CO-EQUAL combined rank —
+        #   routing_rank + OPTIMAL_HUB_ANCHOR_WEIGHT * anchor_rank
+        # ROUTING — objective(H) = mean over a weighted OD-pair sample
+        # of the cheapest A->B journey using the direct ride, ONE hub,
+        # or TWO hubs from H — D[A,h1]+T+D[h1,h2]+T+D[h2,B] — where
+        # D[X,Y] is the fastest ONE-SEAT ride X->Y (single trip, no
+        # change; BIG when none). A hub is credited for a pair only
+        # when one train reaches it and a DIFFERENT train continues the
+        # journey — a through-junction that cannot one-seat-reach the
+        # next leg earns nothing. No train classification.
+        # ANCHOR — anchor_score(station) = sum, over EACH AND EVERY
+        # connection calling at the station (every trip stopping there
+        # before its terminus, NOT collapsed to distinct termini), of
+        # the great-circle distance from the station to that trip's
+        # terminus, weighted by the trip's operating-day count (mirrors
+        # the existing station_hub_scores calendar normalisation). A
+        # train 5 min from terminating contributes only 5 min of
+        # distance; a station originating many trains to far termini
+        # scores high. No LD/regional label. The greedy STOPS on the
+        # routing objective's marginal gain, so the count is derived,
+        # not picked. Candidate pool = served stations that can be a
+        # real interchange; the structural hub_score heuristic is
+        # untouched and still drives map-label placement only.
+        OPTIMAL_HUB_MIN = 8                  # stopping-rule guard: never fewer
+        OPTIMAL_HUB_MAX = 40                 # ...nor more (also caps the profiled-CSA grid)
+        OPTIMAL_HUB_STOP_EPS = 0.005         # stop when a hub improves the network-mean
+                                             # single-best-hub-detour journey time by
+                                             # < 0.5% of the one-hub baseline
+        OPTIMAL_HUB_OD_SAMPLE = 6000         # OD-pair sample size for the objective
+        OPTIMAL_HUB_OD_SEED = 20260514       # fixed RNG seed — deterministic selection
+        OPTIMAL_HUB_ANCHOR_WEIGHT = 1.0      # μ — co-equal weight of the terminus-
+                                             # distance anchor rank vs the routing rank
+                                             # (both on the same [1,n] scale; 1.0 = truly
+                                             # co-equal)
 
         # Sentinel `via_trip` on CSA seed rows ("first boarding from the
         # journey origin charges no transfer time"; also the
@@ -647,6 +689,241 @@ def _(Path, os, textwrap):
                         "coords": coords,
                     })
             return journeys
+
+
+        def _build_conns(db_path):
+            """Build the union-timetable integer connection table + the
+            station catalogue + transfer table — the shared input to
+            every CSA pass. Returns
+            (conns_df, station_ids, stations, transfer_i, collect_fn):
+
+              * conns_df   — (trip, from_st, to_st, dep, arr_c), full-day
+                (no departure-time window: the profiled CSA needs the
+                whole service day; forward/backward passes naturally
+                ignore out-of-window connections).
+              * station_ids — (station_feature_id, st) integer node map.
+              * stations   — per-station catalogue (feature_id, name,
+                lon, lat).
+              * transfer_i — (from_st, transfer_s) from transfers.txt.
+              * collect_fn — the GPU-with-CPU-fallback polars collector.
+
+            The `origins` (hub) selection is deliberately NOT built here
+            — it is the one caller-specific input: compute_optimal_hubs
+            picks from every served station, compute_chrono_isochrones
+            reads the route-optimised set. R3: both callers share this
+            connection-table build instead of duplicating the SQL.
+            """
+            import duckdb
+            import polars as pl
+
+            # ---- GPU engine probe (once) ----------------------------
+            try:
+                pl.LazyFrame({"_p": [1]}).select(
+                    pl.col("_p").sum()
+                ).collect(engine="gpu")
+                _engine = "gpu"
+            except Exception as _exc:  # noqa: BLE001
+                _engine = "cpu"
+                print(
+                    "[_build_conns] GPU engine unavailable "
+                    f"({_exc!r}) - falling back to CPU"
+                )
+            print(f"[_build_conns] polars engine={_engine}")
+
+            def _collect(lf):
+                # GPU collect with a per-call CPU fallback — one
+                # iteration failing over must not abort the run.
+                if _engine == "gpu":
+                    try:
+                        return lf.collect(engine="gpu")
+                    except Exception:  # noqa: BLE001
+                        return lf.collect()
+                return lf.collect()
+
+            def _to_seconds(df, src, dst):
+                # Normalise a GTFS clock field to seconds-after-
+                # midnight, branching on dtype:
+                #   * Utf8  -> "H:MM:SS" string (may exceed 24h for
+                #     overnight services) -> parse to seconds.
+                #   * numeric -> gtfs_parquet hands GTFS times over as
+                #     integer MILLISECONDS after midnight (verified
+                #     against the at_Railway feed: 43800000 = 12:10:00,
+                #     2220000 = 00:37:00) -> scale down by 1000.
+                if df[src].dtype == pl.Utf8:
+                    _parts = pl.col(src).str.split(":")
+                    return df.with_columns(
+                        (
+                            _parts.list.get(0, null_on_oob=True)
+                            .cast(pl.Int64, strict=False).fill_null(0)
+                            * 3600
+                            + _parts.list.get(1, null_on_oob=True)
+                            .cast(pl.Int64, strict=False).fill_null(0)
+                            * 60
+                            + _parts.list.get(2, null_on_oob=True)
+                            .cast(pl.Int64, strict=False).fill_null(0)
+                        ).alias(dst)
+                    )
+                return df.with_columns(
+                    (pl.col(src).cast(pl.Int64) // 1000).alias(dst)
+                )
+
+            # ---- Pull the real timetable from DuckDB (read-only) ----
+            con = duckdb.connect(db_path, read_only=True)
+
+            # UNION TIMETABLE: connections are built from EVERY trip
+            # the feed ships, across all service_ids — NOT one
+            # reference service day. A single busiest-service_id
+            # snapshot left ~half the stations unreachable (weekend-
+            # only / seasonal / specific-date services were excluded);
+            # clicking those in the route builder returned "no route
+            # found". The union is the composite-day model: a station
+            # served on ANY service pattern is routable. Documented
+            # approximation: the CSA may chain two trips whose service
+            # patterns never coincide on a real calendar date — an
+            # accepted trade-off for full-network reachability, shared
+            # by the chronomap, fastest-connections and route-builder
+            # maps. Still format-agnostic — no calendar-date parsing —
+            # and deterministic.
+
+            # Consecutive stop_times pairs per trip -> connections,
+            # rolled up stop -> station_feature_id. Clock fields are
+            # pulled raw (parsed in polars by _to_seconds).
+            conns = con.sql("""
+                WITH svc_trips AS (
+                    SELECT trip_id FROM gtfs.trips
+                ),
+                seq AS (
+                    SELECT
+                        st.trip_id,
+                        st.stop_id,
+                        st.departure_time             AS dep_raw,
+                        LEAD(st.stop_id)      OVER w   AS next_stop_id,
+                        LEAD(st.arrival_time) OVER w   AS arr_raw
+                    FROM gtfs.stop_times st
+                    JOIN svc_trips USING (trip_id)
+                    WINDOW w AS (
+                        PARTITION BY st.trip_id
+                        ORDER BY st.stop_sequence
+                    )
+                )
+                SELECT
+                    s.trip_id,
+                    sm_from.station_feature_id AS from_station,
+                    sm_to.station_feature_id   AS to_station,
+                    s.dep_raw,
+                    s.arr_raw
+                FROM seq s
+                JOIN transit.station_members sm_from
+                  ON sm_from.stop_id = s.stop_id
+                JOIN transit.station_members sm_to
+                  ON sm_to.stop_id = s.next_stop_id
+                WHERE s.next_stop_id IS NOT NULL
+                  AND sm_from.station_feature_id IS NOT NULL
+                  AND sm_to.station_feature_id IS NOT NULL
+                  AND sm_from.station_feature_id
+                      <> sm_to.station_feature_id
+            """).pl()
+
+            # Station catalogue (one row per parent station).
+            stations = con.sql("""
+                SELECT
+                    station_feature_id,
+                    any_value(station_name) AS station_name,
+                    any_value(station_lon)  AS station_lon,
+                    any_value(station_lat)  AS station_lat
+                FROM transit.station_members
+                WHERE station_feature_id IS NOT NULL
+                GROUP BY station_feature_id
+            """).pl()
+
+            # Real transfer times from transfers.txt when the feed
+            # shipped one (same-station entries, rolled to station
+            # level); otherwise CHRONO_DEFAULT_TRANSFER_S downstream.
+            _has_transfers = con.sql(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema = 'gtfs' "
+                "AND table_name = 'transfers'"
+            ).fetchone()[0] > 0
+            if _has_transfers:
+                transfers = con.sql("""
+                    SELECT
+                        sm_f.station_feature_id AS station_feature_id,
+                        min(TRY_CAST(tr.min_transfer_time AS BIGINT))
+                            AS transfer_s
+                    FROM gtfs.transfers tr
+                    JOIN transit.station_members sm_f
+                      ON sm_f.stop_id = tr.from_stop_id
+                    JOIN transit.station_members sm_t
+                      ON sm_t.stop_id = tr.to_stop_id
+                    WHERE sm_f.station_feature_id
+                          = sm_t.station_feature_id
+                      AND tr.min_transfer_time IS NOT NULL
+                    GROUP BY sm_f.station_feature_id
+                """).pl()
+            else:
+                transfers = pl.DataFrame(
+                    schema={
+                        "station_feature_id": pl.Utf8,
+                        "transfer_s": pl.Int64,
+                    }
+                )
+            con.close()
+            print(
+                "[_build_conns] connections="
+                f"{conns.height}, stations={stations.height}, "
+                f"transfers.txt={'yes' if _has_transfers else 'no'}"
+            )
+
+            # ---- Parse clock fields + assign integer node ids -------
+            conns = conns.filter(
+                pl.col("dep_raw").is_not_null()
+                & pl.col("arr_raw").is_not_null()
+            )
+            if conns["dep_raw"].dtype == pl.Utf8:
+                conns = conns.filter(
+                    (pl.col("dep_raw").str.len_chars() > 0)
+                    & (pl.col("arr_raw").str.len_chars() > 0)
+                )
+            conns = _to_seconds(conns, "dep_raw", "dep")
+            conns = _to_seconds(conns, "arr_raw", "arr_c")
+            conns = conns.filter(pl.col("arr_c") >= pl.col("dep"))
+
+            station_ids = stations.select(
+                "station_feature_id"
+            ).with_row_index("st")
+            trip_ids = conns.select(
+                "trip_id"
+            ).unique().with_row_index("trip")
+
+            conns_df = (
+                conns
+                .join(
+                    station_ids.rename({
+                        "station_feature_id": "from_station",
+                        "st": "from_st",
+                    }),
+                    on="from_station",
+                )
+                .join(
+                    station_ids.rename({
+                        "station_feature_id": "to_station",
+                        "st": "to_st",
+                    }),
+                    on="to_station",
+                )
+                .join(trip_ids, on="trip_id")
+                .select("trip", "from_st", "to_st", "dep", "arr_c")
+            )
+
+            transfer_i = (
+                transfers
+                .join(station_ids, on="station_feature_id")
+                .select(
+                    pl.col("st").alias("from_st"),
+                    pl.col("transfer_s").cast(pl.Int64),
+                )
+            )
+            return conns_df, station_ids, stations, transfer_i, _collect
 
 
         @dag(
@@ -1777,6 +2054,580 @@ def _(Path, os, textwrap):
                 return str(out)
 
             @task
+            def compute_optimal_hubs(db_path: str) -> str:
+                # Hub-and-spoke transfer-hub selection.
+                #
+                # A "hub" is a station where you ACTUALLY change trains:
+                # travelling Innsbruck -> Budapest you switch at Wien
+                # Hbf, NOT at Wien Meidling — because no single train
+                # runs Meidling -> Budapest, while Wien Hbf is one-seat-
+                # reachable from Innsbruck AND one-seat-reaches Budapest.
+                # Each station is scored on two CO-EQUAL factors:
+                #
+                # ROUTING — D[X,Y] is the fastest ONE-SEAT ride X -> Y
+                # (a single trip, no train change; BIG when none).
+                #   objective(H) = mean over a weighted OD-pair sample of
+                #     min( D[A,B],                              direct,
+                #          min h in H   D[A,h]+T+D[h,B],     1 transfer,
+                #          min h1,h2 in H
+                #              D[A,h1]+T+D[h1,h2]+T+D[h2,B]   2 transfers)
+                # A pair with a direct train needs no hub; a hub is
+                # credited for a pair ONLY when one train reaches it
+                # from A and a DIFFERENT train continues toward B. A
+                # through-junction that cannot one-seat-reach the next
+                # leg earns nothing for that pair — the multi-hop CSA
+                # would have wrongly credited it (it can ride on to the
+                # real interchange and change there). The two-hub term
+                # covers journeys that need a change at each of two
+                # hubs. No train classification.
+                #
+                # ANCHOR — anchor_score(station) = sum, over EACH AND
+                # EVERY connection calling at the station (every trip
+                # that stops there before its own terminus — NOT
+                # collapsed to distinct termini), of the great-circle
+                # distance from the station to that trip's terminus,
+                # weighted by the trip's operating-day count. Following
+                # the existing transit.station_hub_scores algorithm,
+                # calendar.txt + calendar_dates are expanded to an
+                # operating-day count so the all-days union feed does
+                # not just measure its own date span. A train 5 min from
+                # terminating contributes only that short distance; a
+                # station that originates many trains to far termini
+                # scores high. No LD/regional label.
+                #
+                # Each greedy step ranks the live candidates by routing
+                # (ascending objective) and by anchor_score (descending),
+                # both on the same [1, n_live] scale, and picks argmin of
+                #   routing_rank + OPTIMAL_HUB_ANCHOR_WEIGHT*anchor_rank
+                # — a genuinely CO-EQUAL pick. The greedy STOPS on the
+                # raw routing objective's marginal gain (< STOP_EPS of
+                # the one-hub baseline, or non-positive, or
+                # OPTIMAL_HUB_MAX); never below OPTIMAL_HUB_MIN — so the
+                # count is derived, not picked.
+                #
+                # Candidate pool = served stations that can actually be
+                # an interchange (one-seat-reachable from >= 2 stations
+                # and one-seat-reaching >= 2). Deterministic: fixed RNG
+                # seed for the OD sample; ties broken by
+                # station_feature_id.
+                #
+                # Reads austria.duckdb READ-ONLY (via _build_conns, the
+                # one-seat-ride query and the anchor query), then opens
+                # it READ-WRITE to persist transit.optimal_hubs —
+                # ordered after the match_* writers (R4 — see the DAG
+                # wiring).
+                import math
+                import duckdb
+                import numpy as np
+                import polars as pl
+
+                TILES_WORK.mkdir(parents=True, exist_ok=True)
+                out = TILES_WORK / "austria-optimal-hubs.parquet"
+                if not _needs_regen(out):
+                    return str(out)
+
+                # Shared station catalogue + integer node map (R3).
+                # Only the catalogue / served-set / dep-count outputs
+                # are used here — the hub-selection routing oracle is
+                # the one-seat-ride matrix D below, NOT the multi-hop
+                # CSA the chronomap / route-builder passes run.
+                conns_df, station_ids, stations, _transfer_i, _collect = (
+                    _build_conns(db_path)
+                )
+                n_st = station_ids.height
+                BIG = max(CHRONO_BANDS_H) * 3600 * 2          # 24 h sentinel
+                sfid_by_st = dict(zip(
+                    station_ids["st"].to_list(),
+                    station_ids["station_feature_id"].to_list(),
+                ))
+
+                served = sorted(
+                    set(conns_df["from_st"].to_list())
+                    | set(conns_df["to_st"].to_list())
+                )
+                if not served:
+                    raise RuntimeError(
+                        "compute_optimal_hubs: empty connection table"
+                    )
+                dep_counts = dict(
+                    conns_df.group_by("from_st").len().iter_rows()
+                )
+
+                # ---- D: one-seat-ride (no-transfer) oracle ------------
+                # D[X,Y] = fastest single-trip ride X -> Y with NO train
+                # change — the time to ride from X to Y on ONE train
+                # that calls at X before Y. BIG when no single trip
+                # links them. This is THE hub-and-spoke primitive: a
+                # station h is a real interchange for an A->B journey
+                # ONLY when one train runs A->h (one seat) AND a
+                # DIFFERENT train runs h->B (one seat). The multi-hop
+                # CSA travel time would wrongly credit a through-
+                # junction (Wien Meidling) for an interchange that
+                # physically happens elsewhere (Wien Hbf) — because the
+                # CSA can ride Meidling->Wien Hbf and change THERE. D
+                # cannot: no single train runs Meidling->Budapest, so
+                # Meidling is not a valid hub for Innsbruck->Budapest;
+                # Wien Hbf is. Built directly from stop_times: per trip,
+                # every (earlier-stop, later-stop) station pair; min
+                # ride time across all trips. Rail only (route_type=2).
+                _con = duckdb.connect(db_path, read_only=True)
+                _ride = _con.sql("""
+                    WITH ride_stops AS (
+                        SELECT st.trip_id,
+                               sm.station_feature_id      AS sfid,
+                               st.stop_sequence           AS seq,
+                               st.departure_time / 1000.0 AS dep_s,
+                               st.arrival_time   / 1000.0 AS arr_s
+                        FROM gtfs.stop_times st
+                        JOIN gtfs.trips t  USING (trip_id)
+                        JOIN gtfs.routes r USING (route_id)
+                        JOIN transit.station_members sm
+                          ON sm.stop_id = st.stop_id
+                        WHERE r.route_type = 2
+                          AND st.departure_time IS NOT NULL
+                          AND st.arrival_time   IS NOT NULL
+                          AND st.stop_sequence  IS NOT NULL
+                          AND sm.station_feature_id IS NOT NULL
+                    )
+                    SELECT a.sfid                  AS from_sfid,
+                           b.sfid                  AS to_sfid,
+                           min(b.arr_s - a.dep_s)  AS ride_s
+                    FROM ride_stops a
+                    JOIN ride_stops b
+                      ON a.trip_id = b.trip_id AND a.seq < b.seq
+                    WHERE a.sfid <> b.sfid
+                      AND b.arr_s >= a.dep_s
+                    GROUP BY a.sfid, b.sfid
+                """).pl()
+                _con.close()
+                _ride = (
+                    _ride
+                    .join(
+                        station_ids.rename({
+                            "station_feature_id": "from_sfid",
+                            "st": "from_st",
+                        }),
+                        on="from_sfid",
+                    )
+                    .join(
+                        station_ids.rename({
+                            "station_feature_id": "to_sfid",
+                            "st": "to_st",
+                        }),
+                        on="to_sfid",
+                    )
+                )
+                D = np.full((n_st, n_st), BIG, dtype=np.int64)
+                D[
+                    _ride["from_st"].to_numpy(),
+                    _ride["to_st"].to_numpy(),
+                ] = np.clip(
+                    _ride["ride_s"].to_numpy().astype(np.int64), 0, BIG
+                )
+                np.fill_diagonal(D, 0)
+
+                # Candidate pool = served stations that can ACTUALLY be
+                # an interchange — reachable by a one-seat ride from
+                # >= 2 other stations AND able to reach >= 2 others, so
+                # an A->h->B decomposition through them can exist.
+                _srv0 = np.array(served, dtype=np.int64)
+                _sub = D[np.ix_(_srv0, _srv0)] < BIG
+                _outdeg = _sub.sum(axis=1) - 1    # one-seat rides FROM h
+                _indeg = _sub.sum(axis=0) - 1     # one-seat rides TO h
+                _ok = (_outdeg >= 2) & (_indeg >= 2)
+                cand_arr = _srv0[_ok]
+                n_excluded = int((~_ok).sum())
+                if len(cand_arr) < OPTIMAL_HUB_MIN:
+                    raise RuntimeError(
+                        "compute_optimal_hubs: only "
+                        f"{len(cand_arr)} hub candidates "
+                        f"(need >= {OPTIMAL_HUB_MIN})"
+                    )
+                n_cand = len(cand_arr)
+
+                # ---- Anchor score: terminus distance per connection ---
+                # anchor_score(S) = sum, over EACH AND EVERY connection
+                # calling at S (every trip that stops at S before its
+                # own terminus — NOT collapsed to distinct termini), of
+                # the great-circle distance from S to that trip's
+                # terminus, weighted by the trip's operating-day count.
+                # A train 5 min from terminating contributes only that
+                # short distance; a station that originates many trains
+                # to far-flung termini scores high. Following the
+                # existing transit.station_hub_scores algorithm: the
+                # all-days union feed counts every trip across all
+                # service days, so a raw connection count just measures
+                # the feed's date span — calendar.txt + calendar_dates
+                # are expanded to an operating-day count per service_id
+                # and each connection is weighted by it (svc_days),
+                # exactly as station_hub_scores derives its
+                # weighted_departures. Rail only (route_type = 2 — not
+                # the SV* replacement buses).
+                _con = duckdb.connect(db_path, read_only=True)
+                _anchor = _con.sql("""
+                    WITH cal_days AS (
+                        -- calendar.txt: (service_id, date) the weekly
+                        -- pattern is active over its date range.
+                        SELECT c.service_id, gs.d::DATE AS service_date
+                        FROM gtfs.calendar c,
+                             generate_series(
+                                 c.start_date::TIMESTAMP,
+                                 c.end_date::TIMESTAMP,
+                                 INTERVAL '1 day') AS gs(d)
+                        WHERE [c.sunday, c.monday, c.tuesday,
+                               c.wednesday, c.thursday, c.friday,
+                               c.saturday]
+                              [dayofweek(gs.d::DATE) + 1] = 1
+                    ),
+                    service_dates AS (
+                        -- apply calendar_dates.txt exceptions
+                        -- (1 = added, 2 = removed).
+                        (SELECT service_id, service_date FROM cal_days
+                         EXCEPT
+                         SELECT service_id, date
+                         FROM gtfs.calendar_dates
+                         WHERE exception_type = 2)
+                        UNION
+                        (SELECT service_id, date
+                         FROM gtfs.calendar_dates
+                         WHERE exception_type = 1)
+                    ),
+                    service_day_count AS (
+                        SELECT service_id,
+                               count(DISTINCT service_date) AS n_days
+                        FROM service_dates
+                        GROUP BY service_id
+                    ),
+                    trip_svc AS (
+                        SELECT t.trip_id,
+                               COALESCE(sdc.n_days, 1) AS svc_days
+                        FROM gtfs.trips t
+                        LEFT JOIN service_day_count sdc
+                          USING (service_id)
+                    ),
+                    trip_ends AS (
+                        SELECT trip_id,
+                               arg_max(stop_id, stop_sequence)
+                                   AS last_stop,
+                               max(stop_sequence) AS max_seq
+                        FROM gtfs.stop_times
+                        WHERE stop_sequence IS NOT NULL
+                        GROUP BY trip_id
+                    ),
+                    conn_calls AS (
+                        -- ONE row per (trip, station-call before that
+                        -- trip's terminus) — every connection, NOT
+                        -- collapsed to distinct termini.
+                        SELECT sm_s.station_feature_id AS s_sfid,
+                               sm_e.station_feature_id AS e_sfid,
+                               ts.svc_days
+                        FROM gtfs.stop_times st
+                        JOIN trip_ends te USING (trip_id)
+                        JOIN trip_svc ts USING (trip_id)
+                        JOIN gtfs.trips t USING (trip_id)
+                        JOIN gtfs.routes r USING (route_id)
+                        JOIN transit.station_members sm_s
+                          ON sm_s.stop_id = st.stop_id
+                        JOIN transit.station_members sm_e
+                          ON sm_e.stop_id = te.last_stop
+                        WHERE r.route_type = 2
+                          AND st.stop_sequence < te.max_seq
+                          AND sm_s.station_feature_id
+                              <> sm_e.station_feature_id
+                    ),
+                    st_xy AS (
+                        SELECT station_feature_id,
+                               any_value(station_lat) AS lat,
+                               any_value(station_lon) AS lon
+                        FROM transit.station_members
+                        WHERE station_feature_id IS NOT NULL
+                        GROUP BY station_feature_id
+                    ),
+                    dist AS (
+                        -- equirectangular S->terminus distance (km);
+                        -- a relative weight, exact haversine not needed
+                        SELECT cc.s_sfid, cc.e_sfid, cc.svc_days,
+                               111.0 * sqrt(
+                                   power(xe.lat - xs.lat, 2)
+                                   + power((xe.lon - xs.lon)
+                                       * cos(radians(
+                                           (xs.lat + xe.lat) / 2)), 2)
+                               ) AS km
+                        FROM conn_calls cc
+                        JOIN st_xy xs
+                          ON xs.station_feature_id = cc.s_sfid
+                        JOIN st_xy xe
+                          ON xe.station_feature_id = cc.e_sfid
+                    )
+                    SELECT s_sfid                 AS station_feature_id,
+                           sum(km * svc_days)     AS anchor_score,
+                           count(*)               AS n_calls,
+                           count(DISTINCT e_sfid) AS n_termini_reached,
+                           round(max(km), 1)      AS max_terminus_km
+                    FROM dist
+                    GROUP BY s_sfid
+                """).pl()
+                _con.close()
+                _anch = {
+                    r["station_feature_id"]: (
+                        float(r["anchor_score"]),
+                        int(r["n_calls"]),
+                        int(r["n_termini_reached"]),
+                        float(r["max_terminus_km"]))
+                    for r in _anchor.iter_rows(named=True)
+                }
+                _ZERO_ANCH = (0.0, 0, 0, 0.0)
+                anchor_score = np.array(
+                    [_anch.get(sfid_by_st[int(c)], _ZERO_ANCH)[0]
+                     for c in cand_arr], dtype=np.float64)
+                n_calls = np.array(
+                    [_anch.get(sfid_by_st[int(c)], _ZERO_ANCH)[1]
+                     for c in cand_arr], dtype=np.float64)
+                n_termini_reached = np.array(
+                    [_anch.get(sfid_by_st[int(c)], _ZERO_ANCH)[2]
+                     for c in cand_arr], dtype=np.float64)
+                max_terminus_km = np.array(
+                    [_anch.get(sfid_by_st[int(c)], _ZERO_ANCH)[3]
+                     for c in cand_arr], dtype=np.float64)
+
+                # ---- Weighted OD-pair sample (deterministic) ----------
+                # Endpoints drawn proportional to departure count,
+                # clipped at the 95th percentile so one busy station
+                # can't dominate — this weights JOURNEYS, not hubs.
+                rng = np.random.default_rng(OPTIMAL_HUB_OD_SEED)
+                _srv = np.array(served, dtype=np.int64)
+                _w = np.array(
+                    [max(dep_counts.get(int(s), 0), 1) for s in served],
+                    dtype=np.float64)
+                _w = np.minimum(_w, np.quantile(_w, 0.95))
+                _w = _w / _w.sum()
+                M = min(OPTIMAL_HUB_OD_SAMPLE, len(served) * len(served))
+                A_m = _srv[rng.choice(len(served), M, p=_w)]
+                B_m = _srv[rng.choice(len(served), M, p=_w)]
+
+                # One-seat-ride oracle slices for the OD sample +
+                # candidates:
+                #   DA[m,c]   = D[A_m, cand_c]   one-seat ride A -> hub c
+                #   DB[m,c]   = D[cand_c, B_m]   one-seat ride hub c -> B
+                #   D_cc[i,j] = D[cand_i,cand_j] one-seat ride hub -> hub
+                # best_cost is seeded with the DIRECT one-seat ride
+                # D[A,B] — a pair already served by a single train
+                # needs no hub; hubs are credited only where a transfer
+                # is genuinely required.
+                DA = D[np.ix_(A_m, cand_arr)].astype(np.float64)
+                DB = D[np.ix_(cand_arr, B_m)].T.astype(np.float64)
+                D_cc = D[np.ix_(cand_arr, cand_arr)].astype(np.float64)
+                TRANSFER = float(CHRONO_DEFAULT_TRANSFER_S)
+
+                # ---- Greedy: ONE- or TWO-interchange hub-and-spoke -----
+                # A journey A->B may ride A->h1, change, h1->h2, change,
+                # h2->B — up to TWO transfers, both at hubs in H. The
+                # incremental machinery keeps, per OD-sample row m and
+                # candidate c:
+                #   viaA[m,c] = min over h1 in H of
+                #               D[A_m,h1] + TRANSFER + D[h1,c]
+                #               — cheapest "A to c, one transfer at an
+                #                 existing hub" (c would be the 2nd hub)
+                #   viaB[m,c] = min over h2 in H of
+                #               D[c,h2] + TRANSFER + D[h2,B_m]
+                #               — cheapest "c to B, one transfer at an
+                #                 existing hub" (c would be the 1st hub)
+                # Both start at BIG (H empty) and are refreshed with one
+                # vectorised np.minimum against the committed pick.
+                best_cost = D[A_m, B_m].astype(np.float64)
+                viaA = np.full((M, n_cand), float(BIG))
+                viaB = np.full((M, n_cand), float(BIG))
+                in_H = np.zeros(n_cand, dtype=bool)
+                H_ci, rows = [], []
+                obj_one = None
+                prev_obj = None
+                while len(H_ci) < OPTIMAL_HUB_MAX and len(H_ci) < n_cand:
+                    k = len(H_ci) + 1
+                    # journey cost if candidate c is added — the best of
+                    #   current best_cost (direct ride / hubs in H),
+                    #   A -> c -> B          (c the only interchange),
+                    #   A ->[h1]-> c -> B    (c the 2nd of two hubs),
+                    #   A -> c ->[h2]-> B    (c the 1st of two hubs).
+                    # A through-junction that cannot one-seat-reach the
+                    # next leg contributes ...+BIG and is never the min,
+                    # so it earns no credit for that pair. Chained
+                    # np.minimum so best_cost[:, None] (M, 1) broadcasts
+                    # against the (M, n_cand) terms.
+                    cand_cost = np.minimum(
+                        best_cost[:, None], DA + TRANSFER + DB)
+                    cand_cost = np.minimum(
+                        cand_cost, viaA + TRANSFER + DB)
+                    cand_cost = np.minimum(
+                        cand_cost, DA + TRANSFER + viaB)
+                    # objective: mean journey cost over the OD sample,
+                    # capped at BIG (monotone non-increasing as hubs
+                    # are added).
+                    obj = np.minimum(cand_cost, BIG).mean(axis=0)
+                    obj[in_H] = np.inf
+                    # CO-EQUAL rank-based pick. Among the live
+                    # candidates, rank each by routing (ascending
+                    # objective — 1 = best routing this step) and by
+                    # anchor_score (descending — 1 = farthest-reaching).
+                    # Both ranks share the same [1, n_live] scale, so
+                    #   routing_rank + OPTIMAL_HUB_ANCHOR_WEIGHT
+                    #                  * anchor_rank   (minimise)
+                    # is genuinely co-equal — a candidate wins by being
+                    # good on BOTH axes. A small routing edge cannot
+                    # override a large anchor gap, so a station whose
+                    # trains barely travel cannot beat one whose trains
+                    # reach far termini.
+                    _live_idx = np.flatnonzero(~in_H)
+                    routing_rank = np.full(n_cand, np.inf)
+                    _ord_r = _live_idx[np.argsort(
+                        obj[_live_idx], kind="stable")]
+                    routing_rank[_ord_r] = np.arange(
+                        1, len(_ord_r) + 1, dtype=np.float64)
+                    anchor_rank = np.full(n_cand, np.inf)
+                    _ord_a = _live_idx[np.argsort(
+                        -anchor_score[_live_idx], kind="stable")]
+                    anchor_rank[_ord_a] = np.arange(
+                        1, len(_ord_a) + 1, dtype=np.float64)
+                    score = (routing_rank
+                             + OPTIMAL_HUB_ANCHOR_WEIGHT * anchor_rank)
+                    score[in_H] = np.inf
+                    _smin = float(score.min())
+                    ties = np.flatnonzero(score <= _smin + 1e-9)
+                    pick = int(min(
+                        ties, key=lambda i: sfid_by_st[int(cand_arr[i])]
+                    ))
+                    best_obj = float(obj[pick])
+                    if obj_one is None:
+                        obj_one = best_obj
+                    marginal = (prev_obj - best_obj
+                                if prev_obj is not None else best_obj)
+                    rel = marginal / obj_one if obj_one else 1.0
+                    # stopping rule keys on the ROUTING objective — once
+                    # we hold >= MIN hubs, stop WITHOUT adding a hub that
+                    # barely improves routing.
+                    if len(H_ci) >= OPTIMAL_HUB_MIN and (
+                            marginal <= 0 or rel < OPTIMAL_HUB_STOP_EPS):
+                        break
+                    # commit `pick` — refresh best_cost + the two via*
+                    # helpers so the next step sees `pick` as an
+                    # available intermediate hub.
+                    in_H[pick] = True
+                    H_ci.append(pick)
+                    best_cost = cand_cost[:, pick]
+                    viaA = np.minimum(
+                        viaA,
+                        DA[:, pick:pick + 1] + TRANSFER
+                        + D_cc[pick][None, :])
+                    viaB = np.minimum(
+                        viaB,
+                        D_cc[:, pick][None, :] + TRANSFER
+                        + DB[:, pick:pick + 1])
+                    rows.append({
+                        "station_feature_id": sfid_by_st[
+                            int(cand_arr[pick])],
+                        "selection_order": k,
+                        "marginal_gain": marginal,
+                        "cumulative_objective": best_obj,
+                        "rel_gain": rel,
+                        "hubcost_mean": best_obj,
+                        "anchor_score": float(anchor_score[pick]),
+                        "n_calls": int(n_calls[pick]),
+                        "n_termini_reached": int(n_termini_reached[pick]),
+                        "max_terminus_km": float(max_terminus_km[pick]),
+                    })
+                    prev_obj = best_obj
+
+                hub_df = pl.DataFrame(
+                    rows,
+                    schema={
+                        "station_feature_id": pl.Utf8,
+                        "selection_order": pl.Int64,
+                        "marginal_gain": pl.Float64,
+                        "cumulative_objective": pl.Float64,
+                        "rel_gain": pl.Float64,
+                        "hubcost_mean": pl.Float64,
+                        "anchor_score": pl.Float64,
+                        "n_calls": pl.Int64,
+                        "n_termini_reached": pl.Int64,
+                        "max_terminus_km": pl.Float64,
+                    },
+                )
+                hub_df.write_parquet(out)
+
+                # Persist as transit.optimal_hubs (read-write — ordered
+                # after the match_* writers) + the "did the route-
+                # optimisation pick hubs the structural heuristic would
+                # have missed?" diagnostic.
+                con = duckdb.connect(db_path)
+                con.sql("CREATE SCHEMA IF NOT EXISTS transit")
+                con.sql(
+                    "CREATE OR REPLACE TABLE transit.optimal_hubs AS "
+                    f"SELECT * FROM read_parquet('{out}')"
+                )
+                _missed = con.sql("""
+                    SELECT count(*) FROM transit.optimal_hubs oh
+                    LEFT JOIN transit.station_hub_scores hs
+                      USING (station_feature_id)
+                    WHERE hs.hub_rank IS NULL OR hs.hub_rank > 25
+                """).fetchone()[0]
+                con.close()
+
+                # ---- Diagnostics --------------------------------------
+                _n_unconn = int((best_cost >= BIG).sum())
+                _xy = {
+                    rr["station_feature_id"]: (rr["station_lon"],
+                                               rr["station_lat"])
+                    for rr in stations.iter_rows(named=True)
+                }
+
+                def _haversine_km(a, b):
+                    lo1, la1 = _xy[a]
+                    lo2, la2 = _xy[b]
+                    p1, p2 = math.radians(la1), math.radians(la2)
+                    dp = math.radians(la2 - la1)
+                    dl = math.radians(lo2 - lo1)
+                    h = (math.sin(dp / 2) ** 2 + math.cos(p1)
+                         * math.cos(p2) * math.sin(dl / 2) ** 2)
+                    return 2 * 6371.0 * math.asin(math.sqrt(h))
+
+                _sf = [rr["station_feature_id"] for rr in rows]
+                _min_pair_km = min(
+                    (_haversine_km(_sf[i], _sf[j])
+                     for i in range(len(_sf))
+                     for j in range(i + 1, len(_sf))),
+                    default=0.0,
+                )
+                _sel_anchor = np.array([rr["anchor_score"] for rr in rows])
+                print(
+                    "[compute_optimal_hubs] candidate pool="
+                    f"{n_cand} served stations "
+                    f"({n_excluded} isolated excluded); "
+                    f"OD sample={M} pairs"
+                )
+                for rr in rows:
+                    print(
+                        f"[compute_optimal_hubs]   #{rr['selection_order']:2d}"
+                        f" {rr['station_feature_id']:24s}"
+                        f" obj={rr['cumulative_objective'] / 60.0:7.2f}min"
+                        f" delta={rr['marginal_gain'] / 60.0:6.2f}min"
+                        f" rel={rr['rel_gain']:.4f}"
+                        f" anchor={rr['anchor_score'] / 1000.0:.0f}k"
+                        f" (calls={rr['n_calls']},"
+                        f" termini={rr['n_termini_reached']},"
+                        f" farthest={rr['max_terminus_km']:.0f}km)"
+                    )
+                print(
+                    "[compute_optimal_hubs] selected "
+                    f"{len(H_ci)} hubs (derived count); {_missed} of them "
+                    "rank >25 (or are absent) in the old structural "
+                    f"hub_score; {_n_unconn} OD pairs need >2 interchanges; "
+                    f"min pairwise hub distance={_min_pair_km:.1f} km; "
+                    f"mean anchor_score={_sel_anchor.mean() / 1000.0:.0f}k "
+                    "connection-km (candidate-pool mean="
+                    f"{float(anchor_score.mean()) / 1000.0:.0f}k)"
+                )
+                return str(out)
+
+            @task
             def compute_chrono_isochrones(db_path: str) -> str:
                 # Chronotrains-style per-station travel-time isochrones,
                 # computed from the REAL Austria railway timetable.
@@ -1811,222 +2662,29 @@ def _(Path, os, textwrap):
                 if not _needs_regen(out):
                     return str(out)
 
-                # ---- GPU engine probe (once) ----------------------------
-                try:
-                    pl.LazyFrame({"_p": [1]}).select(
-                        pl.col("_p").sum()
-                    ).collect(engine="gpu")
-                    _engine = "gpu"
-                except Exception as _exc:  # noqa: BLE001
-                    _engine = "cpu"
-                    print(
-                        "[compute_chrono_isochrones] GPU engine unavailable "
-                        f"({_exc!r}) - falling back to CPU"
-                    )
-                print(f"[compute_chrono_isochrones] polars engine={_engine}")
-
-                def _collect(lf):
-                    # GPU collect with a per-call CPU fallback — one
-                    # iteration failing over must not abort the run.
-                    if _engine == "gpu":
-                        try:
-                            return lf.collect(engine="gpu")
-                        except Exception:  # noqa: BLE001
-                            return lf.collect()
-                    return lf.collect()
-
-                def _to_seconds(df, src, dst):
-                    # Normalise a GTFS clock field to seconds-after-
-                    # midnight, branching on dtype:
-                    #   * Utf8  -> "H:MM:SS" string (may exceed 24h for
-                    #     overnight services) -> parse to seconds.
-                    #   * numeric -> gtfs_parquet hands GTFS times over as
-                    #     integer MILLISECONDS after midnight (verified
-                    #     against the at_Railway feed: 43800000 = 12:10:00,
-                    #     2220000 = 00:37:00) -> scale down by 1000.
-                    if df[src].dtype == pl.Utf8:
-                        _parts = pl.col(src).str.split(":")
-                        return df.with_columns(
-                            (
-                                _parts.list.get(0, null_on_oob=True)
-                                .cast(pl.Int64, strict=False).fill_null(0)
-                                * 3600
-                                + _parts.list.get(1, null_on_oob=True)
-                                .cast(pl.Int64, strict=False).fill_null(0)
-                                * 60
-                                + _parts.list.get(2, null_on_oob=True)
-                                .cast(pl.Int64, strict=False).fill_null(0)
-                            ).alias(dst)
-                        )
-                    return df.with_columns(
-                        (pl.col(src).cast(pl.Int64) // 1000).alias(dst)
-                    )
-
                 horizon = CHRONO_DEPART_S + max(CHRONO_BANDS_H) * 3600
 
-                # ---- Pull the real timetable from DuckDB (read-only) ----
-                con = duckdb.connect(db_path, read_only=True)
+                # Shared union-timetable connection-table build (R3 —
+                # the module-level _build_conns helper; the
+                # compute_optimal_hubs task uses the exact same build).
+                conns_df, station_ids, stations, transfer_i, _collect = (
+                    _build_conns(db_path)
+                )
 
-                # UNION TIMETABLE: connections are built from EVERY trip
-                # the feed ships, across all service_ids — NOT one
-                # reference service day. A single busiest-service_id
-                # snapshot left ~half the stations unreachable (weekend-
-                # only / seasonal / specific-date services were excluded);
-                # clicking those in the route builder returned "no route
-                # found". The union is the composite-day model: a station
-                # served on ANY service pattern is routable. Documented
-                # approximation: the CSA may chain two trips whose service
-                # patterns never coincide on a real calendar date — an
-                # accepted trade-off for full-network reachability, shared
-                # by the chronomap, fastest-connections and route-builder
-                # maps. Still format-agnostic — no calendar-date parsing —
-                # and deterministic.
-
-                # Consecutive stop_times pairs per trip -> connections,
-                # rolled up stop -> station_feature_id. Clock fields are
-                # pulled raw (parsed in polars by _to_seconds).
-                conns = con.sql("""
-                    WITH svc_trips AS (
-                        SELECT trip_id FROM gtfs.trips
-                    ),
-                    seq AS (
-                        SELECT
-                            st.trip_id,
-                            st.stop_id,
-                            st.departure_time             AS dep_raw,
-                            LEAD(st.stop_id)      OVER w   AS next_stop_id,
-                            LEAD(st.arrival_time) OVER w   AS arr_raw
-                        FROM gtfs.stop_times st
-                        JOIN svc_trips USING (trip_id)
-                        WINDOW w AS (
-                            PARTITION BY st.trip_id
-                            ORDER BY st.stop_sequence
-                        )
-                    )
-                    SELECT
-                        s.trip_id,
-                        sm_from.station_feature_id AS from_station,
-                        sm_to.station_feature_id   AS to_station,
-                        s.dep_raw,
-                        s.arr_raw
-                    FROM seq s
-                    JOIN transit.station_members sm_from
-                      ON sm_from.stop_id = s.stop_id
-                    JOIN transit.station_members sm_to
-                      ON sm_to.stop_id = s.next_stop_id
-                    WHERE s.next_stop_id IS NOT NULL
-                      AND sm_from.station_feature_id IS NOT NULL
-                      AND sm_to.station_feature_id IS NOT NULL
-                      AND sm_from.station_feature_id
-                          <> sm_to.station_feature_id
-                """).pl()
-
-                # Station catalogue (one row per parent station) +
-                # top-N origins by hub_rank.
-                stations = con.sql("""
-                    SELECT
-                        station_feature_id,
-                        any_value(station_name) AS station_name,
-                        any_value(station_lon)  AS station_lon,
-                        any_value(station_lat)  AS station_lat
-                    FROM transit.station_members
-                    WHERE station_feature_id IS NOT NULL
-                    GROUP BY station_feature_id
-                """).pl()
-                origins = con.sql(f"""
+                # Hub origins: the route-optimised transfer-hub set the
+                # compute_optimal_hubs task selected — a greedy over the
+                # one-seat-ride hub-and-spoke journey objective on REAL
+                # timetable rides, NOT a hardcoded top-N by the
+                # structural hub_score heuristic. Read via a short
+                # read-only connection of its own (the _build_conns
+                # connection has already closed).
+                _con = duckdb.connect(db_path, read_only=True)
+                origins = _con.sql("""
                     SELECT station_feature_id
-                    FROM transit.station_hub_scores
-                    ORDER BY hub_rank
-                    LIMIT {CHRONO_ORIGIN_COUNT}
+                    FROM transit.optimal_hubs
+                    ORDER BY selection_order
                 """).pl()
-
-                # Real transfer times from transfers.txt when the feed
-                # shipped one (same-station entries, rolled to station
-                # level); otherwise CHRONO_DEFAULT_TRANSFER_S.
-                _has_transfers = con.sql(
-                    "SELECT count(*) FROM information_schema.tables "
-                    "WHERE table_schema = 'gtfs' "
-                    "AND table_name = 'transfers'"
-                ).fetchone()[0] > 0
-                if _has_transfers:
-                    transfers = con.sql("""
-                        SELECT
-                            sm_f.station_feature_id AS station_feature_id,
-                            min(TRY_CAST(tr.min_transfer_time AS BIGINT))
-                                AS transfer_s
-                        FROM gtfs.transfers tr
-                        JOIN transit.station_members sm_f
-                          ON sm_f.stop_id = tr.from_stop_id
-                        JOIN transit.station_members sm_t
-                          ON sm_t.stop_id = tr.to_stop_id
-                        WHERE sm_f.station_feature_id
-                              = sm_t.station_feature_id
-                          AND tr.min_transfer_time IS NOT NULL
-                        GROUP BY sm_f.station_feature_id
-                    """).pl()
-                else:
-                    transfers = pl.DataFrame(
-                        schema={
-                            "station_feature_id": pl.Utf8,
-                            "transfer_s": pl.Int64,
-                        }
-                    )
-                con.close()
-                print(
-                    "[compute_chrono_isochrones] connections="
-                    f"{conns.height}, stations={stations.height}, "
-                    f"origins={origins.height}, "
-                    f"transfers.txt={'yes' if _has_transfers else 'no'}"
-                )
-
-                # ---- Parse clock fields + assign integer node ids -------
-                conns = conns.filter(
-                    pl.col("dep_raw").is_not_null()
-                    & pl.col("arr_raw").is_not_null()
-                )
-                if conns["dep_raw"].dtype == pl.Utf8:
-                    conns = conns.filter(
-                        (pl.col("dep_raw").str.len_chars() > 0)
-                        & (pl.col("arr_raw").str.len_chars() > 0)
-                    )
-                conns = _to_seconds(conns, "dep_raw", "dep")
-                conns = _to_seconds(conns, "arr_raw", "arr_c")
-                conns = conns.filter(pl.col("arr_c") >= pl.col("dep"))
-
-                station_ids = stations.select(
-                    "station_feature_id"
-                ).with_row_index("st")
-                trip_ids = conns.select(
-                    "trip_id"
-                ).unique().with_row_index("trip")
-
-                conns_df = (
-                    conns
-                    .join(
-                        station_ids.rename({
-                            "station_feature_id": "from_station",
-                            "st": "from_st",
-                        }),
-                        on="from_station",
-                    )
-                    .join(
-                        station_ids.rename({
-                            "station_feature_id": "to_station",
-                            "st": "to_st",
-                        }),
-                        on="to_station",
-                    )
-                    .join(trip_ids, on="trip_id")
-                    .select("trip", "from_st", "to_st", "dep", "arr_c")
-                )
-                # NOTE: conns_df is the FULL-DAY connection table (no
-                # departure-time window filter) — the profiled CSA needs
-                # the whole service day. The forward/backward passes
-                # naturally ignore out-of-window connections (a seed at
-                # 08:00 can't board a 07:00 departure; an arrival pruned
-                # at the horizon can't lead anywhere) so their results
-                # are unchanged vs. the old pre-filtered table.
-
+                _con.close()
                 origin_st = (
                     origins
                     .join(station_ids, on="station_feature_id")
@@ -2036,16 +2694,12 @@ def _(Path, os, textwrap):
                 if not origin_st:
                     raise RuntimeError(
                         "compute_chrono_isochrones: no origin stations "
-                        "resolved from transit.station_hub_scores"
+                        "resolved from transit.optimal_hubs — did the "
+                        "compute_optimal_hubs task run?"
                     )
-
-                transfer_i = (
-                    transfers
-                    .join(station_ids, on="station_feature_id")
-                    .select(
-                        pl.col("st").alias("from_st"),
-                        pl.col("transfer_s").cast(pl.Int64),
-                    )
+                print(
+                    "[compute_chrono_isochrones] route-optimised "
+                    f"origins={len(origin_st)}"
                 )
 
                 # ---- CSA passes ---------------------------------------
@@ -2436,9 +3090,10 @@ def _(Path, os, textwrap):
                 # the actual route through every called station.
                 #
                 # The CSA in compute_chrono_isochrones already found the
-                # earliest arrival from each of the CHRONO_ORIGIN_COUNT
-                # hub origins to every reachable station AND (via the
-                # predecessor pointers) recorded HOW. This task just
+                # earliest arrival from each route-optimised hub origin
+                # (the transit.optimal_hubs set) to every reachable
+                # station AND (via the predecessor pointers) recorded
+                # HOW. This task just
                 # BACKTRACKS that — via the module-level
                 # `_reconstruct_journeys` helper (shared with
                 # compute_route_network, R3) — for every ordered
@@ -2676,16 +3331,22 @@ def _(Path, os, textwrap):
                 #
                 # Output: austria-routehub-paths.parquet — one journey
                 # per row, each carrying its FULL ordered `stops` list
-                # (JSON) so the client route builder can slice a direct
-                # sub-path between any two stations that share a journey,
-                # falling back to hub-decomposition otherwise. Geometry
-                # is a degenerate origin->dest 2-point line only: the
-                # route-builder JS rebuilds on-map geometry from the
-                # austria-transit station points + each journey's `stops`
-                # and never reads this tile's geometry. The tile is baked
-                # z0-only (freestiler_routehub_convert) so every journey
-                # lives in the single always-loaded z0 tile and
-                # querySourceFeatures sees them all.
+                # (JSON, [station_feature_id, arr_hhmm, dep_hhmm,
+                # leg_idx]) so the client route builder can slice a
+                # direct sub-path between any two stations that share a
+                # journey, falling back to hub-decomposition otherwise.
+                # PLUS one theme='station' catalogue row per station —
+                # `stops` JSON `{"c":[lon,lat],"n":name}` — so the
+                # route-builder resolves every station's coord + name
+                # from THIS tile and never touches the austria-transit
+                # tile (whose querySourceFeatures is viewport-limited and
+                # would leave off-screen legs of a route undrawn). The
+                # catalogue is normalised — one row per station, not the
+                # coord repeated into every journey's stops. Geometry is
+                # a degenerate 2-point line the JS never reads. The tile
+                # is baked z0-only (freestiler_routehub_convert) so every
+                # journey AND every station lives in the single always-
+                # loaded z0 tile and querySourceFeatures sees them all.
                 import duckdb
                 import json
                 import polars as pl
@@ -2804,6 +3465,35 @@ def _(Path, os, textwrap):
                             "lon": _crd[0],
                             "lat": _crd[1],
                         })
+                # Normalised station catalogue — one theme='station' row
+                # per station (NOT the coord repeated into every
+                # journey's stops). `stops` carries {"c":[lon,lat],"n":
+                # name}; geometry is a real POINT (the geometry SQL
+                # below branches on theme — a degenerate same-point
+                # LINESTRING would be dropped by the tiler as zero-
+                # length). The route-builder reads only `stops`, never
+                # the geometry; this is its single source of station
+                # coord+name, entirely from this z0 tile.
+                for _lon, _lat, _sfid, _sname in st_info.values():
+                    _sdata = json.dumps(
+                        {"c": [_lon, _lat], "n": _sname},
+                        separators=(",", ":"),
+                    )
+                    legs_rows.append({
+                        "osm_id": f"station/{_sfid}",
+                        "theme": "station",
+                        "origin_station_id": _sfid,
+                        "dest_station_id": "",
+                        "travel_min": "",
+                        "n_transfers": "",
+                        "depart_hhmm": "",
+                        "arrive_hhmm": "",
+                        "depart_grid": "",
+                        "stops": _sdata,
+                        "seq": 0,
+                        "lon": _lon,
+                        "lat": _lat,
+                    })
                 _legs = pl.DataFrame(legs_rows)
                 _legs_parquet = (
                     TILES_WORK / "austria-routehub-legs.parquet"
@@ -2823,13 +3513,22 @@ def _(Path, os, textwrap):
                         )
                         SELECT
                             osm_id,
-                            ST_GeomFromText(
-                                'LINESTRING(' || string_agg(
-                                    CAST(lon AS VARCHAR) || ' '
-                                    || CAST(lat AS VARCHAR),
-                                    ', ' ORDER BY seq
-                                ) || ')'
-                            ) AS geometry,
+                            -- journeys: degenerate origin->dest line
+                            -- (the JS never reads it). theme='station'
+                            -- catalogue rows: a real POINT — a same-
+                            -- point LINESTRING would be zero-length and
+                            -- the tiler drops it.
+                            CASE WHEN any_value(theme) = 'station'
+                                 THEN ST_Point(
+                                     CAST(any_value(lon) AS DOUBLE),
+                                     CAST(any_value(lat) AS DOUBLE))
+                                 ELSE ST_GeomFromText(
+                                     'LINESTRING(' || string_agg(
+                                         CAST(lon AS VARCHAR) || ' '
+                                         || CAST(lat AS VARCHAR),
+                                         ', ' ORDER BY seq
+                                     ) || ')')
+                            END AS geometry,
                             any_value(theme)             AS theme,
                             any_value(origin_station_id)
                                 AS origin_station_id,
@@ -2849,17 +3548,21 @@ def _(Path, os, textwrap):
                     f"SELECT count(*) FROM read_parquet('{out}')"
                 ).fetchone()[0]
                 con2.close()
-                # The GROUP BY osm_id must be 1:1 with the input journeys
-                # — a mismatch means osm_id is not unique and journeys
-                # were merged/lost (see the theme-prefix above).
-                if _n != len(journeys):
+                # The GROUP BY osm_id must be 1:1 with the input rows —
+                # one row per journey (theme-prefixed osm_id) PLUS one
+                # per station (osm_id 'station/<sfid>'). A mismatch means
+                # an osm_id collided and a row was merged/lost.
+                _n_expected = len(journeys) + len(st_info)
+                if _n != _n_expected:
                     raise RuntimeError(
                         "compute_route_network: osm_id collision — "
-                        f"{len(journeys)} journeys in, {_n} rows out"
+                        f"{len(journeys)} journeys + {len(st_info)} "
+                        f"stations expected, {_n} rows out"
                     )
                 print(
                     "[compute_route_network] wrote "
-                    f"{_n} routehub journeys ({out.stat().st_size // 1024}"
+                    f"{len(journeys)} journeys + {len(st_info)} station "
+                    f"rows ({out.stat().st_size // 1024}"
                     f" KiB) -> {out}"
                 )
                 return str(out)
@@ -2978,10 +3681,13 @@ def _(Path, os, textwrap):
             # download_gtfs → gtfs_to_parquet → materialize_duckdb
             #     → match_stops → match_routes → match_trips
             #          ↘ freestiler_transit_convert ───────────────┐
-            #          ↘ compute_chrono_isochrones ────────────────┤
-            #               → freestiler_chrono_convert ───────────┤
-            #               → compute_fastest_connections          │
-            #                    → freestiler_fastlink_convert ────┤
+            #          → compute_optimal_hubs                      │
+            #               → compute_chrono_isochrones ───────────┤
+            #                    → freestiler_chrono_convert ──────┤
+            #                    → compute_fastest_connections     │
+            #                         → freestiler_fastlink_convert┤
+            #                    → compute_route_network           │
+            #                         → freestiler_routehub_convert┤
             #                                          → reload_martin
             gtfs_dir = gtfs_to_parquet(download_gtfs())
             db = materialize_duckdb(gtfs_dir)
@@ -2996,14 +3702,26 @@ def _(Path, os, textwrap):
             # The transit tile only needs match_stops' parquet export — it
             # branches off here independent of routes/trips diagnostics.
             transit_tile = freestiler_transit_convert(stops_task)
+            # Route-optimised transfer-hub selection: a greedy over the
+            # one-seat-ride hub-and-spoke journey objective on real
+            # timetable rides that derives the hub set (and its count)
+            # the chronomap / fastest-connections / route-builder CSA
+            # passes seed from. Opens austria.duckdb
+            # READ-WRITE to persist transit.optimal_hubs, so it is
+            # ORDERED AFTER trips_task (every match_* writer has closed)
+            # and BEFORE compute_chrono_isochrones (which reads the table
+            # read-only). Deterministic ordering, not a sleep (R4).
+            optimal_hubs = compute_optimal_hubs(db)
+            trips_task >> optimal_hubs
             # Chronomap isochrones: a time-dependent CSA over the real GTFS
-            # timetable. Reads austria.duckdb READ-ONLY but is ORDERED AFTER
-            # trips_task so every match_* writer has closed its write
-            # connection first — DuckDB forbids a read-only open from one
-            # process while another holds the file open read-write.
-            # Deterministic ordering, not a sleep (R4).
+            # timetable, seeded from the route-optimised hub set. Reads
+            # austria.duckdb READ-ONLY but is ORDERED AFTER optimal_hubs
+            # so that task's write connection has closed first — DuckDB
+            # forbids a read-only open while another process holds the
+            # file open read-write. Deterministic ordering, not a sleep
+            # (R4).
             chrono_isochrones = compute_chrono_isochrones(db)
-            trips_task >> chrono_isochrones
+            optimal_hubs >> chrono_isochrones
             chrono_tile = freestiler_chrono_convert(chrono_isochrones)
             # Fastest hub→hub connections + the hub-decomposition routing
             # network (hub→station, station→hub, hub→hub profile): both
@@ -5573,18 +6291,23 @@ def _(mo):
     time between transfers all come straight from `gtfs.stop_times` —
     you board the next service that really departs.
 
-    The search is a **smart multipath** relaxation: all top-25 origins
-    are routed simultaneously, and each iteration relaxes only from the
+    The search is a **smart multipath** relaxation: every hub origin is
+    routed simultaneously, and each iteration relaxes only from the
     frontier (the labels that just improved) rather than re-scanning
     the whole state — a vectorised **polars** join/group-by loop on the
     **GPU** (cudf-polars) when the host has one. The connection graph is
     the **union timetable** — every trip the feed ships, across all
     service patterns — so a station served on ANY service day is
-    reachable. From each of the **top 25 transfer hubs** (by `hub_rank`,
-    routed from an 08:00 reference departure) it reaches **every other
-    station in the network** within 12 h, then bakes the per-band
-    isochrone rings + origin markers to the `austria-chrono` PMTiles
-    archive — exactly like every other dataset on these maps.
+    reachable. The hub origins are **not** an arbitrary top-N: the
+    `compute_optimal_hubs` task picks them by **route optimisation** — a
+    greedy over the one-seat-ride hub-and-spoke journey objective on
+    real timetable rides that derives both the hub set *and* its count
+    (see the "Route-optimised transfer hubs" panel below). From each
+    route-optimised hub, routed from an
+    08:00 reference departure, it reaches **every other station in the
+    network** within 12 h, then bakes the per-band isochrone rings +
+    origin markers to the `austria-chrono` PMTiles archive — exactly
+    like every other dataset on these maps.
     """)
     return
 
@@ -5718,9 +6441,9 @@ def _(mo):
     ## Fastest connections — hub to hub
 
     The complement to the chronomap: the **fastest journey between the
-    top 25 hub stations**, drawn as the actual route it takes through
-    every intermediate station it calls at. **Click a hub marker** and
-    its fastest connection to each of the other 24 hubs lights up,
+    route-optimised transfer hubs**, drawn as the actual route it takes
+    through every intermediate station it calls at. **Click a hub
+    marker** and its fastest connection to each other hub lights up,
     coloured by travel time; **hover a line** for the travel time and
     transfer count.
 
@@ -6024,16 +6747,21 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
       + 'border-radius:4px;font:12px/1.5 sans-serif;color:#222;'
       + 'box-shadow:0 1px 6px rgba(0,0,0,0.4);';
     box.appendChild(panel);
-    // station -> coord / name, from the austria-transit dots
-    var tf = M.querySourceFeatures('transit-src',
-      { sourceLayer: 'austria-transit',
-        filter: ['==', ['get', 'is_station_label'], 'true'] });
-    for (var i = 0; i < tf.length; i++) {
-      var p = tf[i].properties || {};
-      if (p.station_feature_id && !coordOf[p.station_feature_id]) {
-        coordOf[p.station_feature_id] = tf[i].geometry.coordinates;
-        nameOf[p.station_feature_id] =
-          p.station_name || p.station_feature_id;
+    // station -> coord / name. Sourced from the austria-routehub tile's
+    // own theme='station' catalogue rows — NOT austria-transit, whose
+    // querySourceFeatures is viewport-limited and would leave the
+    // off-screen legs of a route undrawn. austria-routehub is the
+    // z0-only, always-loaded tile, so this catalogue is COMPLETE
+    // regardless of where the map is panned.
+    var sf = dedup(M.querySourceFeatures('src',
+      { sourceLayer: 'austria-routehub',
+        filter: ['==', ['get', 'theme'], 'station'] }));
+    for (var i = 0; i < sf.length; i++) {
+      var sp = sf[i], sd;
+      try { sd = JSON.parse(sp.stops || '{}'); } catch (e) { sd = {}; }
+      if (sp.origin_station_id && sd.c) {
+        coordOf[sp.origin_station_id] = sd.c;
+        nameOf[sp.origin_station_id] = sd.n || sp.origin_station_id;
       }
     }
     // pre-load every journey's stops (for direct sub-path search) +
@@ -6042,6 +6770,7 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
       { sourceLayer: 'austria-routehub' }));
     for (var i = 0; i < jf.length; i++) {
       var p = jf[i];
+      if (p.theme === 'station') { continue; }
       var stops;
       try { stops = JSON.parse(p.stops || '[]'); } catch (e) { stops = []; }
       if (stops.length < 2) { continue; }
@@ -6385,6 +7114,97 @@ def _(dag_run_states, mo):
               "hub_rank drives label-placement priority in the "
               "transit map)"),
         _top_hubs,
+    ])
+    return
+
+
+@app.cell
+def _(dag_run_states, mo):
+    # Route-optimised transfer hubs — the hub set the GTFS DAG's
+    # compute_optimal_hubs task selects by ACTUAL route optimisation.
+    # A "hub" is a place where you genuinely change trains (Innsbruck
+    # -> Budapest switches at Wien Hbf, not Wien Meidling). A greedy
+    # adds hubs one at a time; each step picks the candidate with the
+    # best CO-EQUAL RANK — `routing_rank` (ascending mean one-seat-ride
+    # hub-and-spoke journey time over a weighted OD sample — the
+    # cheapest A->B route using the direct ride, one hub, or two hubs,
+    # where D is the fastest single-trip no-change ride) PLUS
+    # `anchor_rank` (descending `anchor_score`). The anchor
+    # score sums, over EACH AND EVERY connection calling at the station
+    # (every trip stopping there before its terminus), the great-circle
+    # distance to that trip's terminus, operating-day weighted — so a
+    # station originating many trains to far termini outranks a
+    # junction whose trains are minutes from their end. The greedy
+    # STOPS when the routing gain diminishes, so both the hub set AND
+    # its count are derived. These hubs (transit.optimal_hubs) seed the
+    # chronomap / fastest-connections / route-builder CSA passes.
+    # `old_hub_rank` is where the previous purely-structural hub_score
+    # heuristic would have ranked each pick — values > 25 are hubs the
+    # old hardcoded top-25 cutoff would have missed.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    import duckdb as _duckdb_oh
+    _oh_con = _duckdb_oh.connect(
+        "/workspace/duckdb/austria.duckdb",
+        read_only=True,
+    )
+    _opt_hubs = _oh_con.sql("""
+        SELECT
+            oh.selection_order,
+            min(m.station_name)                       AS station_name,
+            oh.station_feature_id,
+            round(oh.hubcost_mean / 60.0, 1)          AS hubcost_min,
+            round(oh.marginal_gain / 60.0, 2)         AS gain_min,
+            round(oh.rel_gain, 4)                     AS rel_gain,
+            round(oh.anchor_score / 1000.0, 0)        AS anchor_k,
+            oh.n_calls,
+            oh.n_termini_reached,
+            round(oh.max_terminus_km, 0)              AS max_terminus_km,
+            hs.hub_rank                               AS old_hub_rank
+        FROM transit.optimal_hubs oh
+        JOIN transit.station_members m
+          ON m.station_feature_id = oh.station_feature_id
+        LEFT JOIN transit.station_hub_scores hs
+          ON hs.station_feature_id = oh.station_feature_id
+        GROUP BY oh.selection_order, oh.station_feature_id,
+                 oh.hubcost_mean, oh.marginal_gain, oh.rel_gain,
+                 oh.anchor_score, oh.n_calls, oh.n_termini_reached,
+                 oh.max_terminus_km, hs.hub_rank
+        ORDER BY oh.selection_order
+    """).pl()
+    _oh_con.close()
+    _n_hubs = _opt_hubs.height
+    _n_missed = _opt_hubs.filter(
+        _opt_hubs["old_hub_rank"].is_null()
+        | (_opt_hubs["old_hub_rank"] > 25)
+    ).height
+    mo.vstack([
+        mo.md(
+            f"**Route-optimised transfer hubs** — {_n_hubs} hubs, "
+            "**derived** (greedy over real timetable ride times; "
+            "stops on diminishing routing returns). Candidate pool = "
+            "served stations that can actually be an interchange. "
+            "`hubcost_min` is the mean one-seat-ride hub-and-spoke "
+            "journey time — cheapest A→B route via the direct ride, "
+            "one hub, or two hubs (D = fastest single-trip no-change "
+            "ride) — falling as hubs are added; `gain_min` is the "
+            "marginal improvement. `anchor_k` sums "
+            "(in 1000s) the great-circle distance to the terminus over "
+            "`n_calls` connections calling at the station — every trip "
+            "stopping there before its end, operating-day weighted — "
+            "with `n_termini_reached` distinct termini, the farthest "
+            "`max_terminus_km` away. So a station originating many "
+            "trains to far termini outranks a junction whose trains are "
+            "minutes from their end. Each greedy step picks the best "
+            "CO-EQUAL RANK of `routing_rank` + `anchor_rank`. "
+            f"{_n_missed} of these hubs rank outside the old structural "
+            "top-25 — stations the previous hub_score heuristic would "
+            "have missed."
+        ),
+        _opt_hubs,
     ])
     return
 
