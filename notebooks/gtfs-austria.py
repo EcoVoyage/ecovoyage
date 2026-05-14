@@ -81,7 +81,7 @@ def _(airflow_public, mo):
     | `gtfs.*` | EVERY *.parquet the feed shipped — `stops`, `routes`, `trips`, **`stop_times` (the full timetable)**, `shapes`, `calendar`, `calendar_dates`, `agency`, plus any optionals (`transfers`, `fare_*`, `frequencies`, `pathways`, …) | THIS notebook's DAG |
     | `transit.*` | `osm_stops`, `osm_route_masters`, `osm_routes`, `matched_stops`, `matched_routes`, `matched_trips` | THIS notebook's wiki-compliant joins |
 
-    Maps below — four viewpoints on the same unified dataset:
+    Maps below — five viewpoints on the same unified dataset:
 
     - **Unified transit map** — `austria-railway` PMTiles (tracks)
       + `austria-transit` PMTiles (GTFS stops as points) overlaid on
@@ -135,6 +135,13 @@ def _(airflow_public, mo):
       `compute_chrono_isochrones` task — from each of the top 25 hubs
       to EVERY other station, baked to the `austria-chrono` PMTiles
       archive.
+    - **Fastest connections** — the fastest journey between the top 25
+      hubs, drawn as the actual route through every intermediate
+      station. Click a hub marker → its fastest connection to each
+      other hub lights up (coloured by travel time, hover for time +
+      transfers). Reconstructed by backtracking the chronomap CSA's
+      predecessor chain in the `compute_fastest_connections` task,
+      baked to the `austria-fastlink` PMTiles archive.
 
     ## GTFS↔OSM unification model — see [OSM wiki: GTFS](https://wiki.openstreetmap.org/wiki/GTFS)
 
@@ -1751,16 +1758,30 @@ def _(Path, os, textwrap):
                 # Frontier: arr_delta / reached_delta — the rows that
                 #          improved this iteration, i.e. next iteration's
                 #          relaxation source.
+                # `via_trip` / `board_st` are predecessor pointers carried
+                # alongside every arrival: via_trip = the trip ridden into
+                # `st`, board_st = the station that trip was boarded at.
+                # They let compute_fastest_connections backtrack the full
+                # journey origin → dest without re-running the CSA. Seed
+                # rows carry the sentinel _NO_TRIP and board_st = origin
+                # (the backtrack stops at the origin before ever reading
+                # these). They cost two extra UInt32 columns and do not
+                # affect the isochrone output.
+                _NO_TRIP = 2 ** 32 - 1
                 _seed = pl.DataFrame(
                     {
                         "origin": origin_st,
                         "st": origin_st,
                         "sec": [CHRONO_DEPART_S] * len(origin_st),
+                        "via_trip": [_NO_TRIP] * len(origin_st),
+                        "board_st": origin_st,
                     },
                     schema={
                         "origin": pl.UInt32,
                         "st": pl.UInt32,
                         "sec": pl.Int64,
+                        "via_trip": pl.UInt32,
+                        "board_st": pl.UInt32,
                     },
                 )
                 arr = _seed
@@ -1770,6 +1791,7 @@ def _(Path, os, textwrap):
                         "origin": pl.UInt32,
                         "trip": pl.UInt32,
                         "board_dep": pl.Int64,
+                        "board_st": pl.UInt32,
                     }
                 )
                 reached_delta = reached
@@ -1811,42 +1833,64 @@ def _(Path, os, textwrap):
                             pl.col("sec") + pl.col("eff_transfer")
                             <= pl.col("dep")
                         )
-                        .select("origin", "trip", "to_st", "dep", "arr_c")
+                        # from_st rides along: it is the board_st for both
+                        # the new arrival AND the new boarding.
+                        .select("origin", "trip", "from_st",
+                                "to_st", "dep", "arr_c")
                     )
 
                     # Ride rule — relaxed ONLY from the boarding frontier
                     # (reached_delta): a whole reached trip's remaining run
                     # expands in ONE iteration (so leg count = transfers +
-                    # 1, not stop count).
+                    # 1, not stop count). reached_delta.board_st rides
+                    # along — the original boarding station of the trip.
                     ride = _collect(
                         conns_df.lazy()
                         .join(reached_delta.lazy(), on="trip")
                         .filter(pl.col("dep") >= pl.col("board_dep"))
-                        .select("origin", "to_st", "arr_c")
+                        .select("origin", "trip", "to_st", "arr_c",
+                                "board_st")
                     )
 
                     # Candidate arrivals (both rules) -> best per
                     # (origin, st), pruned to the 12 h horizon, then diffed
                     # against the running state: arr_delta keeps only rows
                     # that STRICTLY beat the current label (or are new).
+                    # Candidate arrivals carry their predecessor pointers
+                    # (via_trip, board_st). "Best per (origin, st)" is now
+                    # an ARGMIN-keep-row (min sec, via_trip tie-break for
+                    # determinism) so the winning row's predecessor
+                    # survives. arr_delta = rows that STRICTLY beat the
+                    # running label (or are new).
                     arr_delta = _collect(
                         pl.concat([
                             trans.lazy().select(
                                 "origin",
                                 pl.col("to_st").alias("st"),
                                 pl.col("arr_c").alias("sec"),
+                                pl.col("trip").alias("via_trip"),
+                                pl.col("from_st").alias("board_st"),
                             ),
                             ride.lazy().select(
                                 "origin",
                                 pl.col("to_st").alias("st"),
                                 pl.col("arr_c").alias("sec"),
+                                pl.col("trip").alias("via_trip"),
+                                "board_st",
                             ),
                         ])
                         .filter(pl.col("sec") <= horizon)
                         .group_by("origin", "st")
-                        .agg(pl.col("sec").min())
+                        .agg(
+                            pl.exclude("origin", "st")
+                            .sort_by(["sec", "via_trip"])
+                            .first()
+                        )
                         .join(
-                            arr.lazy().rename({"sec": "sec_old"}),
+                            arr.lazy().select(
+                                "origin", "st",
+                                pl.col("sec").alias("sec_old"),
+                            ),
                             on=["origin", "st"],
                             how="left",
                         )
@@ -1854,23 +1898,34 @@ def _(Path, os, textwrap):
                             pl.col("sec_old").is_null()
                             | (pl.col("sec") < pl.col("sec_old"))
                         )
-                        .select("origin", "st", "sec")
+                        .select("origin", "st", "sec",
+                                "via_trip", "board_st")
                     )
 
-                    # Candidate boardings -> reached_delta (same diff).
+                    # Candidate boardings -> reached_delta. board_st (the
+                    # boarding station = trans.from_st) rides along; "best
+                    # per (origin, trip)" is the same argmin-keep-row.
                     reached_delta = _collect(
                         trans.lazy()
                         .select(
                             "origin",
                             "trip",
                             pl.col("dep").alias("board_dep"),
+                            pl.col("from_st").alias("board_st"),
                         )
                         .filter(pl.col("board_dep") <= horizon)
                         .group_by("origin", "trip")
-                        .agg(pl.col("board_dep").min())
+                        .agg(
+                            pl.exclude("origin", "trip")
+                            .sort_by(["board_dep", "board_st"])
+                            .first()
+                        )
                         .join(
-                            reached.lazy().rename(
-                                {"board_dep": "board_dep_old"}
+                            reached.lazy().select(
+                                "origin", "trip",
+                                pl.col("board_dep").alias(
+                                    "board_dep_old"
+                                ),
                             ),
                             on=["origin", "trip"],
                             how="left",
@@ -1880,19 +1935,29 @@ def _(Path, os, textwrap):
                             | (pl.col("board_dep")
                                < pl.col("board_dep_old"))
                         )
-                        .select("origin", "trip", "board_dep")
+                        .select("origin", "trip", "board_dep",
+                                "board_st")
                     )
 
-                    # Fold the frontier into the running state.
+                    # Fold the frontier into the running state (argmin-
+                    # keep-row, so the predecessor pointers persist).
                     arr = _collect(
                         pl.concat([arr.lazy(), arr_delta.lazy()])
                         .group_by("origin", "st")
-                        .agg(pl.col("sec").min())
+                        .agg(
+                            pl.exclude("origin", "st")
+                            .sort_by(["sec", "via_trip"])
+                            .first()
+                        )
                     )
                     reached = _collect(
                         pl.concat([reached.lazy(), reached_delta.lazy()])
                         .group_by("origin", "trip")
-                        .agg(pl.col("board_dep").min())
+                        .agg(
+                            pl.exclude("origin", "trip")
+                            .sort_by(["board_dep", "board_st"])
+                            .first()
+                        )
                     )
 
                     if (
@@ -1910,6 +1975,32 @@ def _(Path, os, textwrap):
                         f"CHRONO_MAX_LEGS={CHRONO_MAX_LEGS} "
                         "(result may be incomplete — raise the cap)"
                     )
+
+                # ---- Persist the CSA result for compute_fastest_-
+                # connections: the converged arr state (with predecessor
+                # pointers), the integer connection table, and the
+                # station catalogue. These let the fastlinks task
+                # backtrack journeys without re-running the CSA or
+                # re-deriving the connection SQL (R3 — one source of
+                # truth for the routing graph).
+                arr.select(
+                    "origin", "st", "sec", "via_trip", "board_st"
+                ).write_parquet(
+                    TILES_WORK / "austria-chrono-arr.parquet"
+                )
+                conns_df.select(
+                    "trip", "from_st", "to_st", "dep", "arr_c"
+                ).write_parquet(
+                    TILES_WORK / "austria-chrono-conns.parquet"
+                )
+                station_ids.join(
+                    stations, on="station_feature_id"
+                ).select(
+                    "st", "station_feature_id", "station_name",
+                    "station_lon", "station_lat",
+                ).write_parquet(
+                    TILES_WORK / "austria-chrono-stations.parquet"
+                )
 
                 # ---- Reduce to per-origin reachability ------------------
                 fid = station_ids.rename(
@@ -2125,17 +2216,277 @@ def _(Path, os, textwrap):
                 return str(out)
 
             @task
+            def compute_fastest_connections(chrono_iso: str) -> str:
+                # Fastest journeys BETWEEN the top hub stations, drawn as
+                # the actual route through every intermediate station.
+                #
+                # The CSA in compute_chrono_isochrones already found the
+                # earliest arrival from each of the CHRONO_ORIGIN_COUNT
+                # hub origins to every reachable station AND (via the
+                # predecessor pointers via_trip / board_st) recorded HOW.
+                # This task just BACKTRACKS that predecessor chain for
+                # every ordered (origin -> other-hub) pair: no CSA, no
+                # GPU — a pure-Python graph walk over the three persisted
+                # intermediates. `chrono_iso` is the upstream dependency.
+                #
+                # Output: one LineString per (origin, dest) journey
+                # through its called stations + one POINT per origin
+                # marker, baked into austria-fastlink-paths.parquet (the
+                # same one-tile-two-themes shape as austria-chrono).
+                import duckdb
+                import polars as pl
+
+                TILES_WORK.mkdir(parents=True, exist_ok=True)
+                out = TILES_WORK / "austria-fastlink-paths.parquet"
+                if not _needs_regen(out):
+                    return str(out)
+
+                arr = pl.read_parquet(
+                    TILES_WORK / "austria-chrono-arr.parquet"
+                )
+                conns = pl.read_parquet(
+                    TILES_WORK / "austria-chrono-conns.parquet"
+                )
+                stations = pl.read_parquet(
+                    TILES_WORK / "austria-chrono-stations.parquet"
+                )
+
+                # ---- Lookups -------------------------------------------
+                # arr_lookup[(origin, st)] -> (sec, via_trip, board_st)
+                arr_lookup = {
+                    (r["origin"], r["st"]): (
+                        r["sec"], r["via_trip"], r["board_st"]
+                    )
+                    for r in arr.iter_rows(named=True)
+                }
+                # trip_seq[trip] -> ordered list of st along the trip's
+                # run. conns rows are (trip, from_st, to_st, dep, arr_c);
+                # a trip's connections sorted by dep form its chain.
+                trip_seq = {}
+                for r in conns.sort("trip", "dep").iter_rows(named=True):
+                    seq = trip_seq.setdefault(r["trip"], [])
+                    if not seq or seq[-1] != r["from_st"]:
+                        seq.append(r["from_st"])
+                    seq.append(r["to_st"])
+                # st -> (lon, lat, station_feature_id, station_name)
+                st_info = {
+                    r["st"]: (
+                        r["station_lon"], r["station_lat"],
+                        r["station_feature_id"], r["station_name"],
+                    )
+                    for r in stations.iter_rows(named=True)
+                }
+
+                origins = sorted(set(arr["origin"].to_list()))
+                legs_rows = []          # long-format path vertices
+                _n_journeys = 0
+                _transfer_hist = {}
+                for o in origins:
+                    for d in origins:
+                        if d == o or (o, d) not in arr_lookup:
+                            continue    # self, or d unreachable from o
+                        # backtrack the predecessor chain dest -> origin
+                        segs = []       # (board_st, alight_st, trip)
+                        st = d
+                        for _ in range(CHRONO_MAX_LEGS + 1):
+                            if st == o:
+                                break
+                            _sec, _via, _bst = arr_lookup[(o, st)]
+                            segs.append((_bst, st, _via))
+                            st = _bst
+                        else:
+                            continue    # chain didn't reach origin
+                        segs.reverse()
+                        # expand each segment to its called stations
+                        path = []
+                        for _b, _a, _trip in segs:
+                            _ts = trip_seq.get(_trip)
+                            if _ts is None:
+                                path = []
+                                break
+                            try:
+                                _ib = _ts.index(_b)
+                                _ia = _ts.index(_a, _ib)
+                            except ValueError:
+                                path = []
+                                break
+                            _sub = _ts[_ib:_ia + 1]
+                            if path and path[-1] == _sub[0]:
+                                path.extend(_sub[1:])  # dedup transfer st
+                            else:
+                                path.extend(_sub)
+                        if len(path) < 2:
+                            continue
+                        _travel_min = round(
+                            (arr_lookup[(o, d)][0] - CHRONO_DEPART_S)
+                            / 60.0
+                        )
+                        _n_transfers = len(segs) - 1
+                        _o_fid, _o_name = st_info[o][2], st_info[o][3]
+                        _d_fid, _d_name = st_info[d][2], st_info[d][3]
+                        _osm_id = f"{_o_fid}->{_d_fid}"
+                        for _seq_i, _ps in enumerate(path):
+                            _lon, _lat = st_info[_ps][0], st_info[_ps][1]
+                            legs_rows.append({
+                                "osm_id": _osm_id,
+                                "origin_station_id": _o_fid,
+                                "dest_station_id": _d_fid,
+                                "origin_name": _o_name,
+                                "dest_name": _d_name,
+                                "travel_min": str(_travel_min),
+                                "n_transfers": str(_n_transfers),
+                                "seq": _seq_i,
+                                "lon": _lon,
+                                "lat": _lat,
+                            })
+                        _n_journeys += 1
+                        _transfer_hist[_n_transfers] = (
+                            _transfer_hist.get(_n_transfers, 0) + 1
+                        )
+
+                if not legs_rows:
+                    raise RuntimeError(
+                        "compute_fastest_connections: no journeys "
+                        "reconstructed — check the CSA intermediates"
+                    )
+                legs = pl.DataFrame(legs_rows)
+                legs_parquet = (
+                    TILES_WORK / "austria-chrono-fastlink-legs.parquet"
+                )
+                legs.write_parquet(legs_parquet)
+                print(
+                    "[compute_fastest_connections] reconstructed "
+                    f"{_n_journeys} hub->hub journeys; transfer-count "
+                    f"histogram={dict(sorted(_transfer_hist.items()))}"
+                )
+
+                # ---- Build geometry ------------------------------------
+                # Python built the per-vertex legs; DuckDB stitches each
+                # journey's vertices (ordered by seq) into a LINESTRING
+                # via ST_GeomFromText, plus one ST_Point per origin
+                # (theme='fastlink-origin') baked into the SAME tile —
+                # mirroring austria-chrono's rings + origin markers.
+                con2 = duckdb.connect()
+                con2.sql("INSTALL spatial; LOAD spatial;")
+                con2.sql(f"""
+                    COPY (
+                        WITH legs AS (
+                            SELECT * FROM read_parquet('{legs_parquet}')
+                        ),
+                        lines AS (
+                            SELECT
+                                osm_id,
+                                any_value(origin_station_id)
+                                    AS origin_station_id,
+                                any_value(dest_station_id)
+                                    AS dest_station_id,
+                                any_value(origin_name) AS origin_name,
+                                any_value(dest_name)   AS dest_name,
+                                any_value(travel_min)  AS travel_min,
+                                any_value(n_transfers) AS n_transfers,
+                                ST_GeomFromText(
+                                    'LINESTRING(' || string_agg(
+                                        CAST(lon AS VARCHAR) || ' '
+                                        || CAST(lat AS VARCHAR),
+                                        ', ' ORDER BY seq
+                                    ) || ')'
+                                ) AS geometry
+                            FROM legs
+                            GROUP BY osm_id
+                        ),
+                        origin_pts AS (
+                            SELECT
+                                origin_station_id,
+                                any_value(origin_name) AS origin_name,
+                                arg_min(lon, seq)      AS lon,
+                                arg_min(lat, seq)      AS lat
+                            FROM legs
+                            GROUP BY origin_station_id
+                        )
+                        SELECT
+                            osm_id,
+                            geometry,
+                            'fastlink'          AS theme,
+                            origin_station_id,
+                            dest_station_id,
+                            origin_name,
+                            dest_name,
+                            travel_min,
+                            n_transfers
+                        FROM lines
+                        UNION ALL
+                        SELECT
+                            origin_station_id || '-origin' AS osm_id,
+                            ST_Point(lon, lat)             AS geometry,
+                            'fastlink-origin'              AS theme,
+                            origin_station_id,
+                            ''                  AS dest_station_id,
+                            origin_name,
+                            ''                  AS dest_name,
+                            '0'                 AS travel_min,
+                            '0'                 AS n_transfers
+                        FROM origin_pts
+                    ) TO '{out}' (FORMAT 'parquet')
+                """)
+                _n = con2.sql(
+                    f"SELECT count(*) FROM read_parquet('{out}')"
+                ).fetchone()[0]
+                con2.close()
+                print(
+                    "[compute_fastest_connections] wrote "
+                    f"{_n} fastlink features (journeys + origin markers) "
+                    f"-> {out}"
+                )
+                return str(out)
+
+            @task
+            def freestiler_fastlink_convert(fastlink_paths: str) -> str:
+                # Bake the hub->hub fastest-journey lines + origin markers
+                # to PMTiles — the same freestiler -> PMTiles path every
+                # other on-map dataset uses. martin auto-discovers the
+                # archive; the fastest-connections cell consumes it as the
+                # `austria-fastlink` vector source.
+                import freestiler
+                TILES.mkdir(parents=True, exist_ok=True)
+                out = TILES / "austria-fastlink.pmtiles"
+                if not _needs_regen(out):
+                    return str(out)
+                query = f"""
+                    SELECT osm_id,
+                           geometry,
+                           theme,
+                           origin_station_id,
+                           dest_station_id,
+                           origin_name,
+                           dest_name,
+                           travel_min,
+                           n_transfers
+                    FROM read_parquet('{fastlink_paths}')
+                """
+                freestiler.freestile_query(
+                    query=query,
+                    output=str(out),
+                    layer_name="austria-fastlink",
+                    min_zoom=0,
+                    max_zoom=10,
+                    drop_rate=None,
+                    simplification=True,
+                    coalesce=False,
+                )
+                return str(out)
+
+            @task
             def reload_martin(pmtiles_paths: list) -> list:
                 # Reload martin so it picks up the freshly-baked PMTiles
-                # (austria-transit + austria-chrono). Uses the same flock +
-                # readiness-probe primitives as the OSM DAG's reload_martin
-                # task — and now takes a LIST of paths, exactly like that
-                # task does, so the two reload surfaces no longer diverge
-                # (R3). The OSM DAG runs its own reload_martin first (over
-                # the OSM-side tiles); this reload picks up THIS DAG's
-                # transit + chrono tiles. Serialized restarts are fine —
-                # flock keeps them ordered, /catalog membership verifies
-                # end-state.
+                # (austria-transit + austria-chrono + austria-fastlink).
+                # Uses the same flock + readiness-probe primitives as the
+                # OSM DAG's reload_martin task — and takes a LIST of paths,
+                # exactly like that task does, so the two reload surfaces
+                # no longer diverge (R3). The OSM DAG runs its own
+                # reload_martin first (over the OSM-side tiles); this
+                # reload picks up THIS DAG's transit + chrono + fastlink
+                # tiles. Serialized restarts are fine — flock keeps them
+                # ordered, /catalog membership verifies end-state.
                 import fcntl
                 import json as _json
                 import socket
@@ -2192,9 +2543,12 @@ def _(Path, os, textwrap):
             #
             # download_gtfs → gtfs_to_parquet → materialize_duckdb
             #     → match_stops → match_routes → match_trips
-            #          ↘ freestiler_transit_convert ─┐
-            #          ↘ compute_chrono_isochrones ──┤
-            #                → freestiler_chrono_convert ┘→ reload_martin
+            #          ↘ freestiler_transit_convert ───────────────┐
+            #          ↘ compute_chrono_isochrones ────────────────┤
+            #               → freestiler_chrono_convert ───────────┤
+            #               → compute_fastest_connections          │
+            #                    → freestiler_fastlink_convert ────┤
+            #                                          → reload_martin
             gtfs_dir = gtfs_to_parquet(download_gtfs())
             db = materialize_duckdb(gtfs_dir)
             stops_task = match_gtfs_stops_to_osm(db)
@@ -2217,8 +2571,13 @@ def _(Path, os, textwrap):
             chrono_isochrones = compute_chrono_isochrones(db)
             trips_task >> chrono_isochrones
             chrono_tile = freestiler_chrono_convert(chrono_isochrones)
-            # ONE reload picks up both freshly-baked tiles.
-            reload_martin([transit_tile, chrono_tile])
+            # Fastest hub→hub connections: backtracks the CSA's predecessor
+            # chain (no CSA, no GPU) over the intermediates compute_chrono_-
+            # isochrones persisted — hence ORDERED after it.
+            fastlinks = compute_fastest_connections(chrono_isochrones)
+            fastlink_tile = freestiler_fastlink_convert(fastlinks)
+            # ONE reload picks up all three freshly-baked tiles.
+            reload_martin([transit_tile, chrono_tile, fastlink_tile])
 
 
         notebook_austria_gtfs_pipeline()
@@ -4070,10 +4429,103 @@ def _theme_styles():
             "text-halo-blur": 0.4,
          }},
     ]
+
+    # ---- FASTLINK_STYLE — fastest hub→hub connections ----------------
+    # Self-contained style for the one `austria-fastlink` source (the
+    # fastest-connections map passes source_name="austria-fastlink", so
+    # the helper's `src` IS that tile; layers use "source": "src"). The
+    # tile carries two feature kinds via `theme`:
+    #   * theme='fastlink'        — one LineString per (origin, dest)
+    #     journey, routed through every called station, coloured by
+    #     travel time. White casing underneath for legibility on
+    #     satellite.
+    #   * theme='fastlink-origin' — one POINT per top hub: the ONLY
+    #     markers on the map, so every marker is a clickable origin
+    #     (mirrors CHRONO_ORIGIN_STYLE). `fastlink-origin-selected`
+    #     highlights the chosen one.
+    # All filters open pinned to origin_station_id == "" (map opens
+    # clean); the click handler (extra_js) rewrites them to the clicked
+    # origin. travel_min rides the tile as a string → `to-number` first.
+    _FASTLINK_FILTER = ["all",
+                        ["==", ["get", "theme"], "fastlink"],
+                        ["==", ["get", "origin_station_id"], ""]]
+    FASTLINK_STYLE = [
+        {"id": "fastlink-line-casing", "type": "line",
+         "source": "src", "source-layer": "austria-fastlink",
+         "filter": _FASTLINK_FILTER,
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": "#ffffff",
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           3, 3.0, 7, 5.0, 11, 7.5],
+            "line-opacity": 0.7,
+         }},
+        {"id": "fastlink-line", "type": "line",
+         "source": "src", "source-layer": "austria-fastlink",
+         "filter": _FASTLINK_FILTER,
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            # green (fast) → red (slow), by travel time in minutes
+            "line-color": ["interpolate", ["linear"],
+                           ["to-number", ["get", "travel_min"]],
+                           0,   "#1a9850",
+                           60,  "#a6d96a",
+                           120, "#fee08b",
+                           240, "#fdae61",
+                           360, "#d73027",
+                           600, "#6d0026"],
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           3, 1.4, 7, 2.6, 11, 4.0],
+            "line-opacity": 0.95,
+         }},
+        {"id": "fastlink-origin", "type": "circle",
+         "source": "src", "source-layer": "austria-fastlink",
+         "filter": ["==", ["get", "theme"], "fastlink-origin"],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              3, 3.5, 7, 5.5, 11, 8, 14, 10],
+            "circle-color": "#ffffff",
+            "circle-stroke-color": "#1b3a5c",
+            "circle-stroke-width": 2.4,
+            "circle-opacity": 1.0,
+         }},
+        {"id": "fastlink-origin-selected", "type": "circle",
+         "source": "src", "source-layer": "austria-fastlink",
+         "filter": ["all",
+                    ["==", ["get", "theme"], "fastlink-origin"],
+                    ["==", ["get", "origin_station_id"], ""]],
+         "paint": {
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                              3, 5.5, 7, 8, 11, 11, 14, 13],
+            "circle-color": "#ffcc00",
+            "circle-stroke-color": "#1b3a5c",
+            "circle-stroke-width": 3.0,
+            "circle-opacity": 1.0,
+         }},
+        {"id": "fastlink-origin-label", "type": "symbol",
+         "source": "src", "source-layer": "austria-fastlink",
+         "filter": ["==", ["get", "theme"], "fastlink-origin"],
+         "layout": {
+            "text-field": ["get", "origin_name"],
+            "text-font": ["noto_sans_regular"],
+            "text-size": ["interpolate", ["linear"], ["zoom"],
+                          4, 9, 8, 11, 12, 13],
+            "text-anchor": "top",
+            "text-offset": [0, 0.8],
+            "text-padding": 2,
+         },
+         "paint": {
+            "text-color": "#1a1a1a",
+            "text-halo-color": "#ffffff",
+            "text-halo-width": 1.6,
+            "text-halo-blur": 0.4,
+         }},
+    ]
     return (
         CHRONO_ORIGIN_STYLE,
         CHRONO_STYLE,
         CYCLE_STYLE,
+        FASTLINK_STYLE,
         HIKING_STYLE,
         RAILWAY_STYLE,
         SATELLITE_OVERLAY_STYLE,
@@ -4713,6 +5165,161 @@ def _(
             max_pitch=85,
             glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
             extra_js=_CHRONO_CLICK_JS,
+        ),
+        height="500px",
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## Fastest connections — hub to hub
+
+    The complement to the chronomap: the **fastest journey between the
+    top 25 hub stations**, drawn as the actual route it takes through
+    every intermediate station it calls at. **Click a hub marker** and
+    its fastest connection to each of the other 24 hubs lights up,
+    coloured by travel time; **hover a line** for the travel time and
+    transfer count.
+
+    The chronomap's Connection Scan Algorithm already found the
+    earliest arrival from each hub to every station — this view adds
+    *predecessor tracking* to that CSA (which trip carried you into
+    each station, and where you boarded it), then **backtracks** the
+    predecessor chain for every hub→hub pair to reconstruct the full
+    journey: the sequence of called stations, and the transfer count
+    (one per change of trip). No second routing pass — it reuses the
+    same real-timetable CSA result, then bakes the journeys to the
+    `austria-fastlink` PMTiles archive.
+    """)
+    return
+
+
+@app.cell
+def _(FASTLINK_STYLE, Path, dag_run_states, martin, mo, versatiles_assets):
+    # Fastest-connections cell — the fastest hub→hub journeys, drawn as
+    # the route through their called stations.
+    #
+    # ONE martin source: `austria-fastlink` (baked z0-10 by the GTFS
+    # DAG's compute_fastest_connections + freestiler_fastlink_convert
+    # tasks). Two feature kinds via `theme`:
+    #   * theme='fastlink'        — one LineString per (origin, dest)
+    #     journey, rendered by FASTLINK_STYLE's line + casing layers.
+    #   * theme='fastlink-origin' — one POINT per top hub, rendered by
+    #     FASTLINK_STYLE's marker layers — the ONLY markers, so every
+    #     marker is a clickable origin.
+    #
+    # source_name="austria-fastlink" → the helper's `src` IS that tile,
+    # the map instance is `map_austria_fastlink` / container
+    # `map-austria-fastlink` (the names `_FASTLINK_CLICK_JS` reaches
+    # for). All line/selected filters open pinned to
+    # origin_station_id == "" (nothing); the click handler rewrites
+    # them to the clicked origin.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    _fastlink_pmtiles = Path(
+        "/workspace/tiles/pmtiles/austria-fastlink.pmtiles"
+    )
+    mo.stop(
+        not _fastlink_pmtiles.exists()
+        or _fastlink_pmtiles.stat().st_size == 0,
+        "`austria-fastlink.pmtiles` not yet present — the GTFS DAG's "
+        "`compute_fastest_connections` + `freestiler_fastlink_convert` "
+        "tasks produce it (re-run the DAG if this notebook predates "
+        "them).",
+    )
+    # Origin-click handler + travel-time legend + hover popup, injected
+    # via build_pipeline_maplibre_html's `extra_js` kwarg. Coupled to
+    # source_name="austria-fastlink" (map var `map_austria_fastlink` /
+    # container `map-austria-fastlink`) and the fastlink-* layer ids
+    # from FASTLINK_STYLE.
+    _FASTLINK_CLICK_JS = """
+    (function () {
+      var M = map_austria_fastlink;
+      var STOPS = [['#1a9850','0h'], ['#a6d96a','1h'], ['#fee08b','2h'],
+                   ['#fdae61','4h'], ['#d73027','6h'], ['#6d0026','10h']];
+      M.on('load', function () {
+    var box = document.getElementById('map-austria-fastlink');
+    box.style.position = 'relative';
+    var leg = document.createElement('div');
+    leg.style.cssText = 'position:absolute;left:8px;bottom:8px;z-index:2;'
+      + 'background:rgba(255,255,255,0.9);padding:6px 9px;'
+      + 'border-radius:4px;font:11px/1.45 sans-serif;color:#222;'
+      + 'box-shadow:0 1px 4px rgba(0,0,0,0.35);';
+    var html = '<b>Fastest train connection</b>'
+      + '<div id="fastlink-hint" style="color:#666;">'
+      + 'click a hub marker</div>';
+    for (var i = 0; i < STOPS.length; i++) {
+      html += '<div><span style="display:inline-block;width:11px;'
+        + 'height:11px;margin-right:5px;background:' + STOPS[i][0]
+        + ';"></span>' + STOPS[i][1] + ' travel</div>';
+    }
+    leg.innerHTML = html;
+    box.appendChild(leg);
+      });
+      function applyOrigin(fid, name) {
+    var lineFlt = ['all', ['==', ['get', 'theme'], 'fastlink'],
+                   ['==', ['get', 'origin_station_id'], fid]];
+    M.setFilter('fastlink-line-casing', lineFlt);
+    M.setFilter('fastlink-line', lineFlt);
+    M.setFilter('fastlink-origin-selected', ['all',
+      ['==', ['get', 'theme'], 'fastlink-origin'],
+      ['==', ['get', 'origin_station_id'], fid]]);
+    var hint = document.getElementById('fastlink-hint');
+    if (hint) { hint.textContent = 'from: ' + (name || fid); }
+      }
+      M.on('click', 'fastlink-origin', function (e) {
+    if (!e.features || !e.features.length) { return; }
+    var p = e.features[0].properties || {};
+    applyOrigin(p.origin_station_id, p.origin_name);
+      });
+      var popup = new maplibregl.Popup({
+    closeButton: false, closeOnClick: false,
+      });
+      M.on('mousemove', 'fastlink-line', function (e) {
+    M.getCanvas().style.cursor = 'pointer';
+    var p = e.features[0].properties || {};
+    var m = parseInt(p.travel_min, 10) || 0;
+    var hh = Math.floor(m / 60);
+    var tt = (hh ? hh + 'h ' : '') + (m % 60) + 'm';
+    var nt = p.n_transfers
+      + (p.n_transfers === '1' ? ' transfer' : ' transfers');
+    popup.setLngLat(e.lngLat).setHTML(
+      '<b>' + p.origin_name + ' &rarr; ' + p.dest_name + '</b><br>'
+      + tt + ', ' + nt).addTo(M);
+      });
+      M.on('mouseleave', 'fastlink-line', function () {
+    M.getCanvas().style.cursor = '';
+    popup.remove();
+      });
+      M.on('mouseenter', 'fastlink-origin', function () {
+    M.getCanvas().style.cursor = 'pointer';
+      });
+      M.on('mouseleave', 'fastlink-origin', function () {
+    M.getCanvas().style.cursor = '';
+      });
+    })();
+    """
+    mo.iframe(
+        build_pipeline_maplibre_html(
+            martin,
+            "austria-fastlink",
+            layer_name="austria-fastlink",
+            center=[13.34, 47.6],
+            zoom=7,
+            style_layers=FASTLINK_STYLE,
+            source_maxzoom=10,
+            satellite_background=True,
+            terrain=True,
+            hillshade=False,
+            pitch=0,
+            max_pitch=85,
+            glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
+            extra_js=_FASTLINK_CLICK_JS,
         ),
         height="500px",
     )
