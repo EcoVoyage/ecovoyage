@@ -441,16 +441,27 @@ The notebook-change acceptance battery, in order:
    | **Innsbruck** | `[11.392778, 47.267222]` | Alpine + rural. Steep tonal variation on the satellite imagery (snow / rock / forest). Has the Brenner mainline + branch lines + 6 tram lines + the Hungerburgbahn funicular (`railway=funicular`) + intense SAC-scale variety (T1 city walks through T5 alpine routes) + the national Inn-Radweg (`route=bicycle` long-distance) + dense `route=hiking` long-distance trails. Best for surfacing line-width / halo / colour-contrast issues. |
    | **Wien Hauptbahnhof** | `[16.377778, 48.185]` | Dense urban. Vienna's mainline rail hub (8+ platforms, multiple branch and S-Bahn lines), tram network, U-Bahn subway (`railway=subway`), Wiener Linien GTFS stops at high density. Best for surfacing urban-rail filter coverage, GTFS-dot clustering, text-label collision behaviour, double-track centre stripe rendering at z=14. |
 
-   Run the sequence:
+   Run the sequence over EVERY integer zoom level 0–14 — no
+   sampling, no skipping. Bugs hide between the old sampled stops
+   (a layer that's fine at z=10 and z=12 can still break at z=11;
+   `maxzoom` overzoom artifacts and `minzoom` pop-in only show on
+   the exact threshold zoom):
    ```
    for center in [Innsbruck, Wien Hauptbahnhof]:
-       for z in [6, 8, 10, 12, 14]:
+       for z in range(0, 15):   # 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14
            ...
    ```
-   yielding **10 screenshots + 10 feature-count records** per
-   verification pass. A cutover that passes Innsbruck but fails
-   Wien Hauptbahnhof (or vice versa) is NOT green — both centers
-   must clear every assertion.
+   yielding **30 screenshots + 30 feature-count records** per
+   verification pass (15 zoom levels × 2 centers). A cutover that
+   passes Innsbruck but fails Wien Hauptbahnhof (or vice versa) is
+   NOT green — both centers must clear every assertion. A cutover
+   that passes z=10 and z=12 but breaks at z=11 is likewise NOT
+   green — every integer zoom 0–14 must clear every assertion.
+   At z=0–5 the whole of Austria (and beyond) is in view: the
+   assertion there is coarse — primary tiers (rail, long-distance
+   routes) must render as continuous unbroken strokes with no tile-
+   seam gaps; fine tiers legitimately return 0 features below their
+   `minzoom` and that is expected, not a failure.
 
    **e. Per-zoom-per-center step.** For each `(center, z)`:
    - `evaluate_script` calls
