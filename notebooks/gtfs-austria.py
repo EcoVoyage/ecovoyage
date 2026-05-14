@@ -145,12 +145,14 @@ def _(airflow_public, mo):
       `austria-fastlink` PMTiles archive.
     - **Route builder** — left-click a station to start a route,
       shift+click to add stops; the journey through your picked
-      stations is drawn with the cumulative leg-by-leg itinerary. Each
-      segment is hub-decomposed (`station → hub → … → hub → station`)
-      over the `compute_route_network` task's `hub→station` /
-      `station→hub` / `hub→hub`-profile network, or routed as a direct
-      sub-path of a single journey when one already connects the pair.
-      Baked to the `austria-routehub` PMTiles archive.
+      stations is drawn with the cumulative leg-by-leg itinerary. The
+      `compute_route_network` task bakes the REAL timetable — one row
+      per rail trip, its ordered station calls with real times — into
+      the `austria-routehub` PMTiles archive, and the browser does a
+      bounded hub-restricted search over it: board a real trip, ride it
+      through any hubs it passes (no transfer — you stay seated), and
+      change trains ONLY at a hub, to a real trip departing after you
+      really arrive. Every leg shown is a slice of one real trip.
 
     ## GTFS↔OSM unification model — see [OSM wiki: GTFS](https://wiki.openstreetmap.org/wiki/GTFS)
 
@@ -346,11 +348,6 @@ def _(Path, os, textwrap):
         CHRONO_MAX_LEGS = 40                 # CSA fixpoint iteration cap (safety bound)
         CHRONO_BANDS_H = list(range(1, 13))  # cumulative isochrone bands: every hour to 12 h
         CHRONO_HULL_BUFFER_DEG = 0.03        # ~3 km smoothing buffer on each band hull
-        # Hub→hub departure-time profile grid (route builder). A full
-        # profile across the service day per hub stays small + tile-
-        # able — lets a station→hub leg's arrival be matched to a
-        # hub→hub leg's departure.
-        CHRONO_HUB_PROFILE_TIMES = list(range(5 * 3600, 22 * 3600, 1800))
 
         # === Hub-and-spoke transfer-hub selection (compute_optimal_hubs)
         # A "hub" is a station where you ACTUALLY change trains —
@@ -2702,21 +2699,17 @@ def _(Path, os, textwrap):
                     f"origins={len(origin_st)}"
                 )
 
-                # ---- CSA passes ---------------------------------------
-                # The frontier-relaxation CSA fixpoint is the module-level
-                # `_run_csa` helper. compute_chrono_isochrones runs it
-                # THREE ways off the SAME full-day connection table:
-                #   * forward 08:00 — isochrones + hub→station (h2s)
-                #   * backward      — station→hub (s2h), on a time-
-                #                     reversed connection table
-                #   * profiled      — hub→hub at every 30-min grid time
-                #                     (h2h), so route legs match by time
-                # The forward `arr` carries predecessor pointers
-                # (via_trip / board_st, seeds marked _NO_TRIP) so the
-                # route tasks backtrack full journeys without re-running
-                # any CSA. All three results are persisted for them.
-
-                # forward 08:00 — every hub origin seeded at CHRONO_DEPART_S
+                # ---- CSA pass -----------------------------------------
+                # ONE frontier-relaxation CSA (the module-level
+                # `_run_csa` helper): forward from every route-optimised
+                # hub seeded at 08:00 over the full-day connection table.
+                # The converged `arr` carries predecessor pointers
+                # (via_trip / board_st, seeds marked _NO_TRIP) so
+                # compute_fastest_connections can backtrack full hub→hub
+                # journeys without re-running any CSA. (The route builder
+                # no longer rides on CSA snapshots — compute_route_network
+                # bakes the real timetable directly — so the former
+                # backward + profiled passes were removed.)
                 _fwd_seed = pl.DataFrame(
                     {
                         "origin": origin_st,
@@ -2737,125 +2730,21 @@ def _(Path, os, textwrap):
                     _collect, "compute_chrono_isochrones forward",
                 )
 
-                # backward — station→hub. A time-reversed connection
-                # table (T_REF = CHRONO_DEPART_S + horizon span):
-                # (trip,from,to,dep,arr) -> (trip,to,from, T_REF-arr,
-                # T_REF-dep). The forward CSA on it, seeded from the hubs
-                # at reversed-time 0, yields the fastest journey TO each
-                # hub FROM every station — un-reversed by the route task.
-                _t_ref = CHRONO_DEPART_S + max(CHRONO_BANDS_H) * 3600
-                conns_rev = conns_df.select(
-                    "trip",
-                    pl.col("to_st").alias("from_st"),
-                    pl.col("from_st").alias("to_st"),
-                    (_t_ref - pl.col("arr_c")).alias("dep"),
-                    (_t_ref - pl.col("dep")).alias("arr_c"),
-                ).filter(
-                    (pl.col("dep") >= 0)
-                    & (pl.col("arr_c") >= pl.col("dep"))
-                )
-                _bwd_seed = pl.DataFrame(
-                    {
-                        "origin": origin_st,
-                        "st": origin_st,
-                        "sec": [0] * len(origin_st),
-                        "via_trip": [_NO_TRIP] * len(origin_st),
-                        "board_st": origin_st,
-                    },
-                    schema={
-                        "origin": pl.UInt32, "st": pl.UInt32,
-                        "sec": pl.Int64, "via_trip": pl.UInt32,
-                        "board_st": pl.UInt32,
-                    },
-                )
-                arr_back = _run_csa(
-                    conns_rev, _bwd_seed, _t_ref, transfer_i,
-                    CHRONO_DEFAULT_TRANSFER_S, CHRONO_MAX_LEGS,
-                    _collect, "compute_chrono_isochrones backward",
-                )
-
-                # profiled forward — hub→hub at every grid departure
-                # time. Each (hub, grid-time) is a DISTINCT composite
-                # `origin` id; a side table maps it back. _run_csa is
-                # vectorised over `origin`, so this is ONE batched run.
-                _profile_seed_rows = []
-                _profile_map_rows = []
-                _sid = 0
-                for _h_st in origin_st:
-                    for _g in CHRONO_HUB_PROFILE_TIMES:
-                        _profile_seed_rows.append({
-                            "origin": _sid, "st": _h_st, "sec": _g,
-                            "via_trip": _NO_TRIP, "board_st": _h_st,
-                        })
-                        _profile_map_rows.append({
-                            "origin": _sid, "hub_st": _h_st,
-                            "depart_s": _g,
-                        })
-                        _sid += 1
-                _prof_seed = pl.DataFrame(
-                    _profile_seed_rows,
-                    schema={
-                        "origin": pl.UInt32, "st": pl.UInt32,
-                        "sec": pl.Int64, "via_trip": pl.UInt32,
-                        "board_st": pl.UInt32,
-                    },
-                )
-                _prof_horizon = (
-                    max(CHRONO_HUB_PROFILE_TIMES)
-                    + max(CHRONO_BANDS_H) * 3600
-                )
-                arr_profile = _run_csa(
-                    conns_df, _prof_seed, _prof_horizon, transfer_i,
-                    CHRONO_DEFAULT_TRANSFER_S, CHRONO_MAX_LEGS,
-                    _collect, "compute_chrono_isochrones profiled",
-                )
-                # Persisted in FULL (every reached station, not just hub
-                # destinations): compute_route_network must backtrack the
-                # predecessor chain through intermediate stations, so it
-                # needs the whole profiled arr — it then keeps only the
-                # hub→hub journeys at reconstruction time.
-
-                # ---- Persist the CSA results for the route tasks ------
-                # The converged arr states (with predecessor pointers),
-                # the integer connection tables (forward + reversed), the
-                # station catalogue, and the profile seed map. These let
-                # compute_fastest_connections / compute_route_network
-                # backtrack journeys without re-running any CSA or
-                # re-deriving the connection SQL (R3 — one source of
-                # truth for the routing graph).
+                # ---- Persist the CSA result for compute_fastest_connections
+                # The converged `arr` (with predecessor pointers), the
+                # integer connection table, and the station catalogue —
+                # so compute_fastest_connections backtracks journeys
+                # without re-running the CSA or re-deriving the
+                # connection SQL (R3 — one source of truth).
                 arr.select(
                     "origin", "st", "sec", "via_trip", "board_st"
                 ).write_parquet(
                     TILES_WORK / "austria-chrono-arr.parquet"
                 )
-                arr_back.select(
-                    "origin", "st", "sec", "via_trip", "board_st"
-                ).write_parquet(
-                    TILES_WORK / "austria-chrono-arr-back.parquet"
-                )
-                arr_profile.select(
-                    "origin", "st", "sec", "via_trip", "board_st"
-                ).write_parquet(
-                    TILES_WORK / "austria-chrono-arr-profile.parquet"
-                )
-                pl.DataFrame(
-                    _profile_map_rows,
-                    schema={
-                        "origin": pl.UInt32, "hub_st": pl.UInt32,
-                        "depart_s": pl.Int64,
-                    },
-                ).write_parquet(
-                    TILES_WORK / "austria-chrono-profile-map.parquet"
-                )
                 conns_df.select(
                     "trip", "from_st", "to_st", "dep", "arr_c"
                 ).write_parquet(
                     TILES_WORK / "austria-chrono-conns.parquet"
-                )
-                conns_rev.select(
-                    "trip", "from_st", "to_st", "dep", "arr_c"
-                ).write_parquet(
-                    TILES_WORK / "austria-chrono-conns-rev.parquet"
                 )
                 station_ids.join(
                     stations, on="station_feature_id"
@@ -2866,9 +2755,8 @@ def _(Path, os, textwrap):
                     TILES_WORK / "austria-chrono-stations.parquet"
                 )
                 print(
-                    "[compute_chrono_isochrones] persisted CSA results — "
-                    f"arr={arr.height}, arr_back={arr_back.height}, "
-                    f"arr_profile(h2h)={arr_profile.height}"
+                    "[compute_chrono_isochrones] persisted CSA result — "
+                    f"arr={arr.height}"
                 )
 
                 # ---- Reduce to per-origin reachability ------------------
@@ -3320,33 +3208,45 @@ def _(Path, os, textwrap):
                 return str(out)
 
             @task
-            def compute_route_network(chrono_iso: str) -> str:
-                # The hub-decomposition routing network for the route
-                # builder: hub→station (h2s), station→hub (s2h), and the
-                # hub→hub departure-time profile (h2h). All three are
-                # backtracked via the shared `_reconstruct_journeys`
-                # helper from the CSA results compute_chrono_isochrones
-                # persisted — no CSA, no GPU. `chrono_iso` is the upstream
-                # dependency.
+            def compute_route_network(db_path: str) -> str:
+                # The route builder's data source: the REAL Austria
+                # railway timetable, baked one row per trip.
                 #
-                # Output: austria-routehub-paths.parquet — one journey
-                # per row, each carrying its FULL ordered `stops` list
-                # (JSON, [station_feature_id, arr_hhmm, dep_hhmm,
-                # leg_idx]) so the client route builder can slice a
-                # direct sub-path between any two stations that share a
-                # journey, falling back to hub-decomposition otherwise.
-                # PLUS one theme='station' catalogue row per station —
-                # `stops` JSON `{"c":[lon,lat],"n":name}` — so the
-                # route-builder resolves every station's coord + name
-                # from THIS tile and never touches the austria-transit
-                # tile (whose querySourceFeatures is viewport-limited and
-                # would leave off-screen legs of a route undrawn). The
-                # catalogue is normalised — one row per station, not the
-                # coord repeated into every journey's stops. Geometry is
-                # a degenerate 2-point line the JS never reads. The tile
-                # is baked z0-only (freestiler_routehub_convert) so every
-                # journey AND every station lives in the single always-
-                # loaded z0 tile and querySourceFeatures sees them all.
+                # The browser route builder does a bounded hub-restricted
+                # search over this — board a real trip, ride it through
+                # any hubs it passes (no transfer — you stay seated),
+                # change trains ONLY at a hub, to a real trip departing
+                # after you really arrive. Every leg it shows is a slice
+                # of one real trip, so the clock times are real and
+                # coherent by construction — no CSA snapshots, no
+                # stitched-fragment time-rebasing, no transfer penalty.
+                #
+                # Output: austria-routehub-paths.parquet — and the
+                # austria-routehub z0 PMTiles tile — carrying:
+                #   * one theme='trip' row per rail trip that calls at
+                #     >= 1 hub: `stops` JSON = the trip's ordered station
+                #     calls [[station_feature_id, arr_s, dep_s, is_hub],
+                #     ...] in raw seconds-after-midnight (handles >24:00
+                #     overnight trips; the JS formats to HH:MM). The
+                #     first call's arr and the last call's dep are ""
+                #     (you board the first, alight the last). is_hub (1/0)
+                #     flags the stations in transit.optimal_hubs — the
+                #     allowed transfer points.
+                #   * one theme='station' catalogue row per station —
+                #     `stops` JSON {"c":[lon,lat],"n":name} — the route
+                #     builder's single source of station coord + name.
+                # Geometry is a degenerate 2-point line the JS never
+                # reads (theme='station' rows get a real POINT — see the
+                # CASE below). Baked z0-only by freestiler_routehub_convert
+                # so every trip AND every station lives in the single
+                # always-loaded z0 tile and querySourceFeatures sees them
+                # all.
+                #
+                # Reads austria.duckdb READ-ONLY (gtfs.stop_times +
+                # gtfs.trips/routes + transit.station_members +
+                # transit.optimal_hubs). It needs only the hub set, so it
+                # is ORDERED AFTER compute_optimal_hubs — NOT after the
+                # chronomap CSA (see the DAG wiring).
                 import duckdb
                 import json
                 import polars as pl
@@ -3356,125 +3256,152 @@ def _(Path, os, textwrap):
                 if not _needs_regen(out):
                     return str(out)
 
-                arr = pl.read_parquet(
-                    TILES_WORK / "austria-chrono-arr.parquet"
-                )
-                arr_back = pl.read_parquet(
-                    TILES_WORK / "austria-chrono-arr-back.parquet"
-                )
-                arr_profile = pl.read_parquet(
-                    TILES_WORK / "austria-chrono-arr-profile.parquet"
-                )
-                conns = pl.read_parquet(
-                    TILES_WORK / "austria-chrono-conns.parquet"
-                )
-                conns_rev = pl.read_parquet(
-                    TILES_WORK / "austria-chrono-conns-rev.parquet"
-                )
-                stations = pl.read_parquet(
-                    TILES_WORK / "austria-chrono-stations.parquet"
-                )
-                st_info = {
-                    r["st"]: (
-                        r["station_lon"], r["station_lat"],
-                        r["station_feature_id"], r["station_name"],
+                # ---- Pull the real timetable as one row per trip ------
+                # Per rail trip (route_type = 2): its ordered station
+                # calls — platform→station rollup collapses consecutive
+                # same-station calls via LAG, the same rollup _build_conns
+                # uses — each call tagged is_hub from
+                # transit.optimal_hubs. Keep ONLY trips that call at
+                # >= 1 hub and have >= 2 calls: a trip touching no hub can
+                # never be a leg of a hub-restricted route. arrival_time /
+                # departure_time are gtfs-parquet BIGINT milliseconds
+                # (see _build_conns) → / 1000 to seconds; COALESCE so a
+                # call with only one of the two still carries a time.
+                con = duckdb.connect(db_path, read_only=True)
+                _calls = con.sql("""
+                    WITH calls AS (
+                        SELECT
+                            st.trip_id,
+                            st.stop_sequence            AS seq,
+                            sm.station_feature_id       AS sfid,
+                            COALESCE(st.arrival_time,
+                                     st.departure_time) / 1000.0 AS arr_s,
+                            COALESCE(st.departure_time,
+                                     st.arrival_time) / 1000.0   AS dep_s
+                        FROM gtfs.stop_times st
+                        JOIN gtfs.trips t  USING (trip_id)
+                        JOIN gtfs.routes r USING (route_id)
+                        JOIN transit.station_members sm
+                          ON sm.stop_id = st.stop_id
+                        WHERE r.route_type = 2
+                          AND st.stop_sequence IS NOT NULL
+                          AND sm.station_feature_id IS NOT NULL
+                          AND (st.arrival_time IS NOT NULL
+                               OR st.departure_time IS NOT NULL)
+                    ),
+                    tagged AS (
+                        SELECT
+                            c.*,
+                            (h.station_feature_id IS NOT NULL) AS is_hub,
+                            LAG(c.sfid) OVER (
+                                PARTITION BY c.trip_id ORDER BY c.seq
+                            ) AS prev_sfid
+                        FROM calls c
+                        LEFT JOIN transit.optimal_hubs h
+                          ON h.station_feature_id = c.sfid
+                    ),
+                    rolled AS (
+                        -- collapse consecutive same-station calls (a
+                        -- multi-platform station the trip dwells at)
+                        SELECT trip_id, seq, sfid, arr_s, dep_s, is_hub
+                        FROM tagged
+                        WHERE prev_sfid IS NULL OR prev_sfid <> sfid
+                    ),
+                    trip_stats AS (
+                        SELECT trip_id,
+                               count(*) AS n_calls,
+                               max(CASE WHEN is_hub THEN 1 ELSE 0 END)
+                                   AS has_hub
+                        FROM rolled GROUP BY trip_id
                     )
-                    for r in stations.iter_rows(named=True)
-                }
-                _t_ref = CHRONO_DEPART_S + max(CHRONO_BANDS_H) * 3600
-
-                hubs = sorted(set(arr["origin"].to_list()))
-                fwd_dests = sorted(set(arr["st"].to_list()))
-                bwd_dests = sorted(set(arr_back["st"].to_list()))
-                prof_origins = sorted(set(arr_profile["origin"].to_list()))
-
-                # hub → station (forward CSA). The osm_id is theme-
-                # prefixed: a hub→hub pair reachable both ways yields one
-                # h2s journey AND one s2h journey with identical endpoint
-                # ids — without the prefix they collide on the DuckDB
-                # GROUP BY osm_id below and one journey is silently lost.
-                h2s = _reconstruct_journeys(
-                    arr, conns, st_info, hubs, fwd_dests,
-                    CHRONO_MAX_LEGS, t_ref=None,
-                )
-                for _j in h2s:
-                    _j["theme"] = "h2s"
-                    _j["depart_grid"] = ""
-                    _j["osm_id"] = f"h2s/{_j['osm_id']}"
-                # station → hub (backward CSA on conns_rev; un-reversed
-                # by the helper's t_ref branch so it reads station→hub)
-                s2h = _reconstruct_journeys(
-                    arr_back, conns_rev, st_info, hubs, bwd_dests,
-                    CHRONO_MAX_LEGS, t_ref=_t_ref,
-                )
-                for _j in s2h:
-                    _j["theme"] = "s2h"
-                    _j["depart_grid"] = ""
-                    _j["osm_id"] = f"s2h/{_j['osm_id']}"
-                # hub → hub PROFILE (profiled forward CSA). The helper
-                # discovers the real hub origin + the seed (grid) time
-                # from each composite origin id; the osm_id is widened
-                # with the grid time so every (hub_a, grid, hub_b) is
-                # distinct (and theme-prefixed like h2s/s2h).
-                h2h = _reconstruct_journeys(
-                    arr_profile, conns, st_info, prof_origins, hubs,
-                    CHRONO_MAX_LEGS, t_ref=None,
-                )
-                for _j in h2h:
-                    _j["theme"] = "h2h"
-                    _grid = _hhmm(_j["depart_s"])
-                    _j["depart_grid"] = _grid
-                    _j["osm_id"] = (
-                        f"h2h/{_j['origin_station_id']}@{_grid}->"
-                        f"{_j['dest_station_id']}"
-                    )
-
-                journeys = h2s + s2h + h2h
-                if not journeys:
+                    SELECT r.trip_id, r.seq, r.sfid,
+                           r.arr_s, r.dep_s, r.is_hub
+                    FROM rolled r
+                    JOIN trip_stats ts USING (trip_id)
+                    WHERE ts.has_hub = 1 AND ts.n_calls >= 2
+                    ORDER BY r.trip_id, r.seq
+                """).pl()
+                # Station catalogue (one row per station: coord + name).
+                _stcat = con.sql("""
+                    SELECT station_feature_id,
+                           any_value(station_name) AS station_name,
+                           any_value(station_lon)  AS station_lon,
+                           any_value(station_lat)  AS station_lat
+                    FROM transit.station_members
+                    WHERE station_feature_id IS NOT NULL
+                    GROUP BY station_feature_id
+                """).pl()
+                con.close()
+                if _calls.height == 0:
                     raise RuntimeError(
-                        "compute_route_network: no journeys "
-                        "reconstructed — check the CSA intermediates"
+                        "compute_route_network: no rail trips calling at "
+                        "a hub — check transit.optimal_hubs / gtfs tables"
                     )
+                _xy = {
+                    r["station_feature_id"]: (
+                        r["station_lon"], r["station_lat"],
+                        r["station_name"],
+                    )
+                    for r in _stcat.iter_rows(named=True)
+                }
 
-                # Long-format rows for the DuckDB geometry build — two
-                # per journey (origin + dest endpoints only). The geometry
-                # is a degenerate origin->dest line the JS never reads
-                # (see above); the full ordered `stops` list rides every
-                # row as a JSON string.
+                # ---- theme='trip' rows --------------------------------
+                # One row per trip; `stops` = ordered calls
+                # [sfid, arr_s, dep_s, is_hub], first arr / last dep
+                # blanked (you board the first, alight the last). Two
+                # endpoint rows per trip feed the degenerate-LINESTRING
+                # geometry build (the JS never reads tile geometry).
                 legs_rows = []
-                for _j in journeys:
+                _n_trips = 0
+                for _tid, _grp in _calls.group_by(
+                    "trip_id", maintain_order=True
+                ):
+                    _rows = _grp.sort("seq").rows(named=True)
+                    if len(_rows) < 2:
+                        continue
+                    _last = len(_rows) - 1
+                    _stops = []
+                    for _i, _r in enumerate(_rows):
+                        _arr = "" if _i == 0 else int(_r["arr_s"])
+                        _dep = "" if _i == _last else int(_r["dep_s"])
+                        _stops.append([
+                            _r["sfid"], _arr, _dep,
+                            1 if _r["is_hub"] else 0,
+                        ])
+                    _trip_id = (_tid[0] if isinstance(_tid, tuple)
+                                else _tid)
                     _stops_json = json.dumps(
-                        _j["stops"], separators=(",", ":")
+                        _stops, separators=(",", ":")
                     )
-                    _depart_hhmm = _j["stops"][0][2]
-                    _arrive_hhmm = _j["stops"][-1][1]
-                    _endpoints = (_j["coords"][0], _j["coords"][-1])
-                    for _seq_i, _crd in enumerate(_endpoints):
+                    _o_sfid, _d_sfid = _rows[0]["sfid"], _rows[-1]["sfid"]
+                    _o_xy, _d_xy = _xy.get(_o_sfid), _xy.get(_d_sfid)
+                    if _o_xy is None or _d_xy is None:
+                        continue
+                    _n_trips += 1
+                    for _seq_i, _crd in enumerate((_o_xy, _d_xy)):
                         legs_rows.append({
-                            "osm_id": _j["osm_id"],
-                            "theme": _j["theme"],
-                            "origin_station_id": _j["origin_station_id"],
-                            "dest_station_id": _j["dest_station_id"],
-                            "travel_min": str(_j["travel_min"]),
-                            "n_transfers": str(_j["n_transfers"]),
-                            "depart_hhmm": _depart_hhmm,
-                            "arrive_hhmm": _arrive_hhmm,
-                            "depart_grid": _j["depart_grid"],
+                            "osm_id": f"trip/{_trip_id}",
+                            "theme": "trip",
+                            "origin_station_id": _o_sfid,
+                            "dest_station_id": _d_sfid,
+                            "travel_min": "",
+                            "n_transfers": "",
+                            "depart_hhmm": "",
+                            "arrive_hhmm": "",
+                            "depart_grid": "",
                             "stops": _stops_json,
                             "seq": _seq_i,
                             "lon": _crd[0],
                             "lat": _crd[1],
                         })
-                # Normalised station catalogue — one theme='station' row
-                # per station (NOT the coord repeated into every
-                # journey's stops). `stops` carries {"c":[lon,lat],"n":
-                # name}; geometry is a real POINT (the geometry SQL
-                # below branches on theme — a degenerate same-point
-                # LINESTRING would be dropped by the tiler as zero-
-                # length). The route-builder reads only `stops`, never
-                # the geometry; this is its single source of station
-                # coord+name, entirely from this z0 tile.
-                for _lon, _lat, _sfid, _sname in st_info.values():
+
+                # ---- theme='station' catalogue ------------------------
+                # One row per station; `stops` carries
+                # {"c":[lon,lat],"n":name}. Geometry is a real POINT
+                # (the geometry SQL below branches on theme — a same-
+                # point LINESTRING would be zero-length and dropped by
+                # the tiler). The route builder reads only `stops`.
+                for _sfid, (_lon, _lat, _sname) in _xy.items():
                     _sdata = json.dumps(
                         {"c": [_lon, _lat], "n": _sname},
                         separators=(",", ":"),
@@ -3494,14 +3421,16 @@ def _(Path, os, textwrap):
                         "lon": _lon,
                         "lat": _lat,
                     })
+                _n_stations = len(_xy)
                 _legs = pl.DataFrame(legs_rows)
                 _legs_parquet = (
                     TILES_WORK / "austria-routehub-legs.parquet"
                 )
                 _legs.write_parquet(_legs_parquet)
                 print(
-                    "[compute_route_network] reconstructed journeys — "
-                    f"h2s={len(h2s)}, s2h={len(s2h)}, h2h={len(h2h)}"
+                    "[compute_route_network] real-timetable graph — "
+                    f"{_n_trips} hub-touching rail trips, "
+                    f"{_n_stations} stations"
                 )
 
                 con2 = duckdb.connect()
@@ -3513,7 +3442,7 @@ def _(Path, os, textwrap):
                         )
                         SELECT
                             osm_id,
-                            -- journeys: degenerate origin->dest line
+                            -- theme='trip': degenerate origin->dest line
                             -- (the JS never reads it). theme='station'
                             -- catalogue rows: a real POINT — a same-
                             -- point LINESTRING would be zero-length and
@@ -3549,30 +3478,31 @@ def _(Path, os, textwrap):
                 ).fetchone()[0]
                 con2.close()
                 # The GROUP BY osm_id must be 1:1 with the input rows —
-                # one row per journey (theme-prefixed osm_id) PLUS one
-                # per station (osm_id 'station/<sfid>'). A mismatch means
-                # an osm_id collided and a row was merged/lost.
-                _n_expected = len(journeys) + len(st_info)
+                # one per trip ('trip/<trip_id>') PLUS one per station
+                # ('station/<sfid>'). A mismatch means an osm_id collided
+                # and a row was merged/lost.
+                _n_expected = _n_trips + _n_stations
                 if _n != _n_expected:
                     raise RuntimeError(
                         "compute_route_network: osm_id collision — "
-                        f"{len(journeys)} journeys + {len(st_info)} "
-                        f"stations expected, {_n} rows out"
+                        f"{_n_trips} trips + {_n_stations} stations "
+                        f"expected, {_n} rows out"
                     )
                 print(
                     "[compute_route_network] wrote "
-                    f"{len(journeys)} journeys + {len(st_info)} station "
-                    f"rows ({out.stat().st_size // 1024}"
-                    f" KiB) -> {out}"
+                    f"{_n_trips} trip rows + {_n_stations} station rows "
+                    f"({out.stat().st_size // 1024} KiB) -> {out}"
                 )
                 return str(out)
 
             @task
             def freestiler_routehub_convert(routehub_paths: str) -> str:
-                # Bake the hub-decomposition routing network to PMTiles —
-                # the same freestiler -> PMTiles path every other on-map
-                # dataset uses. The route-builder cell consumes it as the
-                # `austria-routehub` vector source.
+                # Bake the route-builder network to PMTiles — the same
+                # freestiler -> PMTiles path every other on-map dataset
+                # uses. The route-builder cell consumes it as the
+                # `austria-routehub` vector source: one theme='trip' row
+                # per rail trip + one theme='station' catalogue row per
+                # station (the column list is theme-agnostic).
                 import freestiler
                 TILES.mkdir(parents=True, exist_ok=True)
                 out = TILES / "austria-routehub.pmtiles"
@@ -3594,8 +3524,8 @@ def _(Path, os, textwrap):
                 """
                 # z0-only: this tile is a "load the whole dataset"
                 # delivery channel, not a spatial map layer. One z0 tile
-                # holds every journey, is always loaded at any display
-                # zoom (the map sets source maxzoom 0 so MapLibre
+                # holds every trip + station, is always loaded at any
+                # display zoom (the map sets source maxzoom 0 so MapLibre
                 # overzooms it), and querySourceFeatures sees them all.
                 # Baking z0-10 with full polylines ballooned the archive
                 # to 440 MB via per-zoom tile-crossing line replication.
@@ -3686,8 +3616,8 @@ def _(Path, os, textwrap):
             #                    → freestiler_chrono_convert ──────┤
             #                    → compute_fastest_connections     │
             #                         → freestiler_fastlink_convert┤
-            #                    → compute_route_network           │
-            #                         → freestiler_routehub_convert┤
+            #               → compute_route_network                │
+            #                    → freestiler_routehub_convert ────┤
             #                                          → reload_martin
             gtfs_dir = gtfs_to_parquet(download_gtfs())
             db = materialize_duckdb(gtfs_dir)
@@ -3723,14 +3653,23 @@ def _(Path, os, textwrap):
             chrono_isochrones = compute_chrono_isochrones(db)
             optimal_hubs >> chrono_isochrones
             chrono_tile = freestiler_chrono_convert(chrono_isochrones)
-            # Fastest hub→hub connections + the hub-decomposition routing
-            # network (hub→station, station→hub, hub→hub profile): both
-            # backtrack the CSA's predecessor chain (no CSA, no GPU) over
-            # the intermediates compute_chrono_isochrones persisted —
-            # hence ORDERED after it.
+            # Fastest hub→hub connections: backtracks the CSA's
+            # predecessor chain (no CSA, no GPU) over the intermediates
+            # compute_chrono_isochrones persisted — hence ORDERED after
+            # it.
             fastlinks = compute_fastest_connections(chrono_isochrones)
             fastlink_tile = freestiler_fastlink_convert(fastlinks)
-            route_net = compute_route_network(chrono_isochrones)
+            # Route-builder network: the real timetable baked one row per
+            # rail trip + the station catalogue. It reads austria.duckdb
+            # READ-ONLY and needs only transit.optimal_hubs +
+            # transit.station_members — NOT the chronomap CSA outputs —
+            # so it is ORDERED AFTER optimal_hubs (whose write connection
+            # must have closed first; DuckDB forbids a read-only open
+            # while a read-write one is held) and runs in PARALLEL with
+            # compute_chrono_isochrones. Deterministic ordering, not a
+            # sleep (R4).
+            route_net = compute_route_network(db)
+            optimal_hubs >> route_net
             routehub_tile = freestiler_routehub_convert(route_net)
             # ONE reload picks up all four freshly-baked tiles.
             reload_martin([transit_tile, chrono_tile, fastlink_tile,
@@ -5681,10 +5620,11 @@ def _theme_styles():
 
     # ---- ROUTEBUILD_STYLE — the build-your-own-route map -------------
     # The route-builder cell passes source_name="austria-routehub" (the
-    # hub-decomposition routing network) and extra_sources for the
-    # `austria-transit` station dots + two client-side GeoJSON sources
-    # (`route-src` = the stitched route, `pick-src` = the picked
-    # waypoints) which _ROUTEBUILD_JS keeps up to date.
+    # real timetable — one row per rail trip — plus the station
+    # catalogue) and extra_sources for the `austria-transit` station
+    # dots + two client-side GeoJSON sources (`route-src` = the
+    # searched route, `pick-src` = the picked waypoints) which
+    # _ROUTEBUILD_JS keeps up to date.
     #   * routehub-loader   — an always-false-filtered line on the
     #     `austria-routehub` source: renders nothing, but forces martin
     #     to load the source's tiles so querySourceFeatures can read the
@@ -6650,34 +6590,41 @@ def _(mo):
     journey through your picked stations and shows the cumulative
     leg-by-leg itinerary.
 
-    Routing every station pair (~1,650²) would explode, so each
-    segment is **hub-decomposed**: `station → hub → … → hub →
-    station`, over the routing network the GTFS DAG precomputes —
-    `hub→station`, `station→hub`, and a **hub→hub departure-time
-    profile** so the hub-core leg is matched to when the
-    `station→hub` leg actually arrives. And because every computed
-    journey carries its full ordered stop list, a waypoint pair
-    that already shares one journey is routed as a **direct
-    sub-path** of it — no hub detour for nearby stations. All of it
-    is the `austria-routehub` PMTiles archive + a client-side
-    stitcher; no per-route compute.
+    Every leg is a **real train**. The GTFS DAG bakes the real
+    timetable — one row per rail trip, its ordered station calls
+    with real times — into the `austria-routehub` PMTiles archive,
+    and the browser does a **bounded hub-restricted search** over
+    it: board a real trip, **ride it through any hubs it passes**
+    (no transfer — you stay seated, "join the connections that pass
+    through the hub"), and **change trains only at a hub**, to a
+    real trip departing after you really arrive. A single train
+    covering the whole pair is found as a zero-transfer route. So
+    the clock times shown are real and coherent by construction —
+    no stitched snapshots, no phantom waits. All of it is the
+    `austria-routehub` archive + a client-side search; no per-route
+    compute.
     """)
     return
 
 
 @app.cell
 def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
-    # Route-builder cell — click stations, get a hub-decomposed route.
+    # Route-builder cell — click stations, get a real-timetable route.
     #
     # source_name="austria-routehub" → the helper's `src` IS the
-    # routing-network tile (hub→station / station→hub / hub→hub-profile
-    # journeys, each carrying its full ordered `stops` list). The
-    # `routehub-loader` style layer (always-false filter, renders
-    # nothing) forces martin to load that source's tiles so
-    # _ROUTEBUILD_JS can read journey `stops` via querySourceFeatures.
-    # extra_sources also wires `austria-transit` (the clickable station
-    # dots + the station→coord lookup) and two empty client-side
-    # GeoJSON sources (`route-src`, `pick-src`) the JS keeps updated.
+    # route-builder tile: one theme='trip' row per rail trip (its
+    # ordered station calls with real times) + one theme='station'
+    # catalogue row per station (coord + name). The `routehub-loader`
+    # style layer (always-false filter, renders nothing) forces martin
+    # to load that source's tiles so _ROUTEBUILD_JS can read every trip
+    # via querySourceFeatures. The browser does a bounded hub-restricted
+    # search over the real timetable — board a real trip, ride it
+    # through any hubs it passes (no transfer — you stay seated), change
+    # trains ONLY at a hub to a real trip departing after you really
+    # arrive — so every leg shown is a slice of one real trip with real,
+    # coherent clock times. extra_sources also wires `austria-transit`
+    # (the clickable station dots) and two empty client-side GeoJSON
+    # sources (`route-src`, `pick-src`) the JS keeps updated.
     mo.stop(
         dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
         f"Waiting for notebook_austria_gtfs_pipeline (state="
@@ -6693,12 +6640,16 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
         "`compute_route_network` + `freestiler_routehub_convert` tasks "
         "produce it (re-run the DAG if this notebook predates them).",
     )
+    # Route-builder search bound: a journey shown to the user changes
+    # trains at most this many times. Caps the client-side search
+    # fan-out; a route-builder tunable, not baked data.
+    _max_transfers = 2
     # The route-builder interaction, injected via the helper's
     # `extra_js`. Coupled to source_name="austria-routehub" (map var
     # `map_austria_routehub` / container `map-austria-routehub`), the
     # `routebuild-station-dot` click layer, and the `route-src` /
     # `pick-src` client GeoJSON sources from ROUTEBUILD_STYLE.
-    _ROUTEBUILD_JS = """
+    _ROUTEBUILD_JS = "var ROUTEBUILD_MAX_TRANSFERS = " + str(_max_transfers) + ";\n" + """
     (function () {
       var M = map_austria_routehub;
       // MapLibre's default boxZoom handler claims shift+mousedown
@@ -6708,17 +6659,14 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
       // only; the other five maps keep boxZoom) so a shift+click
       // reaches the routebuild-station-dot handler.
       M.boxZoom.disable();
-      var route = [];        // picked station_feature_ids, in order
-      var routeSegs = [];    // one entry per consecutive waypoint pair
-      var coordOf = {};      // station_feature_id -> [lon,lat]
-      var nameOf = {};       // station_feature_id -> name
-      var h2h = {};          // hub_a -> hub_b -> [opts sorted by depart_s]
-      var allDirect = [];    // every journey's stops, for sub-path search
+      var route = [];          // picked station_feature_ids, in order
+      var routeSegs = [];      // one entry per consecutive waypoint pair
+      var coordOf = {};        // station_feature_id -> [lon,lat]
+      var nameOf = {};         // station_feature_id -> name
+      var tripStops = {};      // 'trip/<id>' -> [[sfid,arr_s,dep_s,is_hub]...]
+      var tripsCallingAt = {}; // sfid -> [{trip, idx}]
+      var hubSet = {};         // sfid -> true (allowed transfer points)
 
-      function hhSec(h) {
-    if (!h) { return null; }
-    return (+h.slice(0, 2)) * 3600 + (+h.slice(3)) * 60;
-      }
       function dedup(feats) {              // tile-clip dedup by osm_id
     var seen = {}, out = [];
     for (var i = 0; i < feats.length; i++) {
@@ -6726,6 +6674,24 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
       if (p.osm_id && !seen[p.osm_id]) { seen[p.osm_id] = 1; out.push(p); }
     }
     return out;
+      }
+      // raw seconds-after-midnight -> "HH:MM" (+Nd when the trip runs
+      // past midnight — a real overnight service, not an artifact).
+      function fmtT(s) {
+    if (s === '' || s == null) { return '--:--'; }
+    s = +s;
+    var d = Math.floor(s / 86400), m = ((s % 86400) + 86400) % 86400;
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return p(Math.floor(m / 3600)) + ':' + p(Math.floor((m % 3600) / 60))
+      + (d > 0 ? ' (+' + d + 'd)' : '');
+      }
+      // a stop tuple is [sfid, arr_s, dep_s, is_hub]; arr is '' at the
+      // trip's first call, dep is '' at its last. Numeric time or null.
+      function stopArr(stops, i) {
+    var v = stops[i][1]; return (v === '' || v == null) ? null : +v;
+      }
+      function stopDep(stops, i) {
+    var v = stops[i][2]; return (v === '' || v == null) ? null : +v;
       }
       function coordsOf(stops) {           // stops -> [lon,lat] list
     var c = [];
@@ -6747,183 +6713,127 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
       + 'border-radius:4px;font:12px/1.5 sans-serif;color:#222;'
       + 'box-shadow:0 1px 6px rgba(0,0,0,0.4);';
     box.appendChild(panel);
-    // station -> coord / name. Sourced from the austria-routehub tile's
-    // own theme='station' catalogue rows — NOT austria-transit, whose
-    // querySourceFeatures is viewport-limited and would leave the
-    // off-screen legs of a route undrawn. austria-routehub is the
-    // z0-only, always-loaded tile, so this catalogue is COMPLETE
-    // regardless of where the map is panned.
-    var sf = dedup(M.querySourceFeatures('src',
-      { sourceLayer: 'austria-routehub',
-        filter: ['==', ['get', 'theme'], 'station'] }));
-    for (var i = 0; i < sf.length; i++) {
-      var sp = sf[i], sd;
-      try { sd = JSON.parse(sp.stops || '{}'); } catch (e) { sd = {}; }
-      if (sp.origin_station_id && sd.c) {
-        coordOf[sp.origin_station_id] = sd.c;
-        nameOf[sp.origin_station_id] = sd.n || sp.origin_station_id;
-      }
-    }
-    // pre-load every journey's stops (for direct sub-path search) +
-    // the hub->hub profile lookup
-    var jf = dedup(M.querySourceFeatures('src',
+    // Build the "clear graph" from the z0-only austria-routehub tile —
+    // always fully loaded, so this is COMPLETE regardless of map pan.
+    // theme='station' rows -> coordOf / nameOf; theme='trip' rows ->
+    // every real trip's ordered calls + the reverse index
+    // station -> trips calling there + the hub set.
+    var feats = dedup(M.querySourceFeatures('src',
       { sourceLayer: 'austria-routehub' }));
-    for (var i = 0; i < jf.length; i++) {
-      var p = jf[i];
-      if (p.theme === 'station') { continue; }
-      var stops;
-      try { stops = JSON.parse(p.stops || '[]'); } catch (e) { stops = []; }
-      if (stops.length < 2) { continue; }
-      allDirect.push({ stops: stops, theme: p.theme });
-      if (p.theme === 'h2h') {
-        var a = p.origin_station_id, b = p.dest_station_id;
-        (h2h[a] = h2h[a] || {});
-        (h2h[a][b] = h2h[a][b] || []);
-        h2h[a][b].push({
-          depart_s: hhSec(p.depart_hhmm),
-          arrive_s: hhSec(p.arrive_hhmm),
-          travel_min: +p.travel_min, n_transfers: +p.n_transfers,
-          stops: stops,
-        });
-      }
-    }
-    for (var a in h2h) {
-      for (var b in h2h[a]) {
-        h2h[a][b].sort(function (x, y) {
-          return x.depart_s - y.depart_s;
-        });
+    for (var i = 0; i < feats.length; i++) {
+      var p = feats[i];
+      if (p.theme === 'station') {
+        var sd;
+        try { sd = JSON.parse(p.stops || '{}'); } catch (e) { sd = {}; }
+        if (p.origin_station_id && sd.c) {
+          coordOf[p.origin_station_id] = sd.c;
+          nameOf[p.origin_station_id] = sd.n || p.origin_station_id;
+        }
+      } else if (p.theme === 'trip') {
+        var stops;
+        try { stops = JSON.parse(p.stops || '[]'); }
+        catch (e) { stops = []; }
+        if (stops.length < 2) { continue; }
+        tripStops[p.osm_id] = stops;
+        for (var k = 0; k < stops.length; k++) {
+          var sfid = stops[k][0];
+          (tripsCallingAt[sfid] = tripsCallingAt[sfid] || [])
+            .push({ trip: p.osm_id, idx: k });
+          if (stops[k][3]) { hubSet[sfid] = true; }
+        }
       }
     }
     renderPanel();
       });
 
-      // a direct sub-path of a single computed journey covering A then B.
-      // ia = where the journey DEPARTS a (its entry with a non-empty
-      // dep — for a transfer station that is the board twin, not the
-      // alight twin); ib = where it ARRIVES at b (non-empty arr). Slicing
-      // a clean board..alight run keeps renderLegs free of phantom
-      // "transfer at origin" lines and the time math honest.
-      function directSubpath(a, b) {
-    var best = null;
-    for (var i = 0; i < allDirect.length; i++) {
-      var stops = allDirect[i].stops, ia = -1, ib = -1;
-      for (var k = 0; k < stops.length; k++) {
-        if (stops[k][0] === a && stops[k][2] !== '') { ia = k; break; }
+      // Bounded hub-restricted search A -> B over the real timetable.
+      // Board any real trip calling at A; RIDE it forward freely
+      // through any hubs it passes (staying on the train is free —
+      // this IS "join the connections that pass through the hub");
+      // CHANGE trains only at a hub, to a DIFFERENT real trip departing
+      // at/after you really arrive. Explored breadth-first by transfer
+      // count, so the first reach of B is transfer-minimal; within that
+      // level the earliest real arrival wins. seen[(hub,nTr)] keeps the
+      // earliest arrival per state and prunes the fan-out.
+      function findRoute(a, b) {
+    if (!a || !b || a === b) { return null; }
+    var best = null, seen = {};
+    var frontier = [];
+    (tripsCallingAt[a] || []).forEach(function (e) {
+      var dep = stopDep(tripStops[e.trip], e.idx);
+      if (dep == null) { return; }          // a is this trip's terminus
+      frontier.push({ nTr: 0, legs: [],
+        pending: { trip: e.trip, boardIdx: e.idx } });
+    });
+    while (frontier.length) {
+      var nextF = [];
+      for (var fi = 0; fi < frontier.length; fi++) {
+        var stt = frontier[fi];
+        var trip = stt.pending.trip,
+            stops = tripStops[trip],
+            bIdx = stt.pending.boardIdx;
+        for (var k = bIdx + 1; k < stops.length; k++) {   // RIDE forward
+          var sfid = stops[k][0], arr = stopArr(stops, k);
+          if (arr == null) { continue; }
+          var legs2 = stt.legs.concat(
+            [{ trip: trip, boardIdx: bIdx, alightIdx: k }]);
+          if (sfid === b) {                               // reached B
+            if (!best || arr < best.arrSec) {
+              best = { legs: legs2, arrSec: arr, nTr: stt.nTr };
+            }
+            continue;
+          }
+          if (!hubSet[sfid]) { continue; }       // transfer only at hub
+          if (stt.nTr + 1 > ROUTEBUILD_MAX_TRANSFERS) { continue; }
+          var sk = sfid + '|' + (stt.nTr + 1);
+          if (seen[sk] != null && seen[sk] <= arr) { continue; }
+          seen[sk] = arr;
+          var conns = tripsCallingAt[sfid] || [];
+          for (var ci = 0; ci < conns.length; ci++) {
+            var e2 = conns[ci];
+            if (e2.trip === trip) { continue; }    // not the same train
+            var dep2 = stopDep(tripStops[e2.trip], e2.idx);
+            if (dep2 == null || dep2 < arr) { continue; }
+            nextF.push({ nTr: stt.nTr + 1, legs: legs2,
+              pending: { trip: e2.trip, boardIdx: e2.idx } });
+          }
+        }
       }
-      if (ia < 0) { continue; }
-      for (var k = ia + 1; k < stops.length; k++) {
-        if (stops[k][0] === b && stops[k][1] !== '') { ib = k; break; }
-      }
-      if (ib < 0) { continue; }
-      var sub = stops.slice(ia, ib + 1);
-      var t = (hhSec(sub[sub.length - 1][1]) - hhSec(sub[0][2])) / 60;
-      if (t >= 0 && (!best || t < best.travel_min)) {
-        best = {
-          direct: true, coords: coordsOf(sub),
-          parts: [{ stops: sub }],
-          travel_min: Math.round(t),
-          n_transfers: sub[sub.length - 1][3] - sub[0][3],
-        };
-      }
+      if (best) { break; }   // first transfer-level reaching B wins
+      frontier = nextF;
     }
-    return best;
+    return best ? buildSegment(best) : null;
       }
 
-      // hub-decompose A -> B: station->hub + hub->hub(time-matched) +
-      // hub->station, argmin total arrival
-      function hubDecompose(a, b) {
-    function pieces(theme, prop, val) {
-      return dedup(M.querySourceFeatures('src', {
-        sourceLayer: 'austria-routehub',
-        filter: ['all', ['==', ['get', 'theme'], theme],
-                 ['==', ['get', prop], val]],
-      })).map(function (p) {
-        var st;
-        try { st = JSON.parse(p.stops || '[]'); } catch (e) { st = []; }
-        return {
-          hub: (theme === 's2h' ? p.dest_station_id
-                                : p.origin_station_id),
-          arrive_s: hhSec(p.arrive_hhmm),
-          travel_min: +p.travel_min, n_transfers: +p.n_transfers,
-          stops: st,
-        };
-      });
+      // a found route -> the {direct, coords, parts, travel_min,
+      // n_transfers} shape renderPanel/redraw expect. One `part` per
+      // real trip leg (the board..alight slice of that trip's stops).
+      function buildSegment(found) {
+    var parts = [], coords = [];
+    for (var i = 0; i < found.legs.length; i++) {
+      var lg = found.legs[i];
+      var slice = tripStops[lg.trip].slice(
+        lg.boardIdx, lg.alightIdx + 1);
+      parts.push({ stops: slice, trip: lg.trip });
+      coords = coords.concat(coordsOf(slice));
     }
-    var access = {}, egress = {};
-    pieces('s2h', 'origin_station_id', a).forEach(function (x) {
-      if (!access[x.hub] || x.arrive_s < access[x.hub].arrive_s) {
-        access[x.hub] = x;
-      }
-    });
-    pieces('h2s', 'dest_station_id', b).forEach(function (x) {
-      if (!egress[x.hub] || x.travel_min < egress[x.hub].travel_min) {
-        egress[x.hub] = x;
-      }
-    });
-    var best = null;
-    for (var ha in access) {
-      var ac = access[ha];
-      for (var hb in egress) {
-        var eg = egress[hb], mid;
-        if (ha === hb) {
-          mid = { travel_min: 0, n_transfers: 0, stops: [] };
-        } else {
-          var opts = (h2h[ha] || {})[hb];
-          if (!opts) { continue; }
-          mid = null;
-          for (var k = 0; k < opts.length; k++) {
-            if (opts[k].depart_s >= ac.arrive_s) { mid = opts[k]; break; }
-          }
-          if (!mid) { continue; }
-        }
-        var total = ac.travel_min + mid.travel_min + eg.travel_min;
-        if (!best || total < best.total) {
-          best = { total: total, access: ac, mid: mid, egress: eg };
-        }
-      }
-    }
-    if (!best) { return null; }
-    var parts = [{ stops: best.access.stops, label: 'to hub' }];
-    if (best.mid.stops.length) {
-      parts.push({ stops: best.mid.stops, label: 'hub \\u2192 hub' });
-    }
-    parts.push({ stops: best.egress.stops, label: 'from hub' });
-    var coords = [];
-    parts.forEach(function (pt) {
-      coords = coords.concat(coordsOf(pt.stops));
-    });
+    var lg0 = found.legs[0];
+    var dep0 = stopDep(tripStops[lg0.trip], lg0.boardIdx);
     return {
-      direct: false, coords: coords, parts: parts, travel_min: best.total,
-      n_transfers: best.access.n_transfers + best.mid.n_transfers
-                   + best.egress.n_transfers,
+      direct: found.nTr === 0,
+      coords: coords, parts: parts,
+      travel_min: (dep0 == null ? 0
+        : Math.round((found.arrSec - dep0) / 60)),
+      n_transfers: found.nTr,
     };
       }
 
-      function addSegment(prev, cur) {
-    return directSubpath(prev, cur) || hubDecompose(prev, cur);
-      }
-
-      // render a part's leg-by-leg schedule (group stops by leg_idx)
-      function renderLegs(stops) {
-    var html = '', byLeg = {};
-    for (var i = 0; i < stops.length; i++) {
-      (byLeg[stops[i][3]] = byLeg[stops[i][3]] || []).push(stops[i]);
-    }
-    var legIds = Object.keys(byLeg).sort(function (x, y) {
-      return (+x) - (+y);
-    });
-    for (var li = 0; li < legIds.length; li++) {
-      var ls = byLeg[legIds[li]];
-      var a = ls[0], z = ls[ls.length - 1];
-      if (li > 0) {
-        html += '<div style="color:#b06000;">&#8597; transfer at '
-          + (nameOf[a[0]] || a[0]) + '</div>';
-      }
-      html += '<div>&#128642; <b>' + a[2] + '</b> '
-        + (nameOf[a[0]] || a[0]) + '<br>&nbsp;&nbsp;&#8595; <b>'
-        + z[1] + '</b> ' + (nameOf[z[0]] || z[0]) + '</div>';
-    }
-    return html;
+      // one real trip leg: board stop+time -> alight stop+time.
+      function renderLegs(part) {
+    var st = part.stops, a = st[0], z = st[st.length - 1];
+    return '<div>&#128642; <b>' + fmtT(a[2]) + '</b> '
+      + (nameOf[a[0]] || a[0]) + '<br>&nbsp;&nbsp;&#8595; <b>'
+      + fmtT(z[1]) + '</b> ' + (nameOf[z[0]] || z[0]) + '</div>';
       }
 
       function renderPanel() {
@@ -6957,11 +6867,17 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
       totMin += seg.travel_min;
       totTr += seg.n_transfers;
       h += '<div style="color:#666;">leg ' + (s + 1) + ' &mdash; '
-        + (seg.direct ? 'direct' : 'via hub') + ', '
-        + seg.travel_min + ' min, ' + seg.n_transfers + ' transfer'
-        + (seg.n_transfers === 1 ? '' : 's') + '</div>';
+        + (seg.direct ? 'direct'
+           : seg.n_transfers + ' transfer'
+             + (seg.n_transfers === 1 ? '' : 's'))
+        + ', ' + seg.travel_min + ' min</div>';
       for (var pi = 0; pi < seg.parts.length; pi++) {
-        h += renderLegs(seg.parts[pi].stops);
+        if (pi > 0) {                  // transfer between two real trips
+          var hub = seg.parts[pi].stops[0];
+          h += '<div style="color:#b06000;">&#8597; transfer at '
+            + (nameOf[hub[0]] || hub[0]) + '</div>';
+        }
+        h += renderLegs(seg.parts[pi]);
       }
     }
     if (routeSegs.length && okAll) {
@@ -7010,7 +6926,7 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
     if (e.originalEvent && e.originalEvent.shiftKey && route.length) {
       var prev = route[route.length - 1];
       if (prev === sid) { return; }
-      routeSegs.push(addSegment(prev, sid));
+      routeSegs.push(findRoute(prev, sid));
       route.push(sid);
     } else {
       route = [sid];
