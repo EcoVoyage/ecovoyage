@@ -1178,35 +1178,9 @@ def _(Path, os, textwrap):
                 # query, so we round-trip through parquet — the same
                 # pattern every other freestiler task already uses).
                 #
-                # `primary_route_type` rolls the GTFS route_type column
-                # up to a single integer per stop using the precedence
-                # rail > subway > tram > funicular > cable_car/gondola >
-                # ferry > bus. The satellite-overlay map's TRANSIT_STYLE
-                # uses it to tint each stop dot by mode (Artaria-1911
-                # operator-color signature). Values follow the GTFS
-                # route_type enum: 0=tram, 1=subway, 2=rail, 3=bus,
-                # 4=ferry, 5=cable_car, 6=gondola, 7=funicular.
                 transit_parquet = TILES_WORK / "austria-transit-stops.parquet"
                 con.sql(f"""
                     COPY (
-                        WITH stop_route_types AS (
-                            SELECT
-                                st.stop_id,
-                                CASE
-                                    WHEN bool_or(r.route_type = 2) THEN 2  -- rail
-                                    WHEN bool_or(r.route_type = 1) THEN 1  -- subway
-                                    WHEN bool_or(r.route_type = 0) THEN 0  -- tram
-                                    WHEN bool_or(r.route_type = 7) THEN 7  -- funicular
-                                    WHEN bool_or(r.route_type IN (5, 6)) THEN 5  -- cable car / gondola
-                                    WHEN bool_or(r.route_type = 4) THEN 4  -- ferry
-                                    WHEN bool_or(r.route_type = 3) THEN 3  -- bus
-                                    ELSE NULL
-                                END AS primary_route_type
-                            FROM gtfs.stop_times st
-                            JOIN gtfs.trips t USING (trip_id)
-                            JOIN gtfs.routes r USING (route_id)
-                            GROUP BY st.stop_id
-                        )
                         SELECT
                             CAST(s.stop_id AS VARCHAR)         AS osm_id,
                             ST_Point(s.stop_lon, s.stop_lat)   AS geometry,
@@ -1217,22 +1191,13 @@ def _(Path, os, textwrap):
                             COALESCE(m.match_kind, 'unmatched') AS match_kind,
                             m.match_distance_m,
                             m.osm_feature_id,
-                            -- Cast to VARCHAR so freestiler keeps the
-                            -- column through the parquet → MVT round-
-                            -- trip (numeric-nullable cols are silently
-                            -- dropped). The TRANSIT_STYLE filter uses
-                            -- ["==", ["get","primary_route_type"], "2"]
-                            -- against the resulting string values.
-                            CAST(rt.primary_route_type AS VARCHAR)
-                                AS primary_route_type,
                             -- Station roll-up identity. Joined from
                             -- transit.station_members (one row per GTFS
                             -- stop_id — covers EVERY stop incl. the
                             -- unmatched, unlike matched_stops). CAST to
-                            -- VARCHAR for the same reason as
-                            -- primary_route_type: freestiler drops
-                            -- numeric-nullable columns on the parquet →
-                            -- MVT round-trip. The id is already a string
+                            -- VARCHAR because freestiler drops numeric-
+                            -- nullable columns on the parquet → MVT
+                            -- round-trip. The id is already a string
                             -- ('node/..' | 'way/..' | 'gtfs/..' | a raw
                             -- stop_id) — the CAST makes the contract
                             -- explicit and null-safe.
@@ -1241,11 +1206,12 @@ def _(Path, os, textwrap):
                             sm.station_name,
                             -- Exactly ONE row per station_feature_id is
                             -- 'true' — the member point closest to the
-                            -- station anchor coords. transit-stops-label
-                            -- filters on this so a big station shows ONE
-                            -- label, not one per platform. String, not
-                            -- bool — bools are dropped on the MVT round-
-                            -- trip just like numeric-nullables.
+                            -- station anchor coords. transit-station-dot
+                            -- and transit-stops-label both filter on this
+                            -- so a big station shows ONE dot + ONE label,
+                            -- not one per platform. String, not bool —
+                            -- bools are dropped on the MVT round-trip
+                            -- just like numeric-nullables.
                             CASE WHEN ROW_NUMBER() OVER (
                                 PARTITION BY sm.station_feature_id
                                 ORDER BY ST_Distance(
@@ -1256,9 +1222,10 @@ def _(Path, os, textwrap):
                                 AS is_station_label,
                             -- Transfer-hub importance, per station_feature_id
                             -- (so every member row carries the station's
-                            -- value). hub_rank drives symbol-sort-key in
-                            -- transit-stops-label. CAST to VARCHAR for the
-                            -- same MVT-round-trip reason as the columns
+                            -- value). hub_rank drives both the progressive
+                            -- label-disclosure filter and symbol-sort-key
+                            -- in transit-stops-label. CAST to VARCHAR for
+                            -- the same MVT-round-trip reason as the columns
                             -- above; COALESCE so a station with <2 routes
                             -- (no route pairs, absent from
                             -- station_hub_scores) still sorts last.
@@ -1268,7 +1235,6 @@ def _(Path, os, textwrap):
                                 AS hub_rank
                         FROM gtfs.stops s
                         LEFT JOIN transit.matched_stops m USING (stop_id)
-                        LEFT JOIN stop_route_types rt USING (stop_id)
                         LEFT JOIN transit.station_members sm USING (stop_id)
                         LEFT JOIN transit.station_hub_scores hs
                           ON hs.station_feature_id = sm.station_feature_id
@@ -1430,7 +1396,6 @@ def _(Path, os, textwrap):
                            match_kind,
                            match_distance_m,
                            osm_feature_id,
-                           primary_route_type,
                            station_feature_id,
                            station_name,
                            is_station_label,
@@ -1689,6 +1654,7 @@ def build_pipeline_maplibre_html(
     extra_sources: dict | None = None,
     extra_layers: list | None = None,
     mlt: bool = False,
+    source_maxzoom: int = 12,
     terrain: bool = False,
     satellite_background: bool = False,
     pitch: int = 0,
@@ -1750,7 +1716,13 @@ def build_pipeline_maplibre_html(
     data_layers = []
     for _layer in raw_layers:
         _layer = dict(_layer)  # shallow copy — paint/filter dicts shared but not mutated
-        if _layer.get("type") != "background":
+        # Force source/source-layer to this cell's `src` ONLY for layers
+        # that use the default `src` source. A layer that explicitly names
+        # another source (e.g. a second martin tier passed via
+        # extra_sources, like the satellite-overlay map's `paths-src`) is
+        # left untouched so multi-source styles work. The copy above keeps
+        # this non-mutating even for shared module-level style constants.
+        if _layer.get("type") != "background" and _layer.get("source", "src") == "src":
             _layer["source"] = "src"
             _layer["source-layer"] = layer_name
         data_layers.append(_layer)
@@ -1790,16 +1762,18 @@ def build_pipeline_maplibre_html(
         *(extra_layers or []),
     ]
     layers_js = _json.dumps(all_layers, indent=2)
-    # Explicit `maxzoom: 12` matches the highest source-zoom that
-    # exists in austria-ecovoyage.pmtiles (freestiler bakes z=0..12).
-    # MapLibre AUTO-OVERZOOMS for display zoom > 12 — renders the
-    # z=12 vector features upscaled at z=13/14/15/.... Without this
-    # hint, MapLibre tries to fetch non-existent z=13+ tiles from
-    # martin, gets 4xx, and returns 0 features at high zoom.
+    # `source_maxzoom` MUST match the highest zoom freestiler baked into
+    # this source's PMTiles archive. MapLibre AUTO-OVERZOOMS for display
+    # zoom > source_maxzoom — renders the top-zoom vector features
+    # upscaled. Without an accurate hint MapLibre fetches non-existent
+    # higher-zoom tiles from martin, gets 4xx, and returns 0 features at
+    # high zoom. Every caller passes the value matching its own source
+    # (e.g. austria-rail / austria-routes / austria-paths = 14,
+    # austria-ecovoyage = 12).
     source_dict = {
         "type": "vector",
         "url": f"{martin}/{source_name}",
-        "maxzoom": 12,
+        "maxzoom": source_maxzoom,
     }
     if mlt:
         source_dict["mlt"] = True
@@ -1906,9 +1880,8 @@ def _theme_styles():
     #
     # Palette is keyed to the Artaria 1911 Eisenbahnkarte legend
     # (k.k. red mainline, k.u. green urban, k.k. Böhm.Nordbahn violet
-    # for funicular, etc.) and includes RESERVED slots for non-rail
-    # public transport modes (bus/ferry/cable-car) that the GTFS DAG's
-    # `primary_route_type` rollup tints transit-stop dots by.
+    # for funicular, etc.), plus ART_HUB for the neutral GTFS station
+    # dot and ART_FERRY for OSM ferry routes.
     #
     # NOTE: notebooks/osm-austria.py's _theme_styles cell still uses the
     # pre-2026-05-14 heterogeneous palette and will be brought in line
@@ -1924,10 +1897,9 @@ def _theme_styles():
     ART_VIOLET          = "#5e3a8a"  # funicular / Zahnradbahn
     ART_VIOLET_LIGHT    = "#7a5aa0"  # aerialway / cable-car / gondola
 
-    # Non-rail public transport (RESERVED palette slots — used by
-    # TRANSIT_STYLE per-mode dot tinting)
-    ART_BUS             = "#b8862b"  # bus stops (mustard ochre)
-    ART_FERRY           = "#3a6a9a"  # ferry/ship piers (deep blue-grey)
+    # GTFS station overlay + OSM ferry routes
+    ART_HUB             = "#2b2b2b"  # GTFS station dot (neutral, mode-agnostic)
+    ART_FERRY           = "#3a6a9a"  # ferry / ship routes (deep blue-grey)
 
     # Cycle hierarchy
     ART_TEAL            = "#1a4a6e"  # cycle long-distance routes
@@ -2013,11 +1985,6 @@ def _theme_styles():
     W_WALK_LOCAL        = [11, 0.4, 14, 1.0, 18, 2.0]           # track / service / residential
     W_WALK_FOOT         = [12, 0.4, 14, 0.9, 18, 1.8]           # footway / path / pedestrian
     W_WALK_CASING       = [9, 1.4, 12, 2.6, 16, 4.6, 18, 6.2]   # shared casing (widest + ~1.5)
-
-    # Per-mode GTFS stop circle-radius ramps
-    R_STOP_BIG          = [6, 1.8, 10, 2.8, 14, 4.5, 18, 6.5]  # rail / subway
-    R_STOP_MED          = [8, 1.6, 12, 2.4, 14, 3.6, 18, 5.0]  # tram / cable
-    R_STOP_SMALL        = [10, 1.4, 12, 2.0, 14, 3.0, 18, 4.2]  # bus / ferry
 
     # RAILWAY_STYLE — for the ecovoyage 5-theme combined map. Per-mode
     # rail tier split (mainline/branch/subway/light-rail/tram/
@@ -2468,176 +2435,76 @@ def _theme_styles():
                    "circle-stroke-width": 1}},
     ]
 
-    # ---- TRANSIT_STYLE — per-mode GTFS-stops overlay -----------------
-    # Six per-mode circle layers tinted by `primary_route_type` (GTFS
-    # route_type rolled up by the materialize_duckdb DAG task with
-    # precedence rail > subway > tram > funicular > cable_car/gondola >
-    # ferry > bus). Each layer's filter selects ONE mode; the filters
-    # are mutually exclusive, so each stop renders exactly once.
+    # ---- TRANSIT_STYLE — GTFS station overlay -----------------------
+    # The GTFS feed resolves platform-granularity stops up to parent
+    # stations (transit.station_members). Exactly ONE representative
+    # member per station carries is_station_label='true'; every layer in
+    # this style keys off that flag, so a multi-platform station shows a
+    # single dot + a single name — not the ~7,600 platform circles the
+    # former per-mode circle layers drew at every zoom (removed
+    # 2026-05-14: they were the dominant paint cost and pure clutter at
+    # low/mid zoom).
     #
-    # Stops with NO matched GTFS route (orphan OSM points) render via a
-    # neutral 'unmatched' layer at the bottom of the stack.
-    #
-    # The text-label symbol layer at the top reads the stop name in
-    # ART_BLACK with ART_HALO halo at z>=11 (versatiles-glyphs-rs SDF
-    # fonts via the helper's `glyphs_url` kwarg). MapLibre's default
-    # text-allow-overlap=false drops crowded labels at city zoom.
+    # transit-station-dot: neutral mode-agnostic marker (ART_HUB) — "a
+    # GTFS-served station is here". Deliberately distinct from the
+    # k.k.-red OSM railway=station circles (sat-rail-station) so the two
+    # datasets stay visually separable. transit-stops-label: the station
+    # name in ART_BLACK + ART_HALO halo (versatiles-glyphs-rs SDF fonts
+    # via the helper's `glyphs_url` kwarg), disclosed progressively by
+    # hub_rank as zoom increases — top transfer hubs first, minor stops
+    # on zoom-in. symbol-sort-key = hub_rank gives MapLibre's collision
+    # solver the same priority order within each eligible set.
 
-    # GTFS route_type discriminator (per spec):
-    #   0 = Tram / Streetcar / Light rail
-    #   1 = Subway / Metro
-    #   2 = Rail
-    #   3 = Bus
-    #   4 = Ferry
-    #   5 = Cable Car
-    #   6 = Gondola / Aerial-suspended cable
-    #   7 = Funicular
-    # Values are STRING ("0".."7") not int, because freestiler drops
-    # nullable-int columns through the parquet → MVT pipeline.
-    _RT_FILTER = lambda rt: ["==",
-                              ["coalesce",
-                               ["get", "primary_route_type"], ""],
-                              str(rt)]
+    # Progressive label disclosure: a station's name shows once its
+    # hub_rank clears the per-zoom threshold below. hub_rank rides the
+    # tile as a string (parquet COPY), so `to-number` first. 999999 at
+    # z>=13 admits every station (no-score stations default to 999999).
+    _HUB_RANK_STEP = ["step", ["zoom"],
+                      15,        # z6-7  : top 15 hubs only
+                      8,  50,    # z8-9  : top 50
+                      10, 150,   # z10-11: top 150
+                      12, 400,   # z12   : top 400
+                      13, 999999]  # z13+ : all stations
 
     TRANSIT_STYLE = [
-        # Unmatched / null primary_route_type (orphan or pre-rollup).
-        # Empty-string match catches both null and DuckDB's stringified
-        # null ("None" or "" depending on the DuckDB version).
-        {"id": "transit-stops-unmatched", "type": "circle",
+        # One dot per GTFS parent station (is_station_label='true'),
+        # disclosed progressively by hub_rank — the SAME _HUB_RANK_STEP
+        # gate as the label below, so a station's dot and name appear
+        # together. Without the gate, ~1,500 dots render at country zoom
+        # (measured) — the step keeps it to the top ~15 hubs there.
+        {"id": "transit-station-dot", "type": "circle",
          "source": "transit-src", "source-layer": "austria-transit",
+         "minzoom": 6,
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
-                    ["any",
-                     ["==", ["coalesce",
-                            ["get", "primary_route_type"], ""], ""],
-                     ["==", ["get", "primary_route_type"], "None"]]],
+                    ["==", ["get", "is_station_label"], "true"],
+                    ["<=", ["to-number", ["get", "hub_rank"]],
+                     _HUB_RANK_STEP]],
          "paint": {
             "circle-radius": ["interpolate", ["linear"], ["zoom"],
-                              *R_STOP_SMALL],
-            "circle-color": ART_HALO,
-            "circle-stroke-color": ART_GREY_DARK,
-            "circle-stroke-width": 0.9,
-            "circle-opacity": 0.8,
-         }},
-        # Bus stops (route_type=3) — Artaria mustard
-        {"id": "transit-stops-bus", "type": "circle",
-         "source": "transit-src", "source-layer": "austria-transit",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "Point"],
-                    _RT_FILTER(3)],
-         "paint": {
-            "circle-radius": ["interpolate", ["linear"], ["zoom"],
-                              *R_STOP_SMALL],
-            "circle-color": ART_BUS,
-            "circle-stroke-color": ART_HALO,
-            "circle-stroke-width": 1.0,
-            "circle-opacity": 0.95,
-         }},
-        # Ferry piers (route_type=4)
-        {"id": "transit-stops-ferry", "type": "circle",
-         "source": "transit-src", "source-layer": "austria-transit",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "Point"],
-                    _RT_FILTER(4)],
-         "paint": {
-            "circle-radius": ["interpolate", ["linear"], ["zoom"],
-                              *R_STOP_MED],
-            "circle-color": ART_FERRY,
-            "circle-stroke-color": ART_HALO,
-            "circle-stroke-width": 1.0,
-            "circle-opacity": 0.95,
-         }},
-        # Cable car / gondola (route_type=5)
-        {"id": "transit-stops-cable", "type": "circle",
-         "source": "transit-src", "source-layer": "austria-transit",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "Point"],
-                    _RT_FILTER(5)],
-         "paint": {
-            "circle-radius": ["interpolate", ["linear"], ["zoom"],
-                              *R_STOP_MED],
-            "circle-color": ART_VIOLET_LIGHT,
-            "circle-stroke-color": ART_HALO,
-            "circle-stroke-width": 1.0,
-            "circle-opacity": 0.95,
-         }},
-        # Funicular (route_type=7) — Artaria violet
-        {"id": "transit-stops-funicular", "type": "circle",
-         "source": "transit-src", "source-layer": "austria-transit",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "Point"],
-                    _RT_FILTER(7)],
-         "paint": {
-            "circle-radius": ["interpolate", ["linear"], ["zoom"],
-                              *R_STOP_MED],
-            "circle-color": ART_VIOLET,
+                              6, 1.6, 10, 2.6, 14, 4.0, 18, 5.5],
+            "circle-color": ART_HUB,
             "circle-stroke-color": ART_HALO,
             "circle-stroke-width": 1.2,
             "circle-opacity": 0.95,
          }},
-        # Tram stops (route_type=0) — Artaria k.u. green
-        {"id": "transit-stops-tram", "type": "circle",
-         "source": "transit-src", "source-layer": "austria-transit",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "Point"],
-                    _RT_FILTER(0)],
-         "paint": {
-            "circle-radius": ["interpolate", ["linear"], ["zoom"],
-                              *R_STOP_MED],
-            "circle-color": ART_KU_GREEN,
-            "circle-stroke-color": ART_HALO,
-            "circle-stroke-width": 1.2,
-            "circle-opacity": 0.95,
-         }},
-        # Subway / U-Bahn (route_type=1) — Artaria k.u. green dark
-        {"id": "transit-stops-subway", "type": "circle",
-         "source": "transit-src", "source-layer": "austria-transit",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "Point"],
-                    _RT_FILTER(1)],
-         "paint": {
-            "circle-radius": ["interpolate", ["linear"], ["zoom"],
-                              *R_STOP_BIG],
-            "circle-color": ART_KU_GREEN_DARK,
-            "circle-stroke-color": ART_HALO,
-            "circle-stroke-width": 1.2,
-            "circle-opacity": 0.95,
-         }},
-        # Rail stations (route_type=2) — Artaria k.k. red, biggest dot
-        {"id": "transit-stops-train", "type": "circle",
-         "source": "transit-src", "source-layer": "austria-transit",
-         "filter": ["all",
-                    ["==", ["geometry-type"], "Point"],
-                    _RT_FILTER(2)],
-         "paint": {
-            "circle-radius": ["interpolate", ["linear"], ["zoom"],
-                              *R_STOP_BIG],
-            "circle-color": ART_KK_RED,
-            "circle-stroke-color": ART_HALO,
-            "circle-stroke-width": 1.4,
-            "circle-opacity": 0.95,
-         }},
-        # Parent-station names (one symbol layer, all modes). Only the
-        # single representative member per station (is_station_label) is
-        # labelled, with the parent-station name — so a big station shows
-        # ONE label, not one per platform. Every platform still renders
-        # its own dot via the per-mode circle layers above.
-        # symbol-sort-key = hub_rank: MapLibre places lower sort-keys
-        # first, so the most important transfer hubs (rank 1, 2, …) win
-        # collisions and minor junctions drop out when labels crowd.
+        # Parent-station names — progressive by hub_rank.
         {"id": "transit-stops-label", "type": "symbol",
          "source": "transit-src", "source-layer": "austria-transit",
-         "minzoom": 11,
+         "minzoom": 6,
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
-                    ["==", ["get", "is_station_label"], "true"]],
+                    ["==", ["get", "is_station_label"], "true"],
+                    ["<=", ["to-number", ["get", "hub_rank"]],
+                     _HUB_RANK_STEP]],
          "layout": {
             "symbol-sort-key": ["to-number", ["get", "hub_rank"]],
             "text-field": ["get", "station_name"],
             "text-font": ["noto_sans_regular"],
             "text-size": [
                 "interpolate", ["linear"], ["zoom"],
-                11, 10,
+                6, 9,
+                10, 10,
                 14, 12,
                 18, 14,
             ],
@@ -2659,9 +2526,23 @@ def _theme_styles():
     # See the palette constants at the top of this cell for the full
     # operator-color table.
     #
-    # Reads from the `austria-ecovoyage` martin source (single
-    # UNION-ALL-BY-NAME pmtiles with a `theme` discriminator: railway,
-    # cycle, hiking, topo). Every layer's filter anchors `theme` first.
+    # Reads from THREE importance-tiered line/point-only OSM martin
+    # sources (built by osm-austria.py with NO random drop_rate — see
+    # that notebook). Each tier is only built for the zooms it is needed
+    # at, so every zoom level loads the minimum:
+    #   * `src` = austria-rail — railways + aerialways + ferries. The
+    #     continuity headline, carried at EVERY zoom. Layers reading it
+    #     keep `"source": "src"` (the helper force-sets src/source-layer).
+    #   * `routes-src` = austria-routes — long-distance hiking + cycle
+    #     routes, built z6+. Layers carry an EXPLICIT `"source":
+    #     "routes-src"` (sat-hike-route* / sat-cycle-route*).
+    #   * `paths-src` = austria-paths — the bulk walkable-street /
+    #     cycleway / SAC-trail context, built z12+ only. Layers carry an
+    #     EXPLICIT `"source": "paths-src"` (sat-walk-* / sat-hike-trail-*
+    #     / sat-cycleway). Layers with an explicit non-`src` source are
+    #     left untouched by the helper.
+    # All three pmtiles use a `theme` discriminator (railway / cycle /
+    # hiking / topo) — every layer's filter anchors `theme` first.
     #
     # DRAW ORDER (top of list = drawn FIRST = visually UNDERNEATH):
     #   1.  Tertiary/minor paved roads (pedestrian-deprioritized — faint)
@@ -2672,21 +2553,22 @@ def _theme_styles():
     #   6.  Hiking long-distance routes (with halo)
     #   7.  Dedicated cycleways
     #   8.  Cycle long-distance routes (with halo)
-    #   9.  Rail aux: disused / construction / tunnel / service
-    #   10. Aerialway / cable-car (violet light, dotted)
-    #   11. Narrow-gauge (grey-dark, fine stipple)
-    #   12. Funicular (violet, dot-dash) — with halo
-    #   13. Tram (k.u. green) — with halo
-    #   14. Light rail / S-Bahn (k.u. green light) — with halo
-    #   15. Subway / U-Bahn (k.u. green dark) — with halo
-    #   16. Branch rail (k.k. red dark) — with halo
-    #   17. Mainline rail (k.k. red) — with halo + z14+ centre stripe
-    #   18. Rail station + halt circles (red dots)
-    #   19. Rail station name labels (z12+ symbols)
+    #   9.  Ferry routes (ship-blue, dashed) — modes with no GTFS data
+    #   10. Rail aux: disused / construction / tunnel / service
+    #   11. Aerialway / cable-car (violet light, dotted) — ropeways
+    #   12. Narrow-gauge (grey-dark, fine stipple)
+    #   13. Funicular (violet, dot-dash) — with halo
+    #   14. Tram (k.u. green) — with halo
+    #   15. Light rail / S-Bahn (k.u. green light) — with halo
+    #   16. Subway / U-Bahn (k.u. green dark) — with halo
+    #   17. Branch rail (k.k. red dark) — with halo
+    #   18. Mainline rail (k.k. red) — with halo + z14+ centre stripe
+    #   19. Rail station + halt circles (red dots)
     #
-    # GTFS-stop layers (mode-tinted from TRANSIT_STYLE) get APPENDED
-    # via the helper's `extra_layers` parameter, so they ride at the
-    # very top of the visual stack.
+    # GTFS station overlay (TRANSIT_STYLE — one dot + progressive name
+    # label per parent station) gets APPENDED via the helper's
+    # `extra_layers` parameter, so it rides at the very top of the
+    # visual stack. Station NAMES come exclusively from there.
     #
     # White halo casings ride underneath every primary line tier so the
     # operator color reads cleanly against the busy satellite imagery.
@@ -2705,10 +2587,11 @@ def _theme_styles():
         # friendly ways render on top.
 
         # Shared dark casing — all walkable highway classes, all
-        # zooms ≥9. Continuity backstop + contrast edge.
+        # zooms ≥12. Continuity backstop + contrast edge. Reads the
+        # austria-paths tier (bulk highway network, built z12+).
         {"id": "sat-walk-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 9,
+         "source": "paths-src", "source-layer": "austria-paths",
+         "minzoom": 12,
          "filter": ["all",
                     ["in", ["get", "theme"],
                      ["literal", ["hiking", "topo"]]],
@@ -2731,8 +2614,8 @@ def _theme_styles():
         # Major roads — primary / secondary (dark grey). NOT motorway
         # or trunk: pedestrians are legally banned from those.
         {"id": "sat-walk-major", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 9,
+         "source": "paths-src", "source-layer": "austria-paths",
+         "minzoom": 12,
          "filter": ["all",
                     ["==", ["get", "theme"], "topo"],
                     ["in", ["get", "highway"],
@@ -2747,8 +2630,8 @@ def _theme_styles():
 
         # Mid roads — tertiary / unclassified (mid grey)
         {"id": "sat-walk-mid", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 11,
+         "source": "paths-src", "source-layer": "austria-paths",
+         "minzoom": 12,
          "filter": ["all",
                     ["==", ["get", "theme"], "topo"],
                     ["in", ["get", "highway"],
@@ -2764,8 +2647,8 @@ def _theme_styles():
         # Local ways — residential / living_street / service / track /
         # road (light grey)
         {"id": "sat-walk-local", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 11,
+         "source": "paths-src", "source-layer": "austria-paths",
+         "minzoom": 12,
          "filter": ["all",
                     ["in", ["get", "theme"],
                      ["literal", ["hiking", "topo"]]],
@@ -2784,7 +2667,7 @@ def _theme_styles():
         # tagged + route=hiking ways (those render green in the
         # hiking tier below).
         {"id": "sat-walk-foot", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "paths-src", "source-layer": "austria-paths",
          "minzoom": 12,
          "filter": ["all",
                     ["in", ["get", "theme"],
@@ -2814,8 +2697,8 @@ def _theme_styles():
         # deepest green. Drawn FIRST so easier paths render OVER it
         # at junctions where a path transitions T3→T4.
         {"id": "sat-hike-trail-alpine", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 10,
+         "source": "paths-src", "source-layer": "austria-paths",
+         "minzoom": 12,
          "filter": ["all",
                     ["==", ["get", "theme"], "hiking"],
                     ["in", ["get", "sac_scale"],
@@ -2834,8 +2717,8 @@ def _theme_styles():
         # Difficult SAC tier (T3 demanding_mountain_hiking) —
         # DASH_LONG pattern, dark green.
         {"id": "sat-hike-trail-difficult", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 10,
+         "source": "paths-src", "source-layer": "austria-paths",
+         "minzoom": 12,
          "filter": ["all",
                     ["==", ["get", "theme"], "hiking"],
                     ["==", ["get", "sac_scale"],
@@ -2852,8 +2735,8 @@ def _theme_styles():
         # Easy SAC tier (T1 hiking + T2 mountain_hiking) — SOLID green.
         # Color shade encodes T1 vs T2 via inline match.
         {"id": "sat-hike-trail-easy", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 10,
+         "source": "paths-src", "source-layer": "austria-paths",
+         "minzoom": 12,
          "filter": ["all",
                     ["==", ["get", "theme"], "hiking"],
                     ["in", ["get", "sac_scale"],
@@ -2875,7 +2758,7 @@ def _theme_styles():
         # Visual headline of the hiking tier; visible from country
         # zoom upward.
         {"id": "sat-hike-route-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "routes-src", "source-layer": "austria-routes",
          "minzoom": 6,
          "filter": ["all",
                     ["==", ["get", "theme"], "hiking"],
@@ -2888,7 +2771,7 @@ def _theme_styles():
             "line-opacity": 0.85,
          }},
         {"id": "sat-hike-route", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "routes-src", "source-layer": "austria-routes",
          "minzoom": 6,
          "filter": ["all",
                     ["==", ["get", "theme"], "hiking"],
@@ -2906,8 +2789,8 @@ def _theme_styles():
 
         # Dedicated cycleways (highway=cycleway) — Artaria teal-dark
         {"id": "sat-cycleway", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 11,
+         "source": "paths-src", "source-layer": "austria-paths",
+         "minzoom": 12,
          "filter": ["all",
                     ["==", ["get", "theme"], "cycle"],
                     ["==", ["get", "highway"], "cycleway"]],
@@ -2921,7 +2804,7 @@ def _theme_styles():
         # Long-distance cycle routes (route=bicycle, any network) —
         # teal-ink with halo
         {"id": "sat-cycle-route-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "routes-src", "source-layer": "austria-routes",
          "minzoom": 6,
          "filter": ["all",
                     ["==", ["get", "theme"], "cycle"],
@@ -2933,7 +2816,7 @@ def _theme_styles():
             "line-opacity": 0.85,
          }},
         {"id": "sat-cycle-route", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "routes-src", "source-layer": "austria-routes",
          "minzoom": 6,
          "filter": ["all",
                     ["==", ["get", "theme"], "cycle"],
@@ -2945,13 +2828,48 @@ def _theme_styles():
          }},
 
         # ============================================================
+        # === FERRY ROUTES (ships — no GTFS data, OSM-only)          ===
+        # ============================================================
+        # route=ferry ways land in the topo theme and are routed by
+        # _RAIL_PRED into the austria-rail tier (`src`). Ship-blue dashed
+        # line over a white halo casing, drawn from z6 like the other
+        # long-distance route tiers — ferries are notable transport
+        # connections and the Austria railway GTFS feed never carries them.
+        {"id": "sat-ferry-route-casing", "type": "line",
+         "source": "src", "source-layer": "austria-rail",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "topo"],
+                    ["==", ["get", "route"], "ferry"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": ART_HALO,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_LONGDIST_CASING],
+            "line-opacity": 0.85,
+         }},
+        {"id": "sat-ferry-route", "type": "line",
+         "source": "src", "source-layer": "austria-rail",
+         "minzoom": 6,
+         "filter": ["all",
+                    ["==", ["get", "theme"], "topo"],
+                    ["==", ["get", "route"], "ferry"]],
+         "layout": {"line-join": "round", "line-cap": "round"},
+         "paint": {
+            "line-color": ART_FERRY,
+            "line-width": ["interpolate", ["linear"], ["zoom"],
+                           *W_LONGDIST],
+            "line-dasharray": DASH_LONG,
+         }},
+
+        # ============================================================
         # === RAILWAY AUXILIARY (disused / construction / tunnel /  ===
         # === service — drawn before primary tiers)                  ===
         # ============================================================
 
         # Disused / abandoned / razed rail — grey-dark dashed
         {"id": "sat-rail-disused", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -2969,7 +2887,7 @@ def _theme_styles():
 
         # Rail construction — gray dashed
         {"id": "sat-rail-construction", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 9,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -2984,7 +2902,7 @@ def _theme_styles():
 
         # Rail tunnels — dashed Artaria red, partially transparent
         {"id": "sat-rail-tunnel", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -2999,7 +2917,7 @@ def _theme_styles():
 
         # Rail service tracks (sidings) — grey dashed
         {"id": "sat-rail-service", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 13,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3017,12 +2935,13 @@ def _theme_styles():
         # === NON-RAIL & SPECIAL RAILWAYS                            ===
         # ============================================================
 
-        # Aerialway / cable-car / gondola — Artaria violet-light dot.
-        # Aerialway features are tagged theme=topo (NOT railway) in the
-        # unified austria-ecovoyage pmtiles bake; the filter matches
-        # that. RCA 2026-05-14.
+        # Aerialway / cable-car / gondola — ropeways (no GTFS data, so
+        # they only exist on the OSM side). Aerialway features are
+        # tagged theme=topo (NOT railway) but _RAIL_PRED routes them
+        # into the austria-rail tier (`src`); the filter matches
+        # theme=topo. RCA 2026-05-14.
         {"id": "sat-aerialway", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "topo"],
@@ -3037,7 +2956,7 @@ def _theme_styles():
 
         # Narrow-gauge / monorail — grey-dark fine stipple
         {"id": "sat-rail-narrow-gauge", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3053,7 +2972,7 @@ def _theme_styles():
 
         # Funicular / Zahnradbahn — Artaria violet dot-dash, halo
         {"id": "sat-rail-funicular-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3065,7 +2984,7 @@ def _theme_styles():
             "line-opacity": 0.85,
          }},
         {"id": "sat-rail-funicular", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3084,7 +3003,7 @@ def _theme_styles():
 
         # Tram — Artaria k.u. green
         {"id": "sat-rail-tram-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3096,7 +3015,7 @@ def _theme_styles():
             "line-opacity": 0.85,
          }},
         {"id": "sat-rail-tram", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3109,7 +3028,7 @@ def _theme_styles():
 
         # Light rail / S-Bahn — Artaria k.u. green light
         {"id": "sat-rail-light-rail-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3121,7 +3040,7 @@ def _theme_styles():
             "line-opacity": 0.85,
          }},
         {"id": "sat-rail-light-rail", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3134,7 +3053,7 @@ def _theme_styles():
 
         # Subway / U-Bahn — Artaria k.u. green dark
         {"id": "sat-rail-subway-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3146,7 +3065,7 @@ def _theme_styles():
             "line-opacity": 0.85,
          }},
         {"id": "sat-rail-subway", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3169,7 +3088,7 @@ def _theme_styles():
         # per-tier mainline/branch/service layers take over.
 
         {"id": "sat-rail-base-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 6, "maxzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3182,7 +3101,7 @@ def _theme_styles():
             "line-opacity": 0.95,
          }},
         {"id": "sat-rail-base", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 6, "maxzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3202,7 +3121,7 @@ def _theme_styles():
         # k.k. red dark with halo. minzoom=10 — at lower zooms the
         # rail-base layer above takes over.
         {"id": "sat-rail-branch-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3217,7 +3136,7 @@ def _theme_styles():
             "line-opacity": 0.85,
          }},
         {"id": "sat-rail-branch", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3235,7 +3154,7 @@ def _theme_styles():
         # The visual headline; widest line. minzoom=10 (rail-base
         # above handles z=6-9 continuously).
         {"id": "sat-rail-mainline-casing", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3249,7 +3168,7 @@ def _theme_styles():
             "line-opacity": 0.95,
          }},
         {"id": "sat-rail-mainline", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3268,7 +3187,7 @@ def _theme_styles():
         # railway signature; only visible at city zoom where the line
         # is wide enough.
         {"id": "sat-rail-mainline-stripe", "type": "line",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 14,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3287,7 +3206,7 @@ def _theme_styles():
 
         # Rail station — k.k. red dot, halo'd
         {"id": "sat-rail-station", "type": "circle",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 10,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3303,7 +3222,7 @@ def _theme_styles():
 
         # Rail halt / stop — k.k. red dark, smaller
         {"id": "sat-rail-halt", "type": "circle",
-         "source": "src", "source-layer": "austria-ecovoyage",
+         "source": "src", "source-layer": "austria-rail",
          "minzoom": 11,
          "filter": ["all",
                     ["==", ["get", "theme"], "railway"],
@@ -3318,30 +3237,12 @@ def _theme_styles():
             "circle-opacity": 0.9,
          }},
 
-        # Station name labels — black text with halo, z12+
-        {"id": "sat-rail-station-label", "type": "symbol",
-         "source": "src", "source-layer": "austria-ecovoyage",
-         "minzoom": 12,
-         "filter": ["all",
-                    ["==", ["get", "theme"], "railway"],
-                    ["==", ["get", "railway"], "station"]],
-         "layout": {
-            "text-field": ["get", "name"],
-            "text-font": ["noto_sans_regular"],
-            "text-size": [
-                "interpolate", ["linear"], ["zoom"],
-                12, 11, 16, 13, 18, 15,
-            ],
-            "text-anchor": "top",
-            "text-offset": [0, 0.7],
-            "text-padding": 3,
-         },
-         "paint": {
-            "text-color": ART_BLACK,
-            "text-halo-color": ART_HALO,
-            "text-halo-width": 1.5,
-            "text-halo-blur": 0.5,
-         }},
+        # Station NAMES are not labelled from the OSM source here — the
+        # GTFS-driven transit-stops-label layer (TRANSIT_STYLE) is the
+        # single station-labelling system, with hub_rank progressive
+        # disclosure the OSM railway=station set has no equivalent of.
+        # sat-rail-station / sat-rail-halt above still draw the OSM
+        # infrastructure dots.
     ]
     return (
         CYCLE_STYLE,
@@ -3476,190 +3377,6 @@ def _(df_route_stops):
 
 @app.cell
 def _(dag_run_states, mo):
-    # Top transfer hubs — ranks every parent station by hub_score, the
-    # transfer-hub importance metric the GTFS DAG's
-    # match_gtfs_stops_to_osm task computes into
-    # transit.station_hub_scores (sum over LINE-pairs at the station of
-    # line reach in km x transfer feasibility x terminus factor).
-    # hub_rank from this same table drives symbol-sort-key in the
-    # transit map's transit-stops-label layer, so the labels that
-    # survive a crowded viewport are the genuine interchange hubs.
-    mo.stop(
-        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
-        f"Waiting for notebook_austria_gtfs_pipeline (state="
-        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
-    )
-    import duckdb as _duckdb_hub
-    _hub_con = _duckdb_hub.connect(
-        "/workspace/duckdb/austria.duckdb",
-        read_only=True,
-    )
-    _hub_con.sql("INSTALL spatial; LOAD spatial;")
-    _top_hubs = _hub_con.sql("""
-        SELECT
-            h.hub_rank,
-            min(m.station_name)        AS station_name,
-            h.station_feature_id,
-            round(h.hub_score, 1)      AS hub_score,
-            h.n_routes,
-            h.n_terminating_lines,
-            h.n_route_pairs,
-            round(h.max_reach_km, 1)   AS max_reach_km
-        FROM transit.station_hub_scores h
-        JOIN transit.station_members m
-          ON m.station_feature_id = h.station_feature_id
-        GROUP BY h.hub_rank, h.station_feature_id, h.hub_score,
-                 h.n_routes, h.n_terminating_lines, h.n_route_pairs,
-                 h.max_reach_km
-        ORDER BY h.hub_rank
-        LIMIT 25
-    """).pl()
-    _hub_con.close()
-    mo.vstack([
-        mo.md("**Top 25 transfer hubs** "
-              "(hub_score = sum over line-pairs at the station of line "
-              "reach in km x transfer feasibility x terminus factor; "
-              "hub_rank drives label-placement priority in the "
-              "transit map)"),
-        _top_hubs,
-    ])
-    return
-
-
-@app.cell
-def _(dag_run_states, martin, mo):
-    # Unified transit map — austria-railway PMTiles as the base (the
-    # tracks themselves, from the OSM DAG) + austria-transit PMTiles
-    # as a second source (the GTFS stops as points, from THIS GTFS DAG).
-    # 3D mapterhorn terrain + versatiles satellite imagery on top.
-    #
-    # Replaces the previous folium FastMarkerCluster cell. Two wins:
-    #   1. The stops are a VECTOR-TILE layer (PMTiles + martin), not
-    #      a 1-MB inline GeoJSON. Browser handles tile streaming +
-    #      client-side rendering at every zoom level.
-    #   2. The colour-coding by match_kind is the VISIBLE result of
-    #      the GTFS↔OSM unification: green/blue dots = high-confidence
-    #      tag matches, orange = spatial last-resort, red = unmatched.
-    mo.stop(
-        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
-        f"Waiting for notebook_austria_gtfs_pipeline (state="
-        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
-    )
-    mo.iframe(
-        build_pipeline_maplibre_html(
-            martin, "austria-railway",
-            layer_name="austria-railway",
-            center=[13.3, 47.7],
-            zoom=7,
-            extra_sources={
-                "transit-src": {
-                    "type": "vector",
-                    "url": f"{martin}/austria-transit",
-                },
-            },
-            extra_layers=[
-                {"id": "transit-stops-overlay", "type": "circle",
-                 "source": "transit-src",
-                 "source-layer": "austria-transit",
-                 "filter": ["==", ["geometry-type"], "Point"],
-                 "paint": {
-                    "circle-radius": [
-                        "interpolate", ["linear"], ["zoom"],
-                        6, 2,
-                        10, 3.5,
-                        14, 5.5,
-                    ],
-                    "circle-color": [
-                        "match", ["get", "match_kind"],
-                        "gtfs:stop_id",        "#2ca02c",
-                        "ref:IFOPT",           "#1f77b4",
-                        "spatial_last_resort", "#ff7f0e",
-                        "#d62728",
-                    ],
-                    "circle-stroke-width": 1,
-                    "circle-stroke-color": "#ffffff",
-                    "circle-opacity": 0.85,
-                 }},
-            ],
-            terrain=True,
-            satellite_background=True,
-            pitch=45,
-            max_pitch=85,
-        ),
-        height="500px",
-    )
-    return
-
-
-@app.cell
-def _(
-    CYCLE_STYLE,
-    HIKING_STYLE,
-    Path,
-    RAILWAY_STYLE,
-    TOPO_STYLE,
-    TRANSIT_STYLE,
-    dag_run_states,
-    martin,
-    mo,
-):
-    # Consolidated austria-ecovoyage render — ALL FOUR OSM themes
-    # layered into a single MapLibre map served from the single
-    # austria-ecovoyage.pmtiles archive (one vector layer with a
-    # `theme` discriminator column) PLUS the GTFS transit stops
-    # composited on top as a second MapLibre source (austria-transit).
-    #
-    # Style stacking order: topo as base → railway lines on top →
-    # cycle routes over railway → hiking trails on top → GTFS transit
-    # stops on top of everything else.
-    #
-    # Two cross-notebook dependencies:
-    #   1. austria-ecovoyage.pmtiles is produced by osm-austria.py's
-    #      freestiler_ecovoyage_convert task — verified by file
-    #      existence below (gtfs-austria.py does not author the OSM DAG).
-    #   2. austria-transit.pmtiles is produced by THIS notebook's
-    #      freestiler_transit_convert task — gated via the GTFS DAG
-    #      state check.
-    mo.stop(
-        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
-        f"Waiting for notebook_austria_gtfs_pipeline (state="
-        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
-    )
-    _ecovoyage_pmtiles = Path("/workspace/tiles/pmtiles/austria-ecovoyage.pmtiles")
-    mo.stop(
-        not _ecovoyage_pmtiles.exists() or _ecovoyage_pmtiles.stat().st_size == 0,
-        "`austria-ecovoyage.pmtiles` not yet present — open and run "
-        "`osm-austria.py` first. Its OSM DAG produces this tile via "
-        "the `freestiler_ecovoyage_convert` task.",
-    )
-    mo.iframe(
-        build_pipeline_maplibre_html(
-            martin,
-            "austria-ecovoyage",
-            layer_name="austria-ecovoyage",
-            center=[13.3, 47.7],
-            zoom=7,
-            style_layers=[
-                *with_theme("topo", TOPO_STYLE),
-                *with_theme("railway", RAILWAY_STYLE),
-                *with_theme("cycle", CYCLE_STYLE),
-                *with_theme("hiking", HIKING_STYLE),
-            ],
-            extra_sources={
-                "transit-src": {
-                    "type": "vector",
-                    "url": f"{martin}/austria-transit",
-                },
-            },
-            extra_layers=TRANSIT_STYLE,
-        ),
-        height="500px",
-    )
-    return
-
-
-@app.cell
-def _(dag_run_states, mo):
     # Tag-distribution diagnostics — what OSM tag values actually
     # exist in the data the satellite-overlay style filters against.
     #
@@ -3772,6 +3489,141 @@ def _(dag_run_states, mo):
 
 
 @app.cell
+def _(dag_run_states, martin, mo):
+    # Unified transit map — austria-railway PMTiles as the base (the
+    # tracks themselves, from the OSM DAG) + austria-transit PMTiles
+    # as a second source (the GTFS stops as points, from THIS GTFS DAG).
+    # 3D mapterhorn terrain + versatiles satellite imagery on top.
+    #
+    # Replaces the previous folium FastMarkerCluster cell. Two wins:
+    #   1. The stops are a VECTOR-TILE layer (PMTiles + martin), not
+    #      a 1-MB inline GeoJSON. Browser handles tile streaming +
+    #      client-side rendering at every zoom level.
+    #   2. The colour-coding by match_kind is the VISIBLE result of
+    #      the GTFS↔OSM unification: green/blue dots = high-confidence
+    #      tag matches, orange = spatial last-resort, red = unmatched.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    mo.iframe(
+        build_pipeline_maplibre_html(
+            martin, "austria-railway",
+            layer_name="austria-railway",
+            center=[13.3, 47.7],
+            zoom=7,
+            source_maxzoom=14,
+            extra_sources={
+                "transit-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-transit",
+                    "maxzoom": 14,
+                },
+            },
+            extra_layers=[
+                {"id": "transit-stops-overlay", "type": "circle",
+                 "source": "transit-src",
+                 "source-layer": "austria-transit",
+                 "filter": ["==", ["geometry-type"], "Point"],
+                 "paint": {
+                    "circle-radius": [
+                        "interpolate", ["linear"], ["zoom"],
+                        6, 2,
+                        10, 3.5,
+                        14, 5.5,
+                    ],
+                    "circle-color": [
+                        "match", ["get", "match_kind"],
+                        "gtfs:stop_id",        "#2ca02c",
+                        "ref:IFOPT",           "#1f77b4",
+                        "spatial_last_resort", "#ff7f0e",
+                        "#d62728",
+                    ],
+                    "circle-stroke-width": 1,
+                    "circle-stroke-color": "#ffffff",
+                    "circle-opacity": 0.85,
+                 }},
+            ],
+            terrain=True,
+            satellite_background=True,
+            pitch=45,
+            max_pitch=85,
+        ),
+        height="500px",
+    )
+    return
+
+
+@app.cell
+def _(
+    CYCLE_STYLE,
+    HIKING_STYLE,
+    Path,
+    RAILWAY_STYLE,
+    TOPO_STYLE,
+    TRANSIT_STYLE,
+    dag_run_states,
+    martin,
+    mo,
+):
+    # Consolidated austria-ecovoyage render — ALL FOUR OSM themes
+    # layered into a single MapLibre map served from the single
+    # austria-ecovoyage.pmtiles archive (one vector layer with a
+    # `theme` discriminator column) PLUS the GTFS transit stops
+    # composited on top as a second MapLibre source (austria-transit).
+    #
+    # Style stacking order: topo as base → railway lines on top →
+    # cycle routes over railway → hiking trails on top → GTFS transit
+    # stops on top of everything else.
+    #
+    # Two cross-notebook dependencies:
+    #   1. austria-ecovoyage.pmtiles is produced by osm-austria.py's
+    #      freestiler_ecovoyage_convert task — verified by file
+    #      existence below (gtfs-austria.py does not author the OSM DAG).
+    #   2. austria-transit.pmtiles is produced by THIS notebook's
+    #      freestiler_transit_convert task — gated via the GTFS DAG
+    #      state check.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    _ecovoyage_pmtiles = Path("/workspace/tiles/pmtiles/austria-ecovoyage.pmtiles")
+    mo.stop(
+        not _ecovoyage_pmtiles.exists() or _ecovoyage_pmtiles.stat().st_size == 0,
+        "`austria-ecovoyage.pmtiles` not yet present — open and run "
+        "`osm-austria.py` first. Its OSM DAG produces this tile via "
+        "the `freestiler_ecovoyage_convert` task.",
+    )
+    mo.iframe(
+        build_pipeline_maplibre_html(
+            martin,
+            "austria-ecovoyage",
+            layer_name="austria-ecovoyage",
+            center=[13.3, 47.7],
+            zoom=7,
+            style_layers=[
+                *with_theme("topo", TOPO_STYLE),
+                *with_theme("railway", RAILWAY_STYLE),
+                *with_theme("cycle", CYCLE_STYLE),
+                *with_theme("hiking", HIKING_STYLE),
+            ],
+            extra_sources={
+                "transit-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-transit",
+                    "maxzoom": 14,
+                },
+            },
+            extra_layers=TRANSIT_STYLE,
+        ),
+        height="500px",
+    )
+    return
+
+
+@app.cell
 def _(
     Path,
     SATELLITE_OVERLAY_STYLE,
@@ -3792,11 +3644,26 @@ def _(
     # hiking network is also secondary (sienna with halo on
     # long-distance routes), generic footpaths are tertiary.
     #
-    # GTFS stops overlay (`TRANSIT_STYLE`) uses uniform white-fill /
-    # dark-stroke circles at every zoom + a Noto Sans text label per
-    # stop at z11+ (collision-avoided by MapLibre's default). The
-    # match_kind discriminator is no longer encoded into colour —
-    # it remains queryable in the unified-analysis cell above.
+    # This map reads THREE importance-tiered line/point-only OSM sources
+    # built by osm-austria.py (NO random drop_rate — see
+    # SATELLITE_OVERLAY_STYLE), so each zoom loads only what it needs:
+    #   * `src`        = austria-rail — railways + aerialways + ferries;
+    #     carried at EVERY zoom so the rail headline never fragments.
+    #     Passed as the helper's `source_name`.
+    #   * `routes-src` = austria-routes — long-distance hiking + cycle
+    #     routes, built z6+. Passed via `extra_sources`.
+    #   * `paths-src`  = austria-paths — the bulk walkable-street /
+    #     cycleway / SAC-trail context, built z12+ only. Passed via
+    #     `extra_sources`.
+    # All baked to z14, so `source_maxzoom=14` for `src` and
+    # `"maxzoom": 14` on the routes-src / paths-src entries. Ferries +
+    # ropeways live in austria-rail — modes with no GTFS data — so ships
+    # and ropeways still show.
+    #
+    # GTFS stops overlay (`TRANSIT_STYLE`): one neutral dot + one
+    # progressively-disclosed name per parent station (both gated by
+    # hub_rank) — NOT the former ~7,600 per-platform circles. The
+    # `austria-transit` source is baked to z14 (`"maxzoom": 14`).
     #
     # Text labels need an SDF glyph source: wired here via the helper's
     # `glyphs_url` kwarg, pointing at the versatiles-frontend layer's
@@ -3814,25 +3681,42 @@ def _(
         f"Waiting for notebook_austria_gtfs_pipeline (state="
         f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
     )
-    _ecovoyage_pmtiles = Path("/workspace/tiles/pmtiles/austria-ecovoyage.pmtiles")
+    _osm_line_tiles = [
+        Path("/workspace/tiles/pmtiles/austria-rail.pmtiles"),
+        Path("/workspace/tiles/pmtiles/austria-routes.pmtiles"),
+        Path("/workspace/tiles/pmtiles/austria-paths.pmtiles"),
+    ]
     mo.stop(
-        not _ecovoyage_pmtiles.exists() or _ecovoyage_pmtiles.stat().st_size == 0,
-        "`austria-ecovoyage.pmtiles` not yet present — open and run "
-        "`osm-austria.py` first. Its OSM DAG produces this tile via "
-        "the `freestiler_ecovoyage_convert` task.",
+        any(not p.exists() or p.stat().st_size == 0 for p in _osm_line_tiles),
+        "`austria-rail` / `austria-routes` / `austria-paths` .pmtiles "
+        "not yet present — open and run `osm-austria.py` first. Its OSM "
+        "DAG produces them via the `freestiler_rail_convert`, "
+        "`freestiler_routes_convert` and `freestiler_paths_convert` tasks.",
     )
     mo.iframe(
         build_pipeline_maplibre_html(
             martin,
-            "austria-ecovoyage",
-            layer_name="austria-ecovoyage",
+            "austria-rail",
+            layer_name="austria-rail",
             center=[13.3, 47.7],
             zoom=7,
             style_layers=SATELLITE_OVERLAY_STYLE,
+            source_maxzoom=14,
             extra_sources={
+                "routes-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-routes",
+                    "maxzoom": 14,
+                },
+                "paths-src": {
+                    "type": "vector",
+                    "url": f"{martin}/austria-paths",
+                    "maxzoom": 14,
+                },
                 "transit-src": {
                     "type": "vector",
                     "url": f"{martin}/austria-transit",
+                    "maxzoom": 14,
                 },
             },
             extra_layers=TRANSIT_STYLE,
@@ -3845,6 +3729,58 @@ def _(
         ),
         height="500px",
     )
+    return
+
+
+@app.cell
+def _(dag_run_states, mo):
+    # Top transfer hubs — ranks every parent station by hub_score, the
+    # transfer-hub importance metric the GTFS DAG's
+    # match_gtfs_stops_to_osm task computes into
+    # transit.station_hub_scores (sum over LINE-pairs at the station of
+    # line reach in km x transfer feasibility x terminus factor).
+    # hub_rank from this same table drives symbol-sort-key in the
+    # transit map's transit-stops-label layer, so the labels that
+    # survive a crowded viewport are the genuine interchange hubs.
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    import duckdb as _duckdb_hub
+    _hub_con = _duckdb_hub.connect(
+        "/workspace/duckdb/austria.duckdb",
+        read_only=True,
+    )
+    _hub_con.sql("INSTALL spatial; LOAD spatial;")
+    _top_hubs = _hub_con.sql("""
+        SELECT
+            h.hub_rank,
+            min(m.station_name)        AS station_name,
+            h.station_feature_id,
+            round(h.hub_score, 1)      AS hub_score,
+            h.n_routes,
+            h.n_terminating_lines,
+            h.n_route_pairs,
+            round(h.max_reach_km, 1)   AS max_reach_km
+        FROM transit.station_hub_scores h
+        JOIN transit.station_members m
+          ON m.station_feature_id = h.station_feature_id
+        GROUP BY h.hub_rank, h.station_feature_id, h.hub_score,
+                 h.n_routes, h.n_terminating_lines, h.n_route_pairs,
+                 h.max_reach_km
+        ORDER BY h.hub_rank
+        LIMIT 25
+    """).pl()
+    _hub_con.close()
+    mo.vstack([
+        mo.md("**Top 25 transfer hubs** "
+              "(hub_score = sum over line-pairs at the station of line "
+              "reach in km x transfer feasibility x terminus factor; "
+              "hub_rank drives label-placement priority in the "
+              "transit map)"),
+        _top_hubs,
+    ])
     return
 
 

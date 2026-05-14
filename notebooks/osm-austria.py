@@ -88,6 +88,17 @@ def _(airflow_public, martin, mo):
         + GTFS transit overlay) is rendered by `gtfs-austria.py` —
         that's the unified-everything visualisation.
 
+        This notebook's DAG also bakes THREE importance-tiered
+        line/point-only tiles for `gtfs-austria.py`'s satellite-overlay
+        map: `austria-rail.pmtiles` (railways + aerialways + ferries —
+        built at every zoom), `austria-routes.pmtiles` (long-distance
+        hiking + cycle routes — built z6+), and `austria-paths.pmtiles`
+        (the bulk walkable-street / cycleway / trail context — built
+        z12+ only). None uses random `drop_rate` thinning — freestiler's
+        per-zoom geometry simplification + `coalesce` + the importance
+        tier split do the size work, so each zoom loads only what it
+        needs.
+
         ## Download policy — monthly-cached, idempotent
 
         The OSM DAG runs on `schedule="@monthly"` (Airflow's cron alias
@@ -234,6 +245,7 @@ def _(Path, os, textwrap):
                       tags['waterway']                                 AS waterway,
                       tags['intermittent']                             AS intermittent,
                       tags['aerialway']                                AS aerialway,
+                      tags['route']                                    AS route,
                       tags['power']                                    AS power,
                       tags['building']                                 AS building,
                       tags['amenity']                                  AS amenity,
@@ -243,10 +255,16 @@ def _(Path, os, textwrap):
                       tags['wikipedia']                                AS wikipedia,
                       tags['railway']                                  AS railway"""
 
+        # `route='ferry'` ways (ship connections) + `amenity=ferry_terminal`
+        # land here — ferries carry no GTFS data in the Austria railway
+        # feed, so the OSM topo theme is their only source. `aerialway`
+        # (ropeways) is likewise OSM-only. Both are routed by
+        # _RAIL_PRED into the austria-rail tier.
         _TOPO_WHERE = """tags['highway'] IN ('motorway','trunk','primary','secondary','tertiary','unclassified',
                                                'residential','service','track','path','footway','bridleway','cycleway','steps')
                       OR tags['railway'] IS NOT NULL
                       OR tags['waterway'] IS NOT NULL
+                      OR tags['route'] = 'ferry'
                       OR tags['natural'] IS NOT NULL
                       OR tags['landuse'] IN ('forest','meadow','farmland','farmyard','grass','orchard','vineyard',
                                                'cemetery','residential','industrial','commercial','quarry')
@@ -359,6 +377,148 @@ def _(Path, os, textwrap):
             mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
             now = datetime.now(timezone.utc)
             return (mtime.year, mtime.month) != (now.year, now.month)
+
+
+        # The satellite-overlay map's THREE line tiers each carry EXACTLY
+        # what their style layers render — nothing more (a tile full of
+        # never-rendered features is just dead bytes that slow the
+        # browser down). Each predicate below is the union of the WHERE
+        # clauses of the SATELLITE_OVERLAY_STYLE layers that read that
+        # tier (see gtfs-austria.py). The tiers are split by IMPORTANCE
+        # so each zoom level loads only what it needs:
+        #
+        # austria-rail (`src`, built at EVERY zoom — the headline that
+        # must stay continuous from country zoom): railways carrying a
+        # `railway` tag (sat-rail-*), aerialways/ropeways (sat-aerialway),
+        # ferry routes (sat-ferry-route*). The bare
+        # `public_transport=platform/stop_position` POINTs that
+        # _RAILWAY_WHERE also admits are NOT styled by any layer and are
+        # excluded.
+        _RAIL_PRED = (
+            "(theme = 'railway' AND COALESCE(railway, '') <> '') "
+            "OR (theme = 'topo'   AND aerialway IS NOT NULL) "
+            "OR (theme = 'topo'   AND route = 'ferry')"
+        )
+        # austria-routes (`routes-src`, built z6+): long-distance hiking
+        # (sat-hike-route*) + cycle (sat-cycle-route*) routes. Denser than
+        # the rail network, so kept out of the z0-5 tiles where they are
+        # invisible specks anyway.
+        _ROUTES_PRED = (
+            "(theme = 'hiking' AND route = 'hiking') "
+            "OR (theme = 'cycle'  AND route = 'bicycle')"
+        )
+        # austria-paths (`paths-src`, built z12+ only): the bulk
+        # walkable-street highway graph (sat-walk-*), SAC hiking trails
+        # (sat-hike-trail-*), dedicated cycleways (sat-cycleway). By far
+        # the heaviest set — simply not built below z12, where per-tile
+        # area is small enough to stay browser-safe.
+        _PATHS_PRED = (
+            "(theme IN ('topo', 'hiking') AND highway IS NOT NULL) "
+            "OR (theme = 'hiking' AND COALESCE(sac_scale, '') <> '') "
+            "OR (theme = 'cycle'  AND highway = 'cycleway')"
+        )
+        _TIER_PRED = {"rail": _RAIL_PRED, "routes": _ROUTES_PRED,
+                      "paths": _PATHS_PRED}
+
+        # MINIMAL per-feature projection for the satellite-overlay line
+        # tiles. The full ORM-aligned _RAILWAY_FIELDS / _TOPO_FIELDS /...
+        # sets carry ~60 columns (electrified, voltage, every signal:*
+        # tag, z_order, maxspeed, ...) — the satellite-overlay style
+        # FILTERS on only these 12, and labels none of them. Projecting
+        # just the needed columns (a) shrinks the tile directly and
+        # (b) — the big win — lets coalesce=True merge: two rail segments
+        # that differ only in a dropped column (voltage, operator, name…)
+        # become attribute-identical and coalesce into ONE long
+        # continuous line. Fewer, longer features = much smaller tiles
+        # AND better stroke continuity. R3: one projection, all tiers.
+        _LINE_FIELDS = """
+                      geometry,
+                      tags['railway']      AS railway,
+                      tags['usage']        AS usage,
+                      tags['service']      AS service,
+                      tags['abandoned']    AS abandoned,
+                      tags['disused']      AS disused,
+                      tags['razed']        AS razed,
+                      tags['construction'] AS construction,
+                      tags['tunnel']       AS tunnel,
+                      tags['aerialway']    AS aerialway,
+                      tags['route']        AS route,
+                      tags['highway']      AS highway,
+                      tags['sac_scale']    AS sac_scale"""
+
+        def _ecovoyage_union(parquet_path: str, tier: str | None = None) -> str:
+            """4-theme UNION query over the Austria parquet.
+            R3: ONE query definition, four tile builds.
+
+            tier=None       — FULL union (polygons + lines, the complete
+                              ORM column set), for freestiler_ecovoyage_convert.
+            tier='rail'     — lines/points only, MINIMAL projection, the
+                              continuity-critical rail + aerialway + ferry
+                              network (_RAIL_PRED).
+            tier='routes'   — lines/points only, MINIMAL projection,
+                              long-distance hiking + cycle routes (_ROUTES_PRED).
+            tier='paths'    — lines/points only, MINIMAL projection, the bulk
+                              walkable-street / cycleway / SAC-trail context
+                              (_PATHS_PRED).
+
+            The importance-tier split + minimal projection replace the old
+            random drop_rate thinning: each tile keeps EVERY feature at
+            EVERY zoom it is built for (drop_rate=None) so strokes are
+            never fragmented; the heavier tiers are simply not built below
+            their min_zoom (deterministic exclusion, not a random drop).
+            freestiler's per-zoom geometry simplification + coalesce=True
+            (merge identical-attribute features into long continuous
+            lines, made far more effective by the minimal projection) do
+            the size work — no random thinning anywhere."""
+            base_cte = f"""
+                WITH base AS MATERIALIZED (
+                    SELECT feature_id, geometry, tags
+                    FROM read_parquet('{parquet_path}')
+                    WHERE ({_CYCLE_WHERE})
+                       OR ({_TOPO_WHERE})
+                       OR ({_RAILWAY_WHERE})
+                       OR ({_HIKING_WHERE})
+                )"""
+            if tier is None:
+                # Full union — every column, for the consolidated
+                # austria-ecovoyage tile (polygons + lines).
+                return f"""{base_cte}
+                SELECT 'cycle' AS theme,{_COMMON_SELECT_FIELDS},{_CYCLE_FIELDS}
+                FROM base WHERE {_CYCLE_WHERE}
+                UNION ALL BY NAME
+                SELECT 'topo' AS theme,{_COMMON_SELECT_FIELDS},{_TOPO_FIELDS}
+                FROM base WHERE {_TOPO_WHERE}
+                UNION ALL BY NAME
+                SELECT 'railway' AS theme,{_COMMON_SELECT_FIELDS},{_RAILWAY_FIELDS}
+                FROM base WHERE {_RAILWAY_WHERE}
+                UNION ALL BY NAME
+                SELECT 'hiking' AS theme,{_COMMON_SELECT_FIELDS},{_HIKING_FIELDS}
+                FROM base WHERE {_HIKING_WHERE}
+            """
+            if tier not in _TIER_PRED:
+                raise ValueError(f"unknown tier {tier!r}")
+            # Minimal-projection line union — identical columns per arm,
+            # so plain UNION ALL (no BY NAME needed). Lines/points only,
+            # then restricted to the tier's style-layer predicate.
+            lines = f"""{base_cte}
+                SELECT 'cycle' AS theme,{_LINE_FIELDS}
+                FROM base WHERE {_CYCLE_WHERE}
+                UNION ALL
+                SELECT 'topo' AS theme,{_LINE_FIELDS}
+                FROM base WHERE {_TOPO_WHERE}
+                UNION ALL
+                SELECT 'railway' AS theme,{_LINE_FIELDS}
+                FROM base WHERE {_RAILWAY_WHERE}
+                UNION ALL
+                SELECT 'hiking' AS theme,{_LINE_FIELDS}
+                FROM base WHERE {_HIKING_WHERE}
+            """
+            return f"""
+                SELECT * FROM ({lines})
+                WHERE ST_GeometryType(geometry) IN
+                    ('LINESTRING', 'MULTILINESTRING', 'POINT', 'MULTIPOINT')
+                  AND ({_TIER_PRED[tier]})
+            """
 
 
         @dag(
@@ -600,70 +760,124 @@ def _(Path, os, textwrap):
                 # Consolidated single-PMTiles output carrying the union of all
                 # four themes (cycle / topo / railway / hiking) in ONE vector
                 # layer (`austria-ecovoyage`) discriminated by a `theme` column.
-                # Built FROM SCRATCH via a single optimized DuckDB query — no
-                # tile-join, no pmtiles merge of the existing theme archives.
+                # Built FROM SCRATCH via a single optimized DuckDB query
+                # (_ecovoyage_union) — no tile-join, no pmtiles merge.
                 #
-                # Optimization shape:
-                #   1. MATERIALIZED CTE pre-filters the parquet ONCE with the
-                #      UNION of all four themes' WHERE predicates.
-                #   2. Four UNION ALL BY NAME subqueries read from the same
-                #      materialized base. Each emits its theme's column set
-                #      (theme-specific fields + the shared _COMMON_SELECT_FIELDS);
-                #      UNION ALL BY NAME pads missing columns with NULL.
-                #   3. freestiler streams DuckDB rows directly into the Rust
-                #      tiling engine — no Python materialization.
                 # A row that matches multiple themes is emitted once per matching
                 # theme so MapLibre can style each appearance independently via a
                 # ["==", ["get", "theme"], "<name>"] filter clause prepended to
                 # every style layer.
+                #
+                # base_zoom + drop_rate + coalesce thin features at low zooms so
+                # single-tile bytes stay browser-friendly. Without these
+                # freestiler emits z=7 tiles >300 MB which crash browser tabs on
+                # the consolidated view — this FULL tile carries the polygon
+                # fills (forest / landuse / water) that make that happen, so it
+                # keeps drop_rate=2.0. The satellite-overlay map does NOT consume
+                # this tile — it uses the line-only austria-rail / austria-routes
+                # / austria-paths tiles below (no drop_rate at all). For ecovoyage
+                # specifically max_zoom=12 caps detail at city zoom; the 4
+                # standalone theme cells still go to z14.
                 import freestiler
                 TILES.mkdir(parents=True, exist_ok=True)
                 out = TILES / "austria-ecovoyage.pmtiles"
                 if not _needs_regen(out):
                     return str(out)
-                query = f"""
-                    WITH base AS MATERIALIZED (
-                        SELECT feature_id, geometry, tags
-                        FROM read_parquet('{parquet_path}')
-                        WHERE ({_CYCLE_WHERE})
-                           OR ({_TOPO_WHERE})
-                           OR ({_RAILWAY_WHERE})
-                           OR ({_HIKING_WHERE})
-                    )
-                    SELECT 'cycle' AS theme,{_COMMON_SELECT_FIELDS},{_CYCLE_FIELDS}
-                    FROM base WHERE {_CYCLE_WHERE}
-                    UNION ALL BY NAME
-                    SELECT 'topo' AS theme,{_COMMON_SELECT_FIELDS},{_TOPO_FIELDS}
-                    FROM base WHERE {_TOPO_WHERE}
-                    UNION ALL BY NAME
-                    SELECT 'railway' AS theme,{_COMMON_SELECT_FIELDS},{_RAILWAY_FIELDS}
-                    FROM base WHERE {_RAILWAY_WHERE}
-                    UNION ALL BY NAME
-                    SELECT 'hiking' AS theme,{_COMMON_SELECT_FIELDS},{_HIKING_FIELDS}
-                    FROM base WHERE {_HIKING_WHERE}
-                """
-                # base_zoom + drop_rate + coalesce thin features at low
-                # zooms so single-tile bytes stay browser-friendly. Without
-                # these freestiler emits z=7 tiles >300 MB which crash
-                # browser tabs on the consolidated view. Attempts to run
-                # without coalesce destabilized freestiler — multiple tasks
-                # segfault at runtime; coalesce is required for stable
-                # builds at this data scale. Cost: polygons (forest /
-                # landuse / water fills) get merged aggressively at low
-                # zooms; country-zoom views are line-heavy. Users zoom
-                # into theme-specific cells for full-density detail at z14.
-                # For ecovoyage specifically max_zoom=12 (vs the standalone
-                # theme tiles' z14) caps detail at city zoom — the 4
-                # standalone cells still go to z14 for fine detail when
-                # users click into a specific theme.
                 freestiler.freestile_query(
-                    query=query,
+                    query=_ecovoyage_union(parquet_path),
                     output=str(out),
                     layer_name="austria-ecovoyage",
                     min_zoom=0,
                     max_zoom=12,
                     base_zoom=12,
                     drop_rate=2.0,
+                    coalesce=True,
+                )
+                return str(out)
+
+            @task
+            def freestiler_rail_convert(parquet_path: str) -> str:
+                # Tier 1/3 of the satellite-overlay map's line tiles: the
+                # continuity-critical RAIL network — railways carrying a
+                # `railway` tag, aerialways (ropeways), ferry routes
+                # (_RAIL_PRED).
+                #
+                # SPARSE (cf. the 40 MB polygon-free austria-railway tile),
+                # so tiled with NO feature thinning at all: drop_rate=None,
+                # built at EVERY zoom 0-14 — the rail headline must stay
+                # continuous from country zoom down. simplification=True
+                # snaps geometry to the per-zoom pixel grid (cheap,
+                # deterministic) and coalesce=True merges identical-
+                # attribute segments into long continuous lines.
+                import freestiler
+                TILES.mkdir(parents=True, exist_ok=True)
+                out = TILES / "austria-rail.pmtiles"
+                if not _needs_regen(out):
+                    return str(out)
+                freestiler.freestile_query(
+                    query=_ecovoyage_union(parquet_path, tier="rail"),
+                    output=str(out),
+                    layer_name="austria-rail",
+                    min_zoom=0,
+                    max_zoom=14,
+                    drop_rate=None,
+                    simplification=True,
+                    coalesce=True,
+                )
+                return str(out)
+
+            @task
+            def freestiler_routes_convert(parquet_path: str) -> str:
+                # Tier 2/3: long-distance hiking + cycle ROUTES
+                # (_ROUTES_PRED). Denser than the rail network — kept out
+                # of the z0-5 tiles where a route is an invisible speck
+                # anyway (min_zoom=6, matching the sat-hike-route* /
+                # sat-cycle-route* style minzoom). drop_rate=None +
+                # simplification + coalesce, same as the rail tier.
+                import freestiler
+                TILES.mkdir(parents=True, exist_ok=True)
+                out = TILES / "austria-routes.pmtiles"
+                if not _needs_regen(out):
+                    return str(out)
+                freestiler.freestile_query(
+                    query=_ecovoyage_union(parquet_path, tier="routes"),
+                    output=str(out),
+                    layer_name="austria-routes",
+                    min_zoom=6,
+                    max_zoom=14,
+                    drop_rate=None,
+                    simplification=True,
+                    coalesce=True,
+                )
+                return str(out)
+
+            @task
+            def freestiler_paths_convert(parquet_path: str) -> str:
+                # Tier 3/3: the bulk context network — the walkable-street
+                # highway graph, cycleways, SAC hiking trails (_PATHS_PRED).
+                #
+                # HUGE (the full Austria highway graph) — a full-density z0
+                # build is ~275 MB per tile. Instead of randomly thinning
+                # it (drop_rate), it is simply NOT BUILT below min_zoom=12
+                # — a deterministic, non-random exclusion. The satellite-
+                # overlay style's walk / cycleway / trail layers are
+                # zoom-banded to >=12 to match, so nothing that would
+                # render is missing. At z12-14 the per-tile area is small
+                # enough that drop_rate=None + simplification=True +
+                # coalesce=True keep tiles browser-safe with no thinning.
+                import freestiler
+                TILES.mkdir(parents=True, exist_ok=True)
+                out = TILES / "austria-paths.pmtiles"
+                if not _needs_regen(out):
+                    return str(out)
+                freestiler.freestile_query(
+                    query=_ecovoyage_union(parquet_path, tier="paths"),
+                    output=str(out),
+                    layer_name="austria-paths",
+                    min_zoom=12,
+                    max_zoom=14,
+                    drop_rate=None,
+                    simplification=True,
                     coalesce=True,
                 )
                 return str(out)
@@ -731,6 +945,9 @@ def _(Path, os, textwrap):
                 freestiler_topo_convert(parquet),
                 freestiler_hiking_convert(parquet),
                 freestiler_ecovoyage_convert(parquet),
+                freestiler_rail_convert(parquet),
+                freestiler_routes_convert(parquet),
+                freestiler_paths_convert(parquet),
             ])
 
 
