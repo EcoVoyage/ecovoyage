@@ -2233,8 +2233,19 @@ def _(Path, os, textwrap):
                 # through its called stations + one POINT per origin
                 # marker, baked into austria-fastlink-paths.parquet (the
                 # same one-tile-two-themes shape as austria-chrono).
+                # Each journey LineString also carries an `itinerary`
+                # JSON string — the leg-by-leg schedule with real clock
+                # times — which the map cell's click handler renders.
                 import duckdb
+                import json
                 import polars as pl
+
+                def _hhmm(_s):
+                    # seconds-after-midnight -> "HH:MM" ("" for None)
+                    if _s is None:
+                        return ""
+                    _s = int(_s)
+                    return f"{_s // 3600:02d}:{(_s % 3600) // 60:02d}"
 
                 TILES_WORK.mkdir(parents=True, exist_ok=True)
                 out = TILES_WORK / "austria-fastlink-paths.parquet"
@@ -2262,12 +2273,22 @@ def _(Path, os, textwrap):
                 # trip_seq[trip] -> ordered list of st along the trip's
                 # run. conns rows are (trip, from_st, to_st, dep, arr_c);
                 # a trip's connections sorted by dep form its chain.
+                # trip_times[trip] is aligned index-for-index with
+                # trip_seq[trip]: each entry [arr_sec, dep_sec] — arrival
+                # at / departure from that station on that trip (arr is
+                # None at the trip's first station, dep at its last).
                 trip_seq = {}
+                trip_times = {}
                 for r in conns.sort("trip", "dep").iter_rows(named=True):
                     seq = trip_seq.setdefault(r["trip"], [])
+                    tms = trip_times.setdefault(r["trip"], [])
                     if not seq or seq[-1] != r["from_st"]:
                         seq.append(r["from_st"])
+                        tms.append([None, r["dep"]])
+                    else:
+                        tms[-1][1] = r["dep"]
                     seq.append(r["to_st"])
+                    tms.append([r["arr_c"], None])
                 # st -> (lon, lat, station_feature_id, station_name)
                 st_info = {
                     r["st"]: (
@@ -2297,11 +2318,15 @@ def _(Path, os, textwrap):
                         else:
                             continue    # chain didn't reach origin
                         segs.reverse()
-                        # expand each segment to its called stations
+                        # expand each segment to its called stations,
+                        # and capture each leg's real board-departure /
+                        # alight-arrival clock times for the itinerary.
                         path = []
+                        itin_legs = []
                         for _b, _a, _trip in segs:
                             _ts = trip_seq.get(_trip)
-                            if _ts is None:
+                            _tt = trip_times.get(_trip)
+                            if _ts is None or _tt is None:
                                 path = []
                                 break
                             try:
@@ -2315,13 +2340,22 @@ def _(Path, os, textwrap):
                                 path.extend(_sub[1:])  # dedup transfer st
                             else:
                                 path.extend(_sub)
-                        if len(path) < 2:
+                            # leg endpoints + their real clock times:
+                            # [from_name, dep_hhmm, to_name, arr_hhmm]
+                            itin_legs.append([
+                                st_info[_b][3], _hhmm(_tt[_ib][1]),
+                                st_info[_a][3], _hhmm(_tt[_ia][0]),
+                            ])
+                        if len(path) < 2 or not itin_legs:
                             continue
                         _travel_min = round(
                             (arr_lookup[(o, d)][0] - CHRONO_DEPART_S)
                             / 60.0
                         )
                         _n_transfers = len(segs) - 1
+                        _itinerary = json.dumps(
+                            itin_legs, separators=(",", ":")
+                        )
                         _o_fid, _o_name = st_info[o][2], st_info[o][3]
                         _d_fid, _d_name = st_info[d][2], st_info[d][3]
                         _osm_id = f"{_o_fid}->{_d_fid}"
@@ -2335,6 +2369,7 @@ def _(Path, os, textwrap):
                                 "dest_name": _d_name,
                                 "travel_min": str(_travel_min),
                                 "n_transfers": str(_n_transfers),
+                                "itinerary": _itinerary,
                                 "seq": _seq_i,
                                 "lon": _lon,
                                 "lat": _lat,
@@ -2384,6 +2419,7 @@ def _(Path, os, textwrap):
                                 any_value(dest_name)   AS dest_name,
                                 any_value(travel_min)  AS travel_min,
                                 any_value(n_transfers) AS n_transfers,
+                                any_value(itinerary)   AS itinerary,
                                 ST_GeomFromText(
                                     'LINESTRING(' || string_agg(
                                         CAST(lon AS VARCHAR) || ' '
@@ -2412,7 +2448,8 @@ def _(Path, os, textwrap):
                             origin_name,
                             dest_name,
                             travel_min,
-                            n_transfers
+                            n_transfers,
+                            itinerary
                         FROM lines
                         UNION ALL
                         SELECT
@@ -2424,7 +2461,8 @@ def _(Path, os, textwrap):
                             origin_name,
                             ''                  AS dest_name,
                             '0'                 AS travel_min,
-                            '0'                 AS n_transfers
+                            '0'                 AS n_transfers,
+                            ''                  AS itinerary
                         FROM origin_pts
                     ) TO '{out}' (FORMAT 'parquet')
                 """)
@@ -2460,7 +2498,8 @@ def _(Path, os, textwrap):
                            origin_name,
                            dest_name,
                            travel_min,
-                           n_transfers
+                           n_transfers,
+                           itinerary
                     FROM read_parquet('{fastlink_paths}')
                 """
                 freestiler.freestile_query(
@@ -5232,8 +5271,11 @@ def _(FASTLINK_STYLE, Path, dag_run_states, martin, mo, versatiles_assets):
         "tasks produce it (re-run the DAG if this notebook predates "
         "them).",
     )
-    # Origin-click handler + travel-time legend + hover popup, injected
-    # via build_pipeline_maplibre_html's `extra_js` kwarg. Coupled to
+    # Origin-click handler + travel-time legend + hover summary popup +
+    # a connection-LINE click handler that opens a fixed itinerary
+    # panel (the journey's exact leg-by-leg clock times, parsed from
+    # the feature's `itinerary` JSON property). Injected via
+    # build_pipeline_maplibre_html's `extra_js` kwarg; coupled to
     # source_name="austria-fastlink" (map var `map_austria_fastlink` /
     # container `map-austria-fastlink`) and the fastlink-* layer ids
     # from FASTLINK_STYLE.
@@ -5260,6 +5302,15 @@ def _(FASTLINK_STYLE, Path, dag_run_states, martin, mo, versatiles_assets):
     }
     leg.innerHTML = html;
     box.appendChild(leg);
+    // hidden itinerary panel — populated on a fastlink-line click
+    var panel = document.createElement('div');
+    panel.id = 'fastlink-panel';
+    panel.style.cssText = 'position:absolute;top:8px;right:8px;z-index:3;'
+      + 'display:none;max-width:320px;max-height:440px;overflow-y:auto;'
+      + 'background:rgba(255,255,255,0.96);padding:8px 10px;'
+      + 'border-radius:4px;font:12px/1.5 sans-serif;color:#222;'
+      + 'box-shadow:0 1px 6px rgba(0,0,0,0.4);';
+    box.appendChild(panel);
       });
       function applyOrigin(fid, name) {
     var lineFlt = ['all', ['==', ['get', 'theme'], 'fastlink'],
@@ -5276,6 +5327,44 @@ def _(FASTLINK_STYLE, Path, dag_run_states, martin, mo, versatiles_assets):
     if (!e.features || !e.features.length) { return; }
     var p = e.features[0].properties || {};
     applyOrigin(p.origin_station_id, p.origin_name);
+      });
+      // click a connection LINE -> open the exact-travel-times panel
+      function hhmmDiff(a, b) {       // minutes, b - a, "HH:MM" strings
+    function mins(s) { var q = s.split(':'); return (+q[0]) * 60 + (+q[1]); }
+    return mins(b) - mins(a);
+      }
+      M.on('click', 'fastlink-line', function (e) {
+    if (!e.features || !e.features.length) { return; }
+    var p = e.features[0].properties || {};
+    var legs;
+    try { legs = JSON.parse(p.itinerary || '[]'); } catch (err) { legs = []; }
+    var panel = document.getElementById('fastlink-panel');
+    if (!panel || !legs.length) { return; }
+    var nt = p.n_transfers
+      + (p.n_transfers === '1' ? ' transfer' : ' transfers');
+    var h = '<span id="fastlink-close" style="float:right;cursor:pointer;'
+      + 'font-weight:bold;color:#888;">&times;</span>'
+      + '<b>' + p.origin_name + ' &rarr; ' + p.dest_name + '</b><br>'
+      + '<span style="color:#666;">depart ' + legs[0][1] + ' &middot; '
+      + 'arrive ' + legs[legs.length - 1][3] + ' &middot; ' + nt
+      + '</span><hr style="border:none;border-top:1px solid #ddd;'
+      + 'margin:5px 0;">';
+    for (var i = 0; i < legs.length; i++) {
+      if (i > 0) {
+        h += '<div style="color:#b06000;margin:3px 0;">&#8693; transfer at '
+          + legs[i][0] + ', wait '
+          + hhmmDiff(legs[i - 1][3], legs[i][1]) + ' min</div>';
+      }
+      h += '<div style="margin:2px 0;">&#128642; <b>' + legs[i][1]
+        + '</b> ' + legs[i][0] + '<br>&nbsp;&nbsp;&#8595; <b>'
+        + legs[i][3] + '</b> ' + legs[i][2] + '</div>';
+    }
+    panel.innerHTML = h;
+    var cb = document.getElementById('fastlink-close');
+    if (cb) { cb.addEventListener('click', function () {
+      panel.style.display = 'none';
+    }); }
+    panel.style.display = 'block';
       });
       var popup = new maplibregl.Popup({
     closeButton: false, closeOnClick: false,
