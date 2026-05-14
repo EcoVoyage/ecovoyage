@@ -231,6 +231,36 @@ def _(Path, os, textwrap):
                       OR tags['highway'] = 'bus_stop'
                       OR tags['amenity'] = 'ferry_terminal'"""
 
+        # Predicate for OSM features that ARE station anchors — the
+        # roll-up target for platform-granularity GTFS stops. A station
+        # anchor DONATES the parent station id + name + location to all
+        # its platforms. railway=station is the canonical heavy/regional
+        # rail anchor; railway=halt is a small station (a halt IS a
+        # station in GTFS terms — ~850 AT halt nodes, and 277 of the
+        # otherwise-unmapped GTFS stations sit within 250 m of one);
+        # public_transport=station is the PTv2 site node for tram/bus
+        # interchanges.
+        _STATION_ANCHOR_WHERE = """tags['railway'] IN ('station', 'halt')
+                      OR tags['public_transport'] = 'station'"""
+
+        # Platform-to-station snap radius for the spatial fallbacks in
+        # transit.station_members (tier-3 platform→anchor, and the
+        # parent_anchor GTFS-station→anchor resolution). NOT the same
+        # distance as the matched_stops `spatial_last_resort` tier
+        # (0.00045 deg ≈ 50 m): that snaps a GTFS stop POINT to the OSM
+        # feature for the SAME physical object, so 50 m is a generous
+        # "same thing" tolerance. Here we snap a PLATFORM (or a GTFS
+        # station coord) to its PARENT STATION NODE — genuinely different
+        # objects that sit 100-300 m apart on a large through-station
+        # (Wien Hbf's platform field spans ~250 m; the GTFS station coord
+        # and the OSM node centroid can each sit anywhere within it).
+        # 300 m reaches the parent node from the furthest platform edge
+        # without bridging to a neighbour: a census of the AT feed found
+        # only ONE station whose nearest anchor falls between 250 m and
+        # 600 m (Mistelbach, 253 m), so 300 m is safely below inter-
+        # station spacing. 1 deg lat ≈ 111320 m at 47.5°N → 0.002695.
+        _STATION_SNAP_DEG = 0.002695  # ≈ 300 m at Austrian latitude
+
         # Wiki-compliant predicate for OSM relations that ARE route masters
         # (i.e. GTFS routes.txt matching candidates per PTv2).
         _ROUTE_MASTER_WHERE = """tags['type'] = 'route_master'
@@ -493,6 +523,251 @@ def _(Path, os, textwrap):
                     f"total_gtfs_stops={rates[3]} "
                     f"(unmatched={rates[3] - rates[0] - rates[1] - rates[2]})"
                 )
+
+                # ---- Station roll-up: transit.station_members ----
+                # Transitous publishes AT rail stops at PLATFORM
+                # granularity, so transit.matched_stops points at OSM
+                # platform / stop_position features — never the
+                # railway=station node. Downstream consumers (the Top 25
+                # ranking, the transit-map labels) want the STATION, not
+                # the platform. Resolve every GTFS stop_id to a parent
+                # station via a 4-tier chain:
+                #   1. gtfs_parent — GTFS parent_station. The Transitous
+                #      feed models the hierarchy natively; PRIMARY tier,
+                #      covers Wien Hbf (44 child platforms).
+                #   2. uic_ref     — the stop's matched OSM feature shares
+                #      a uic_ref with a station anchor.
+                #   3. spatial     — nearest station anchor within ~250 m
+                #      of the stop's GTFS coords (_STATION_SNAP_DEG).
+                #   4. self        — unresolvable: the stop is its own
+                #      station.
+                # Station IDENTITY (id / name / lon / lat) comes from the
+                # OSM station anchor where correlatable, GTFS otherwise.
+                # Every GTFS stop_id appears in exactly one tier.
+                con.sql(f"""
+                    CREATE OR REPLACE TABLE transit.station_members AS
+                    WITH
+                      anchors AS (
+                        SELECT
+                            feature_id,
+                            tags['name']    AS station_name,
+                            tags['uic_ref'] AS uic_ref,
+                            ST_X(ST_Centroid(geometry)) AS lon,
+                            ST_Y(ST_Centroid(geometry)) AS lat
+                        FROM osm.features
+                        WHERE {_STATION_ANCHOR_WHERE}
+                      ),
+                      -- Single best matched_stops row per stop_id (tag
+                      -- matches beat spatial; osm_feature_id breaks ties
+                      -- deterministically). matched_stops has up to 3
+                      -- rows per stop_id — this collapses the grain.
+                      best_match AS (
+                        SELECT stop_id, osm_feature_id, match_kind
+                        FROM transit.matched_stops
+                        QUALIFY ROW_NUMBER() OVER (
+                            PARTITION BY stop_id
+                            ORDER BY CASE match_kind
+                                       WHEN 'gtfs:stop_id' THEN 0
+                                       WHEN 'ref:IFOPT'     THEN 1
+                                       ELSE 2 END,
+                                     osm_feature_id
+                        ) = 1
+                      ),
+                      -- Resolve the best OSM station anchor for each
+                      -- GTFS parent-station ROW. The station row itself
+                      -- usually matches a PLATFORM (not the
+                      -- railway=station node), so a direct anchor match
+                      -- is rare for big stations — fall back to the
+                      -- nearest anchor within _STATION_SNAP_DEG of the
+                      -- station row's own GTFS coords. This is what makes
+                      -- the merged identity come from OSM (id + name +
+                      -- location) rather than a synthetic GTFS id for
+                      -- Wien Hbf / Linz / Salzburg / etc.
+                      parent_anchor AS (
+                        SELECT
+                            ps.stop_id   AS parent_stop_id,
+                            ps.stop_name AS parent_name,
+                            ps.stop_lon  AS parent_lon,
+                            ps.stop_lat  AS parent_lat,
+                            a.feature_id    AS anchor_feature_id,
+                            a.station_name  AS anchor_name,
+                            a.lon AS anchor_lon,
+                            a.lat AS anchor_lat
+                        FROM gtfs.stops ps
+                        LEFT JOIN best_match pbm
+                               ON pbm.stop_id = ps.stop_id
+                        LEFT JOIN anchors a
+                               ON a.feature_id = pbm.osm_feature_id
+                               OR ST_DWithin(
+                                      ST_Point(ps.stop_lon, ps.stop_lat),
+                                      ST_Point(a.lon, a.lat),
+                                      {_STATION_SNAP_DEG}
+                                  )
+                        WHERE ps.stop_id IN (
+                            SELECT DISTINCT parent_station FROM gtfs.stops
+                            WHERE NULLIF(parent_station, '') IS NOT NULL
+                        )
+                        QUALIFY ROW_NUMBER() OVER (
+                            PARTITION BY ps.stop_id
+                            ORDER BY
+                                CASE WHEN a.feature_id = pbm.osm_feature_id
+                                     THEN 0 ELSE 1 END,
+                                ST_Distance(
+                                    ST_Point(ps.stop_lon, ps.stop_lat),
+                                    ST_Point(COALESCE(a.lon, ps.stop_lon),
+                                             COALESCE(a.lat, ps.stop_lat))
+                                ),
+                                a.feature_id
+                        ) = 1
+                      ),
+                      -- TIER 1: GTFS parent_station. Group by the GTFS
+                      -- parent_station; the identity comes from the OSM
+                      -- anchor resolved above (direct match or spatial),
+                      -- falling back to the GTFS station row's own
+                      -- identity only when no anchor is within range.
+                      tier1 AS (
+                        SELECT
+                            s.stop_id,
+                            COALESCE(pa.anchor_feature_id,
+                                     'gtfs/' || s.parent_station)
+                                AS station_feature_id,
+                            COALESCE(pa.anchor_name, pa.parent_name)
+                                AS station_name,
+                            COALESCE(pa.anchor_lon, pa.parent_lon)
+                                AS station_lon,
+                            COALESCE(pa.anchor_lat, pa.parent_lat)
+                                AS station_lat,
+                            'gtfs_parent' AS resolution_kind
+                        FROM gtfs.stops s
+                        LEFT JOIN parent_anchor pa
+                               ON pa.parent_stop_id = s.parent_station
+                        WHERE NULLIF(s.parent_station, '') IS NOT NULL
+                      ),
+                      -- TIER 2: shared uic_ref. The stop's own matched
+                      -- OSM feature carries a uic_ref that also
+                      -- identifies a station anchor.
+                      tier2 AS (
+                        SELECT
+                            s.stop_id,
+                            a.feature_id  AS station_feature_id,
+                            a.station_name,
+                            a.lon AS station_lon,
+                            a.lat AS station_lat,
+                            'uic_ref' AS resolution_kind
+                        FROM gtfs.stops s
+                        JOIN best_match bm   ON bm.stop_id = s.stop_id
+                        JOIN osm.features of ON of.feature_id = bm.osm_feature_id
+                        JOIN anchors a
+                          ON a.uic_ref = of.tags['uic_ref']
+                         AND NULLIF(of.tags['uic_ref'], '') IS NOT NULL
+                        WHERE s.stop_id NOT IN (
+                            SELECT stop_id FROM tier1 WHERE stop_id IS NOT NULL
+                        )
+                        QUALIFY ROW_NUMBER() OVER (
+                            PARTITION BY s.stop_id ORDER BY a.feature_id
+                        ) = 1
+                      ),
+                      -- TIER 3: spatial snap to the nearest station
+                      -- anchor within _STATION_SNAP_DEG of the stop's
+                      -- GTFS coords.
+                      tier3 AS (
+                        SELECT
+                            s.stop_id,
+                            a.feature_id  AS station_feature_id,
+                            a.station_name,
+                            a.lon AS station_lon,
+                            a.lat AS station_lat,
+                            'spatial' AS resolution_kind
+                        FROM gtfs.stops s
+                        JOIN anchors a
+                          ON ST_DWithin(
+                                 ST_Point(s.stop_lon, s.stop_lat),
+                                 ST_Point(a.lon, a.lat),
+                                 {_STATION_SNAP_DEG}
+                             )
+                        WHERE s.stop_id NOT IN (
+                                SELECT stop_id FROM tier1 WHERE stop_id IS NOT NULL
+                            )
+                          AND s.stop_id NOT IN (
+                                SELECT stop_id FROM tier2 WHERE stop_id IS NOT NULL
+                            )
+                          AND s.stop_lon IS NOT NULL
+                          AND s.stop_lat IS NOT NULL
+                        QUALIFY ROW_NUMBER() OVER (
+                            PARTITION BY s.stop_id
+                            ORDER BY ST_Distance(
+                                ST_Point(s.stop_lon, s.stop_lat),
+                                ST_Point(a.lon, a.lat)
+                            ), a.feature_id
+                        ) = 1
+                      ),
+                      -- TIER 4: self — every stop not resolved above
+                      -- becomes its own station.
+                      tier4 AS (
+                        SELECT
+                            s.stop_id,
+                            s.stop_id   AS station_feature_id,
+                            s.stop_name AS station_name,
+                            s.stop_lon  AS station_lon,
+                            s.stop_lat  AS station_lat,
+                            'self' AS resolution_kind
+                        FROM gtfs.stops s
+                        WHERE s.stop_id NOT IN (
+                                SELECT stop_id FROM tier1 WHERE stop_id IS NOT NULL
+                            )
+                          AND s.stop_id NOT IN (
+                                SELECT stop_id FROM tier2 WHERE stop_id IS NOT NULL
+                            )
+                          AND s.stop_id NOT IN (
+                                SELECT stop_id FROM tier3 WHERE stop_id IS NOT NULL
+                            )
+                      )
+                    SELECT * FROM tier1
+                    UNION ALL SELECT * FROM tier2
+                    UNION ALL SELECT * FROM tier3
+                    UNION ALL SELECT * FROM tier4
+                """)
+                # resolution_kind histogram — mirrors the match-rate log
+                # above. grain MUST hold: one row per GTFS stop_id.
+                res = con.sql("""
+                    SELECT
+                        count(*) FILTER (WHERE resolution_kind='gtfs_parent') AS by_parent,
+                        count(*) FILTER (WHERE resolution_kind='uic_ref')     AS by_uic,
+                        count(*) FILTER (WHERE resolution_kind='spatial')     AS by_spatial,
+                        count(*) FILTER (WHERE resolution_kind='self')        AS by_self,
+                        count(*)                AS total_rows,
+                        count(DISTINCT stop_id) AS distinct_stop_ids,
+                        (SELECT count(*) FROM gtfs.stops) AS total_gtfs_stops
+                    FROM transit.station_members
+                """).fetchone()
+                print(
+                    f"[match_gtfs_stops_to_osm] station roll-up: "
+                    f"by_parent={res[0]}, by_uic={res[1]}, "
+                    f"by_spatial={res[2]}, by_self={res[3]}, "
+                    f"total_rows={res[4]}, distinct_stop_ids={res[5]}, "
+                    f"total_gtfs_stops={res[6]} "
+                    f"(grain OK = {res[4] == res[5] == res[6]})"
+                )
+
+                # Fold the station identity back onto matched_stops so
+                # downstream queries never need to re-join. station_members
+                # is one-row-per-stop_id; matched_stops is
+                # one-row-per-(stop_id, match tier) — a LEFT JOIN USING
+                # (stop_id) against a table unique on the join key cannot
+                # fan out, it only widens each existing row.
+                con.sql("""
+                    CREATE OR REPLACE TABLE transit.matched_stops AS
+                    SELECT
+                        m.*,
+                        sm.station_feature_id,
+                        sm.station_name,
+                        sm.station_lon,
+                        sm.station_lat,
+                        sm.resolution_kind AS station_resolution_kind
+                    FROM transit.matched_stops m
+                    LEFT JOIN transit.station_members sm USING (stop_id)
+                """)
+
                 # Export the joined view as parquet for freestiler
                 # ingestion (freestiler can't ATTACH a duckdb file mid-
                 # query, so we round-trip through parquet — the same
@@ -544,10 +819,40 @@ def _(Path, os, textwrap):
                             -- ["==", ["get","primary_route_type"], "2"]
                             -- against the resulting string values.
                             CAST(rt.primary_route_type AS VARCHAR)
-                                AS primary_route_type
+                                AS primary_route_type,
+                            -- Station roll-up identity. Joined from
+                            -- transit.station_members (one row per GTFS
+                            -- stop_id — covers EVERY stop incl. the
+                            -- unmatched, unlike matched_stops). CAST to
+                            -- VARCHAR for the same reason as
+                            -- primary_route_type: freestiler drops
+                            -- numeric-nullable columns on the parquet →
+                            -- MVT round-trip. The id is already a string
+                            -- ('node/..' | 'way/..' | 'gtfs/..' | a raw
+                            -- stop_id) — the CAST makes the contract
+                            -- explicit and null-safe.
+                            CAST(sm.station_feature_id AS VARCHAR)
+                                AS station_feature_id,
+                            sm.station_name,
+                            -- Exactly ONE row per station_feature_id is
+                            -- 'true' — the member point closest to the
+                            -- station anchor coords. transit-stops-label
+                            -- filters on this so a big station shows ONE
+                            -- label, not one per platform. String, not
+                            -- bool — bools are dropped on the MVT round-
+                            -- trip just like numeric-nullables.
+                            CASE WHEN ROW_NUMBER() OVER (
+                                PARTITION BY sm.station_feature_id
+                                ORDER BY ST_Distance(
+                                    ST_Point(s.stop_lon, s.stop_lat),
+                                    ST_Point(sm.station_lon, sm.station_lat)
+                                ), s.stop_id
+                            ) = 1 THEN 'true' ELSE 'false' END
+                                AS is_station_label
                         FROM gtfs.stops s
                         LEFT JOIN transit.matched_stops m USING (stop_id)
                         LEFT JOIN stop_route_types rt USING (stop_id)
+                        LEFT JOIN transit.station_members sm USING (stop_id)
                     ) TO '{transit_parquet}' (FORMAT 'parquet')
                 """)
                 con.close()
@@ -706,7 +1011,10 @@ def _(Path, os, textwrap):
                            match_kind,
                            match_distance_m,
                            osm_feature_id,
-                           primary_route_type
+                           primary_route_type,
+                           station_feature_id,
+                           station_name,
+                           is_station_label
                     FROM read_parquet('{transit_parquet_path}')
                 """
                 freestiler.freestile_query(
@@ -1879,13 +2187,19 @@ def _theme_styles():
             "circle-stroke-width": 1.4,
             "circle-opacity": 0.95,
          }},
-        # Stop names (one symbol layer, all modes)
+        # Parent-station names (one symbol layer, all modes). Only the
+        # single representative member per station (is_station_label) is
+        # labelled, with the parent-station name — so a big station shows
+        # ONE label, not one per platform. Every platform still renders
+        # its own dot via the per-mode circle layers above.
         {"id": "transit-stops-label", "type": "symbol",
          "source": "transit-src", "source-layer": "austria-transit",
          "minzoom": 11,
-         "filter": ["==", ["geometry-type"], "Point"],
+         "filter": ["all",
+                    ["==", ["geometry-type"], "Point"],
+                    ["==", ["get", "is_station_label"], "true"]],
          "layout": {
-            "text-field": ["get", "name"],
+            "text-field": ["get", "station_name"],
             "text-font": ["Noto Sans Regular"],
             "text-size": [
                 "interpolate", ["linear"], ["zoom"],
@@ -2676,24 +2990,31 @@ def _(dag_run_states, mo):
     """).pl()
 
     # ---- Cross-dataset proof-of-life ----
-    # The query that's IMPOSSIBLE without unification: every OSM
-    # railway=station feature that has GTFS service, ranked by how
-    # many distinct GTFS routes serve it. Joins osm.features ↔
-    # transit.matched_stops ↔ gtfs.stop_times ↔ gtfs.trips ↔
-    # gtfs.routes in one DuckDB query.
+    # The query that's IMPOSSIBLE without unification: every parent
+    # STATION (platform-granularity GTFS stops rolled up via the 4-tier
+    # transit.station_members chain: gtfs_parent → uic_ref → spatial →
+    # self) that has GTFS service, ranked by distinct GTFS routes
+    # served. station_name / station_feature_id / station_resolution_kind
+    # now ride on transit.matched_stops, so this no longer joins
+    # osm.features at all — just matched_stops ↔ stop_times ↔ trips.
+    # Wien Hauptbahnhof and every other multi-platform station now
+    # appears, with its ~44 child platforms rolled into one row (the old
+    # `WHERE tags['railway']='station'` filter dropped them: the GTFS
+    # match lands on platform features, never the railway=station node).
     top_stations = con.sql("""
         SELECT
-            o.feature_id,
-            o.tags['name']                       AS station_name,
-            count(DISTINCT t.route_id)            AS routes_serving,
-            count(DISTINCT st.trip_id)            AS trips_serving
-        FROM osm.features o
-        JOIN transit.matched_stops m ON m.osm_feature_id = o.feature_id
+            m.station_feature_id,
+            min(m.station_name)            AS station_name,
+            min(m.station_resolution_kind) AS resolution_kind,
+            count(DISTINCT t.route_id)     AS routes_serving,
+            count(DISTINCT st.trip_id)     AS trips_serving,
+            count(DISTINCT m.stop_id)      AS gtfs_stops_rolled_up
+        FROM transit.matched_stops m
         JOIN gtfs.stop_times st USING (stop_id)
-        JOIN gtfs.trips t      USING (trip_id)
-        WHERE o.tags['railway'] = 'station'
-        GROUP BY o.feature_id, o.tags['name']
-        ORDER BY routes_serving DESC
+        JOIN gtfs.trips t       USING (trip_id)
+        WHERE m.station_feature_id IS NOT NULL
+        GROUP BY m.station_feature_id
+        ORDER BY routes_serving DESC, trips_serving DESC
         LIMIT 25
     """).pl()
 
@@ -2703,8 +3024,11 @@ def _(dag_run_states, mo):
               "(stops via wiki-compliant tier chain: gtfs:stop_id → "
               "ref:IFOPT → spatial last-resort)"),
         unified_summary,
-        mo.md("**Top 25 OSM `railway=station` features by GTFS service** "
-              "(cross-dataset query — impossible without unified DuckDB)"),
+        mo.md("**Top 25 parent stations by GTFS service** "
+              "(platform-granularity GTFS stops rolled up to their "
+              "parent station via the 4-tier chain: gtfs_parent → "
+              "uic_ref → spatial → self — cross-dataset query, "
+              "impossible without unified DuckDB)"),
         top_stations,
     ])
     return (df_route_stops,)
@@ -2713,119 +3037,6 @@ def _(dag_run_states, mo):
 @app.cell
 def _(df_route_stops):
     df_route_stops
-    return
-
-
-@app.cell
-def _(dag_run_states, mo):
-    # Tag-distribution diagnostics — what OSM tag values actually
-    # exist in the data the satellite-overlay style filters against.
-    #
-    # Surfaces the empirical histograms that informed (or revealed
-    # gaps in) the filter design. Re-run after any OSM data refresh
-    # — e.g. if Austria's cycle network tagging changes upstream,
-    # the cycle histogram here surfaces the new values BEFORE the
-    # satellite-overlay map's `network=` filter silently matches
-    # nothing.
-    #
-    # Imported from the standalone .duckprobe.py script that drove
-    # the RCA of the 2026-05-13 satellite-overlay rendering issue
-    # (cycle/icn/ncn matched 0 features because Austrian OSM uses
-    # mostly highway=cycleway / cycleway=* tagging, not route-relation
-    # tagging).
-    mo.stop(
-        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
-        f"Waiting for notebook_austria_gtfs_pipeline (state="
-        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
-    )
-    # Aliased + underscore-prefixed so the duckdb import and the
-    # connection stay cell-private (marimo flags top-level names
-    # that collide across cells; the unified-analysis cell above
-    # already imports `duckdb`/`con`).
-    import duckdb as _duckdb
-    _con = _duckdb.connect(
-        "/workspace/duckdb/austria.duckdb",
-        read_only=True,
-    )
-
-    # Cycle-theme route + network distribution — informs the
-    # sat-cycle-route filter on the satellite-overlay map.
-    _cycle_network_dist = _con.sql("""
-        SELECT
-            tags['route']   AS route,
-            tags['network'] AS network,
-            count(*)        AS n
-        FROM osm.features
-        WHERE tags['route'] = 'bicycle'
-           OR tags['cycleway'] IS NOT NULL
-           OR tags['highway'] = 'cycleway'
-        GROUP BY 1, 2
-        ORDER BY n DESC
-        LIMIT 30
-    """).pl()
-
-    # Railway-type distribution — informs the sat-rail-* family of
-    # filters (mainline vs branch vs urban via railway= + usage=).
-    _railway_type_dist = _con.sql("""
-        SELECT
-            tags['railway'] AS railway,
-            count(*)        AS n
-        FROM osm.features
-        WHERE tags['railway'] IS NOT NULL
-        GROUP BY 1
-        ORDER BY n DESC
-        LIMIT 30
-    """).pl()
-
-    # Rail usage distribution — informs sat-rail-mainline (usage=main)
-    # vs sat-rail-branch (usage != main, no service).
-    _rail_usage_dist = _con.sql("""
-        SELECT
-            tags['usage'] AS usage,
-            count(*)      AS n
-        FROM osm.features
-        WHERE tags['railway'] = 'rail'
-        GROUP BY 1
-        ORDER BY n DESC
-    """).pl()
-
-    # SAC scale × trail_visibility distribution — informs the three
-    # sat-hike-trail-{solid,dashed,dotted} layers that encode the
-    # OSM-wiki "Hiking trails rendering proposal 1" matrix.
-    _sac_visibility_dist = _con.sql("""
-        SELECT
-            tags['sac_scale']        AS sac_scale,
-            tags['trail_visibility'] AS trail_visibility,
-            count(*)                 AS n
-        FROM osm.features
-        WHERE tags['sac_scale'] IS NOT NULL
-        GROUP BY 1, 2
-        ORDER BY n DESC
-        LIMIT 50
-    """).pl()
-
-    _con.close()
-    mo.vstack([
-        mo.md("**Satellite-overlay style filter diagnostics — "
-              "what tag values actually exist in the Austria data?**"),
-        mo.md("Cycle infrastructure — `route` × `network` distribution. "
-              "Drives the `sat-cycle-route` filter (any `route=bicycle`) "
-              "+ `sat-cycleway` (highway=cycleway):"),
-        _cycle_network_dist,
-        mo.md("Railway `railway=` type distribution — drives the "
-              "`sat-rail-mainline` / `sat-rail-branch` / `sat-rail-urban` "
-              "/ `sat-rail-tunnel` / `sat-rail-service` family:"),
-        _railway_type_dist,
-        mo.md("Rail `usage=` distribution — distinguishes mainline "
-              "(`usage=main`) from branch (everything else):"),
-        _rail_usage_dist,
-        mo.md("`sac_scale` × `trail_visibility` distribution — drives "
-              "the three `sat-hike-trail-{solid,dashed,dotted}` layers "
-              "encoding the OSM-wiki "
-              "[Hiking trails rendering proposal 1](https://wiki.openstreetmap.org/wiki/File:Hiking_trails_rendering_proposal_1.png) "
-              "matrix (colour = difficulty, pattern = visibility):"),
-        _sac_visibility_dist,
-    ])
     return
 
 
@@ -3035,6 +3246,119 @@ def _(
         ),
         height="500px",
     )
+    return
+
+
+@app.cell
+def _(dag_run_states, mo):
+    # Tag-distribution diagnostics — what OSM tag values actually
+    # exist in the data the satellite-overlay style filters against.
+    #
+    # Surfaces the empirical histograms that informed (or revealed
+    # gaps in) the filter design. Re-run after any OSM data refresh
+    # — e.g. if Austria's cycle network tagging changes upstream,
+    # the cycle histogram here surfaces the new values BEFORE the
+    # satellite-overlay map's `network=` filter silently matches
+    # nothing.
+    #
+    # Imported from the standalone .duckprobe.py script that drove
+    # the RCA of the 2026-05-13 satellite-overlay rendering issue
+    # (cycle/icn/ncn matched 0 features because Austrian OSM uses
+    # mostly highway=cycleway / cycleway=* tagging, not route-relation
+    # tagging).
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+    # Aliased + underscore-prefixed so the duckdb import and the
+    # connection stay cell-private (marimo flags top-level names
+    # that collide across cells; the unified-analysis cell above
+    # already imports `duckdb`/`con`).
+    import duckdb as _duckdb
+    _con = _duckdb.connect(
+        "/workspace/duckdb/austria.duckdb",
+        read_only=True,
+    )
+
+    # Cycle-theme route + network distribution — informs the
+    # sat-cycle-route filter on the satellite-overlay map.
+    _cycle_network_dist = _con.sql("""
+        SELECT
+            tags['route']   AS route,
+            tags['network'] AS network,
+            count(*)        AS n
+        FROM osm.features
+        WHERE tags['route'] = 'bicycle'
+           OR tags['cycleway'] IS NOT NULL
+           OR tags['highway'] = 'cycleway'
+        GROUP BY 1, 2
+        ORDER BY n DESC
+        LIMIT 30
+    """).pl()
+
+    # Railway-type distribution — informs the sat-rail-* family of
+    # filters (mainline vs branch vs urban via railway= + usage=).
+    _railway_type_dist = _con.sql("""
+        SELECT
+            tags['railway'] AS railway,
+            count(*)        AS n
+        FROM osm.features
+        WHERE tags['railway'] IS NOT NULL
+        GROUP BY 1
+        ORDER BY n DESC
+        LIMIT 30
+    """).pl()
+
+    # Rail usage distribution — informs sat-rail-mainline (usage=main)
+    # vs sat-rail-branch (usage != main, no service).
+    _rail_usage_dist = _con.sql("""
+        SELECT
+            tags['usage'] AS usage,
+            count(*)      AS n
+        FROM osm.features
+        WHERE tags['railway'] = 'rail'
+        GROUP BY 1
+        ORDER BY n DESC
+    """).pl()
+
+    # SAC scale × trail_visibility distribution — informs the three
+    # sat-hike-trail-{solid,dashed,dotted} layers that encode the
+    # OSM-wiki "Hiking trails rendering proposal 1" matrix.
+    _sac_visibility_dist = _con.sql("""
+        SELECT
+            tags['sac_scale']        AS sac_scale,
+            tags['trail_visibility'] AS trail_visibility,
+            count(*)                 AS n
+        FROM osm.features
+        WHERE tags['sac_scale'] IS NOT NULL
+        GROUP BY 1, 2
+        ORDER BY n DESC
+        LIMIT 50
+    """).pl()
+
+    _con.close()
+    mo.vstack([
+        mo.md("**Satellite-overlay style filter diagnostics — "
+              "what tag values actually exist in the Austria data?**"),
+        mo.md("Cycle infrastructure — `route` × `network` distribution. "
+              "Drives the `sat-cycle-route` filter (any `route=bicycle`) "
+              "+ `sat-cycleway` (highway=cycleway):"),
+        _cycle_network_dist,
+        mo.md("Railway `railway=` type distribution — drives the "
+              "`sat-rail-mainline` / `sat-rail-branch` / `sat-rail-urban` "
+              "/ `sat-rail-tunnel` / `sat-rail-service` family:"),
+        _railway_type_dist,
+        mo.md("Rail `usage=` distribution — distinguishes mainline "
+              "(`usage=main`) from branch (everything else):"),
+        _rail_usage_dist,
+        mo.md("`sac_scale` × `trail_visibility` distribution — drives "
+              "the three `sat-hike-trail-{solid,dashed,dotted}` layers "
+              "encoding the OSM-wiki "
+              "[Hiking trails rendering proposal 1](https://wiki.openstreetmap.org/wiki/File:Hiking_trails_rendering_proposal_1.png) "
+              "matrix (colour = difficulty, pattern = visibility):"),
+        _sac_visibility_dist,
+    ])
     return
 
 
