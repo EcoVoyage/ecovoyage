@@ -397,15 +397,46 @@ def _(Path, os, textwrap):
         # untouched and still drives map-label placement only.
         OPTIMAL_HUB_MIN = 8                  # stopping-rule guard: never fewer
         OPTIMAL_HUB_MAX = 40                 # ...nor more (also caps the profiled-CSA grid)
-        OPTIMAL_HUB_STOP_EPS = 0.005         # stop when a hub improves the network-mean
-                                             # single-best-hub-detour journey time by
-                                             # < 0.5% of the one-hub baseline
+        OPTIMAL_HUB_STOP_EPS = 0.005         # stop when a hub improves the routing
+                                             # objective by < 0.5% of the one-hub baseline
         OPTIMAL_HUB_OD_SAMPLE = 6000         # OD-pair sample size for the objective
         OPTIMAL_HUB_OD_SEED = 20260514       # fixed RNG seed — deterministic selection
         OPTIMAL_HUB_ANCHOR_WEIGHT = 1.0      # μ — co-equal weight of the terminus-
                                              # distance anchor rank vs the routing rank
                                              # (both on the same [1,n] scale; 1.0 = truly
                                              # co-equal)
+        # Routing-objective aggregator. The greedy picks hubs by per-step
+        # `obj = aggregator(cand_cost[m, c] for m in OD-sample)`. Five
+        # variants tested empirically (per-window HARD-FAIL counts on
+        # the 60-pair Transitous gate):
+        #   "mean"       — current; minimises average journey cost.
+        #                  Misses transfer-hubs that fix specific outlier
+        #                  pairs (Wien Meidling on Münster-Wiesing →
+        #                  Langenwang RJX/RJ chain).
+        #   "max"        — minimises the WORST pair's cost. Heavily
+        #                  outlier-driven; may pick weird local hubs
+        #                  serving one bad pair.
+        #   "p95"        — minimises 95th-percentile cost. Robust
+        #                  outlier focus without single-pair brittleness.
+        #   "p99"        — minimises 99th-percentile cost. Even more
+        #                  outlier-sensitive than p95.
+        #   "topk_mean"  — mean of the K=100 worst pairs. Smooths the
+        #                  outlier signal across a stable top-K cohort.
+        #   "savings"    — minimise the NEGATIVE total savings over the
+        #                  routable subset: sum over m of (BIG-cand_cost[m,c])
+        #                  when routable, else 0. Unlike the cost-capped
+        #                  aggregators above (mean/p95/p99/topk_mean/max),
+        #                  this isn't pinned to the BIG=24h ceiling by the
+        #                  unroutable-pair majority: a candidate that opens
+        #                  a new pair contributes a finite positive savings
+        #                  on top of whatever was already routable, so each
+        #                  greedy step makes visible progress instead of
+        #                  ties-at-BIG that degenerate the pick to anchor-
+        #                  rank tie-breaking. Empirically restores real
+        #                  routing-cost optimisation across the OD sample.
+        # See compute_optimal_hubs for the per-objective wiring.
+        OPTIMAL_HUB_OBJ = "savings"
+        OPTIMAL_HUB_TOPK = 100               # only used when OBJ == "topk_mean"
 
         # Sentinel `via_trip` on CSA seed rows ("first boarding from the
         # journey origin charges no transfer time"; also the
@@ -2600,6 +2631,64 @@ def _(Path, os, textwrap):
                 H_ci, rows = [], []
                 obj_one = None
                 prev_obj = None
+                # Objective aggregator over the OD-pair sample. The
+                # objective shape is per-candidate (n_cand,) — for each
+                # candidate c we aggregate the M-vector cand_cost[:, c]
+                # of journey costs into a single scalar. The aggregator
+                # chosen by OPTIMAL_HUB_OBJ controls the greedy's bias:
+                # mean averages, p95/p99 follow the worst tail, max is
+                # extreme worst-case, topk_mean averages the K-worst
+                # pairs. See the OPTIMAL_HUB_OBJ block in the
+                # GTFS DAG header for the full rationale.
+                def _aggregate(_cost_capped):
+                    if OPTIMAL_HUB_OBJ == "mean":
+                        return _cost_capped.mean(axis=0)
+                    if OPTIMAL_HUB_OBJ == "max":
+                        return _cost_capped.max(axis=0)
+                    if OPTIMAL_HUB_OBJ == "p95":
+                        return np.quantile(_cost_capped, 0.95, axis=0)
+                    if OPTIMAL_HUB_OBJ == "p99":
+                        return np.quantile(_cost_capped, 0.99, axis=0)
+                    if OPTIMAL_HUB_OBJ == "topk_mean":
+                        # mean of the K worst pairs per candidate
+                        _k = min(OPTIMAL_HUB_TOPK, _cost_capped.shape[0])
+                        # np.partition is O(N) for the top-K split
+                        _part = np.partition(
+                            _cost_capped, _cost_capped.shape[0] - _k,
+                            axis=0,
+                        )[-_k:, :]
+                        return _part.mean(axis=0)
+                    if OPTIMAL_HUB_OBJ == "savings":
+                        # MINIMISE total residual cost = BIG·M - total
+                        # savings over the routable subset, where savings
+                        # per pair m = max(0, BIG - cand_cost[m, c]).
+                        # The cost-capped aggregators above all plateau
+                        # at BIG when more than (1 - quantile)% of the
+                        # OD-sample is unroutable: with a 6000-pair sample
+                        # over 6789 served stations the random sample
+                        # exposes thousands of rural-rural pairs that
+                        # have no single-trip ride from EITHER side, so
+                        # p95(cand_cost)=BIG for every candidate and the
+                        # greedy stops at MIN=8 with marginal_gain=0 from
+                        # #2 onwards — picks degenerate to anchor-rank
+                        # ties. `savings` doesn't have this floor: a
+                        # candidate that opens a pair contributes BIG -
+                        # cand_cost[m,c] > 0 to its savings on that pair;
+                        # pairs still unroutable contribute 0. So every
+                        # committed hub visibly moves the objective.
+                        # Encoded as RESIDUAL COST (positive, monotone
+                        # non-increasing as hubs are added) so the
+                        # existing rel=marginal/obj_one stopping rule
+                        # still applies unchanged.
+                        _M = _cost_capped.shape[0]
+                        _routable = _cost_capped < BIG
+                        _savings = np.where(
+                            _routable, BIG - _cost_capped, 0
+                        ).sum(axis=0).astype(np.float64)
+                        return float(BIG) * _M - _savings
+                    raise ValueError(
+                        f"unknown OPTIMAL_HUB_OBJ {OPTIMAL_HUB_OBJ!r}"
+                    )
                 while len(H_ci) < OPTIMAL_HUB_MAX and len(H_ci) < n_cand:
                     k = len(H_ci) + 1
                     # journey cost if candidate c is added — the best of
@@ -2618,10 +2707,11 @@ def _(Path, os, textwrap):
                         cand_cost, viaA + TRANSFER + DB)
                     cand_cost = np.minimum(
                         cand_cost, DA + TRANSFER + viaB)
-                    # objective: mean journey cost over the OD sample,
-                    # capped at BIG (monotone non-increasing as hubs
-                    # are added).
-                    obj = np.minimum(cand_cost, BIG).mean(axis=0)
+                    # objective: aggregator-of-choice over the OD sample,
+                    # capped at BIG (each per-candidate aggregator is
+                    # monotone non-increasing as hubs are added since
+                    # cand_cost only shrinks).
+                    obj = _aggregate(np.minimum(cand_cost, BIG))
                     obj[in_H] = np.inf
                     # CO-EQUAL rank-based pick. Among the live
                     # candidates, rank each by routing (ascending
@@ -3586,12 +3676,28 @@ def _(Path, os, textwrap):
                 # chronomap CSA (see the DAG wiring).
                 import duckdb
                 import json
+                import math
                 import polars as pl
 
                 TILES_WORK.mkdir(parents=True, exist_ok=True)
                 out = TILES_WORK / "austria-routehub-paths.parquet"
                 if not _needs_regen(out):
                     return str(out)
+
+                def _haversine_km(_lon1, _lat1, _lon2, _lat2):
+                    """Great-circle distance between two WGS84 points.
+                    Cheap enough to run inline for ~5k trips x ~20
+                    stops; if it ever isn't, swap to duckdb-spatial
+                    ST_Distance over a CRS:3857 projected pair."""
+                    _R = 6371.0
+                    _phi1 = math.radians(_lat1)
+                    _phi2 = math.radians(_lat2)
+                    _dphi = math.radians(_lat2 - _lat1)
+                    _dlam = math.radians(_lon2 - _lon1)
+                    _a = (math.sin(_dphi / 2) ** 2
+                          + math.cos(_phi1) * math.cos(_phi2)
+                          * math.sin(_dlam / 2) ** 2)
+                    return 2 * _R * math.asin(math.sqrt(_a))
 
                 # ---- Pull the real timetable as one row per trip ------
                 # Per rail trip (route_type = 2): its ordered station
@@ -3605,6 +3711,21 @@ def _(Path, os, textwrap):
                 # (see _build_conns) → / 1000 to seconds; COALESCE so a
                 # call with only one of the two still carries a time.
                 con = duckdb.connect(db_path, read_only=True)
+                # The COALESCE on route_short_name (short → long → id)
+                # follows the same shape used in the station hub-scores
+                # cell (line ~1656) — single canonical fallback chain so
+                # the JS sees a non-empty class label for every trip.
+                # `runs_dow` is a 7-bit bitmask (bit n = trip operates on
+                # ISO weekday n: 0=Mon, 1=Tue, …, 6=Sun) derived from
+                # gtfs.calendar's per-trip service_id. LEFT JOIN with
+                # COALESCE-to-127 (all-days) so trips whose service_id
+                # appears only in `calendar_dates` (no recurring pattern)
+                # still get a permissive default — better to surface a
+                # trip than to silently drop it. Used by both `findRoute`
+                # and the gate's `_find_route` to filter to "trips that
+                # ACTUALLY operate on the user's depart day," fixing the
+                # calendar-blindness that produced 5 HARD-FAILs in the
+                # 00–08 night-window of the prior gate run.
                 _calls = con.sql("""
                     WITH calls AS (
                         SELECT
@@ -3614,10 +3735,27 @@ def _(Path, os, textwrap):
                             COALESCE(st.arrival_time,
                                      st.departure_time) / 1000.0 AS arr_s,
                             COALESCE(st.departure_time,
-                                     st.arrival_time) / 1000.0   AS dep_s
+                                     st.arrival_time) / 1000.0   AS dep_s,
+                            COALESCE(
+                                NULLIF(trim(r.route_short_name), ''),
+                                NULLIF(trim(r.route_long_name), ''),
+                                t.route_id
+                            )                            AS route_short_name,
+                            COALESCE(
+                                cal.monday    * 1 +
+                                cal.tuesday   * 2 +
+                                cal.wednesday * 4 +
+                                cal.thursday  * 8 +
+                                cal.friday    * 16 +
+                                cal.saturday  * 32 +
+                                cal.sunday    * 64,
+                                127
+                            )                            AS runs_dow
                         FROM gtfs.stop_times st
                         JOIN gtfs.trips t  USING (trip_id)
                         JOIN gtfs.routes r USING (route_id)
+                        LEFT JOIN gtfs.calendar cal
+                            ON cal.service_id = t.service_id
                         JOIN transit.station_members sm
                           ON sm.stop_id = st.stop_id
                         WHERE r.route_type = 2
@@ -3640,7 +3778,8 @@ def _(Path, os, textwrap):
                     rolled AS (
                         -- collapse consecutive same-station calls (a
                         -- multi-platform station the trip dwells at)
-                        SELECT trip_id, seq, sfid, arr_s, dep_s, is_hub
+                        SELECT trip_id, seq, sfid, arr_s, dep_s, is_hub,
+                               route_short_name, runs_dow
                         FROM tagged
                         WHERE prev_sfid IS NULL OR prev_sfid <> sfid
                     ),
@@ -3652,9 +3791,18 @@ def _(Path, os, textwrap):
                         FROM rolled GROUP BY trip_id
                     )
                     SELECT r.trip_id, r.seq, r.sfid,
-                           r.arr_s, r.dep_s, r.is_hub
+                           r.arr_s, r.dep_s, r.is_hub,
+                           r.route_short_name, r.runs_dow
                     FROM rolled r
                     JOIN trip_stats ts USING (trip_id)
+                    -- has_hub = 1 keeps the parquet to ~30k trips that
+                    -- touch >= 1 hub. Removing it (admitting hub-free
+                    -- trips as direct-only legs) was tested
+                    -- empirically and REGRESSED the gate from 2 to 3
+                    -- HARD-FAILs: the larger trip pool inflates the
+                    -- BFS state space, and the elapsed-domination
+                    -- pruning prematurely kills useful paths in a
+                    -- denser graph. Keep the filter.
                     WHERE ts.has_hub = 1 AND ts.n_calls >= 2
                     ORDER BY r.trip_id, r.seq
                 """).pl()
@@ -3720,6 +3868,36 @@ def _(Path, os, textwrap):
                     _o_xy, _d_xy = _xy.get(_o_sfid), _xy.get(_d_sfid)
                     if _o_xy is None or _d_xy is None:
                         continue
+                    # Train-class label + average speed bake-in. Both
+                    # surface to the JS via querySourceFeatures on the
+                    # baked PMTiles, so the JS emoji-by-class lookup
+                    # is a constant-time hash without any extra fetch.
+                    # `route_short_name` is the canonical OBB feed line
+                    # code (RJ, RJX, IC, EC, R, REX, S1, S40, …); the
+                    # SQL's COALESCE already filled in a fallback so it
+                    # is non-null. avg_kmh = sum of haversine distances
+                    # over the trip's stop sequence (great-circle, not
+                    # the actual track) / (last_arr - first_dep) — gives
+                    # a useful crow-flies speed that the JS uses to
+                    # promote any >150 km/h trip to the high-speed
+                    # emoji regardless of class.
+                    _route_short_name = _rows[0]["route_short_name"] or ""
+                    _runs_dow = int(_rows[0]["runs_dow"] or 127)
+                    _total_km = 0.0
+                    for _i in range(len(_rows) - 1):
+                        _p1 = _xy.get(_rows[_i]["sfid"])
+                        _p2 = _xy.get(_rows[_i + 1]["sfid"])
+                        if _p1 is not None and _p2 is not None:
+                            _total_km += _haversine_km(
+                                _p1[0], _p1[1], _p2[0], _p2[1]
+                            )
+                    _first_dep = _rows[0].get("dep_s") or _rows[0].get("arr_s") or 0
+                    _last_arr  = _rows[-1].get("arr_s") or _rows[-1].get("dep_s") or 0
+                    _hours = (_last_arr - _first_dep) / 3600.0
+                    _avg_kmh = (
+                        round(_total_km / _hours, 1)
+                        if _hours > 1e-6 and _total_km > 0 else 0.0
+                    )
                     _n_trips += 1
                     for _seq_i, _crd in enumerate((_o_xy, _d_xy)):
                         legs_rows.append({
@@ -3733,6 +3911,9 @@ def _(Path, os, textwrap):
                             "arrive_hhmm": "",
                             "depart_grid": "",
                             "stops": _stops_json,
+                            "route_short_name": _route_short_name,
+                            "avg_kmh": _avg_kmh,
+                            "runs_dow": _runs_dow,
                             "seq": _seq_i,
                             "lon": _crd[0],
                             "lat": _crd[1],
@@ -3760,6 +3941,12 @@ def _(Path, os, textwrap):
                         "arrive_hhmm": "",
                         "depart_grid": "",
                         "stops": _sdata,
+                        # Keep schema uniform with theme='trip' rows;
+                        # station rows carry empty class + 0 speed +
+                        # all-days bitmask (never consulted for stations).
+                        "route_short_name": "",
+                        "avg_kmh": 0.0,
+                        "runs_dow": 127,
                         "seq": 0,
                         "lon": _lon,
                         "lat": _lat,
@@ -3811,7 +3998,10 @@ def _(Path, os, textwrap):
                             any_value(depart_hhmm)       AS depart_hhmm,
                             any_value(arrive_hhmm)       AS arrive_hhmm,
                             any_value(depart_grid)       AS depart_grid,
-                            any_value(stops)             AS stops
+                            any_value(stops)             AS stops,
+                            any_value(route_short_name)  AS route_short_name,
+                            any_value(avg_kmh)           AS avg_kmh,
+                            any_value(runs_dow)          AS runs_dow
                         FROM legs
                         GROUP BY osm_id
                     ) TO '{out}' (FORMAT 'parquet')
@@ -3862,7 +4052,10 @@ def _(Path, os, textwrap):
                            depart_hhmm,
                            arrive_hhmm,
                            depart_grid,
-                           stops
+                           stops,
+                           route_short_name,
+                           avg_kmh,
+                           runs_dow
                     FROM read_parquet('{routehub_paths}')
                 """
                 # z0-only: this tile is a "load the whole dataset"
@@ -6041,6 +6234,30 @@ def _theme_styles():
                            3, 2.0, 7, 3.4, 11, 5.0],
             "line-opacity": 0.95,
          }},
+        # route-stops: emoji-marked Points at every stop touched by the
+        # currently-selected route alternative. Populated from the
+        # client `route-stops-src` GeoJSON (kept up to date by the JS
+        # `redraw()`); each feature carries `properties.icon` = the
+        # emoji to render (🟢 origin / 🔴 destination / 🔁 transfer /
+        # train-class emoji at intermediate boarding/alighting points).
+        # Placed AFTER route-leg so icons render on top of the line,
+        # and BEFORE route-pick so the picked-waypoint yellow circles
+        # stay visually dominant at the user's chosen endpoints.
+        {"id": "route-stops", "type": "symbol",
+         "source": "route-stops-src",
+         "layout": {
+            "text-field": ["get", "icon"],
+            "text-font": ["noto_sans_regular"],
+            "text-size": ["interpolate", ["linear"], ["zoom"],
+                          3, 12, 7, 16, 11, 20, 14, 22],
+            "text-allow-overlap": True,
+            "text-ignore-placement": True,
+            "symbol-z-order": "source",
+         },
+         "paint": {
+            "text-halo-color": "#ffffff",
+            "text-halo-width": 1.2,
+         }},
         {"id": "route-pick", "type": "circle",
          "source": "pick-src",
          "paint": {
@@ -7011,13 +7228,57 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
       // only; the other five maps keep boxZoom) so a shift+click
       // reaches the routebuild-station-dot handler.
       M.boxZoom.disable();
+      // Three non-overlapping 8h depart windows over the GTFS local
+      // service-day; tiles the 24h. A trip is "in window W" iff its
+      // FIRST-LEG dep_s falls in [W.min, W.max). Per shift-click the
+      // route-builder calls findRoute 3x and presents all 3 alternatives
+      // side-by-side; the active alternative drives the on-map line +
+      // stop-icon layer (default daytime — covers the most common
+      // query pattern).
+      var WINDOWS = [
+        { key: 'n', label: '🌙 00–08', min:  0 * 3600, max:  8 * 3600 },
+        { key: 'd', label: '☀️ 08–16', min:  8 * 3600, max: 16 * 3600 },
+        { key: 'e', label: '🌆 16–24', min: 16 * 3600, max: 24 * 3600 }
+      ];
+      var ACTIVE_KEY = 'd';   // active alternative drawn on the map
       var route = [];          // picked station_feature_ids, in order
-      var routeSegs = [];      // one entry per consecutive waypoint pair
+      // routeSegs[s] = { n: <seg|null>, d: <seg|null>, e: <seg|null> }
+      // — one entry per consecutive waypoint pair, holding the fastest
+      // journey per window (null = no journey found in that window).
+      var routeSegs = [];
       var coordOf = {};        // station_feature_id -> [lon,lat]
       var nameOf = {};         // station_feature_id -> name
       var tripStops = {};      // 'trip/<id>' -> [[sfid,arr_s,dep_s,is_hub]...]
+      var tripMeta  = {};      // 'trip/<id>' -> {cls: route_short_name, kmh: avg_kmh}
       var tripsCallingAt = {}; // sfid -> [{trip, idx}]
       var hubSet = {};         // sfid -> true (allowed transfer points)
+
+      // Train-class emoji table. Keyed by the OBB feed's
+      // `route_short_name`; baked into the parquet by
+      // compute_route_network. Default to '🚆' (general train) and
+      // promote any trip whose haversine-derived avg_kmh exceeds
+      // 150 km/h to '🚄' regardless of class (catches ad-hoc
+      // high-speed services that don't fit the canonical RJ/ICE/TGV
+      // labels).
+      var EMOJI_BY_CLASS = {
+        'RJ': '🚄', 'RJX': '🚄', 'ICE': '🚄', 'TGV': '🚄', 'AVE': '🚄',
+        'EC': '🚆', 'IC': '🚆', 'EN': '🚆', 'NJ': '🚆', 'D': '🚆',
+        'EX': '🚆', 'REX': '🚆',
+        'R': '🚂', 'RB': '🚂'
+      };
+      function emojiOf(cls, kmh) {
+        if (kmh && kmh > 150) { return '🚄'; }
+        if (!cls) { return '🚆'; }
+        // OBB's route_short_name has the form "<CLASS> <number>" for
+        // long-distance services (e.g. 'RJ 653', 'ICE 19210', 'NJ 40294')
+        // and "<CLASS><digit>" with no space for S-Bahn lines
+        // (e.g. 'S3', 'S45'). Take the first whitespace-separated
+        // token, then match the S-Bahn pattern OR look up the class
+        // in EMOJI_BY_CLASS.
+        var head = String(cls).trim().split(/\\s+/)[0].toUpperCase();
+        if (/^S\\d/.test(head) || head === 'SB' || head === 'S') { return '🚈'; }
+        return EMOJI_BY_CLASS[head] || '🚆';
+      }
 
       function dedup(feats) {              // tile-clip dedup by osm_id
     var seen = {}, out = [];
@@ -7087,6 +7348,15 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
         catch (e) { stops = []; }
         if (stops.length < 2) { continue; }
         tripStops[p.osm_id] = stops;
+        tripMeta[p.osm_id]  = {
+          cls: (p.route_short_name || '').trim(),
+          kmh: (p.avg_kmh != null ? +p.avg_kmh : 0),
+          // 7-bit bitmask: bit n = trip operates on ISO weekday n
+          // (0=Mon ... 6=Sun). Baked from gtfs.calendar by
+          // compute_route_network. 127 = all days (default for trips
+          // with no gtfs.calendar row, i.e. calendar_dates-only).
+          dow: (p.runs_dow != null ? +p.runs_dow : 127)
+        };
         for (var k = 0; k < stops.length; k++) {
           var sfid = stops[k][0];
           (tripsCallingAt[sfid] = tripsCallingAt[sfid] || [])
@@ -7107,14 +7377,39 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
       // count, so the first reach of B is transfer-minimal; within that
       // level the earliest real arrival wins. seen[(hub,nTr)] keeps the
       // earliest arrival per state and prunes the fan-out.
-      function findRoute(a, b) {
+      // Bounded hub-restricted search A -> B over the real timetable
+      // optimised for MINIMUM END-TO-END ELAPSED TIME — the standard
+      // user-facing metric ("how long does this trip take"). State per
+      // (sfid, nTr) tracks the elapsed time arr - firstDep; we keep
+      // the state with smallest elapsed and prune dominated states.
+      // Best-across-all-levels is updated as B is reached; the outer
+      // loop continues past first-reach so a transfer-using journey
+      // can beat a 0-transfer slower one (the historical algorithm
+      // broke at first reach, missing this — exactly the bug the R10
+      // gate's HARD-FAILs traced to). `minS`/`maxS` constrain the
+      // FIRST leg's boarding dep_s to a window of seconds-after-
+      // midnight; `weekday` (0=Mon..6=Sun, optional) filters trips
+      // by their runs_dow bitmask so a Wed query doesn't pick a
+      // Sat-only night service. Mirror of Python `_find_route`
+      // (one canonical algorithm).
+      function findRoute(a, b, minS, maxS, weekday) {
     if (!a || !b || a === b) { return null; }
     var best = null, seen = {};
     var frontier = [];
+    var dowMask = (weekday != null) ? (1 << weekday) : 0;
+    function tripRunsToday(tripOsmId) {
+      if (dowMask === 0) { return true; }   // no calendar filter
+      var meta = tripMeta[tripOsmId];
+      if (!meta || meta.dow == null) { return true; }
+      return (meta.dow & dowMask) !== 0;
+    }
     (tripsCallingAt[a] || []).forEach(function (e) {
       var dep = stopDep(tripStops[e.trip], e.idx);
       if (dep == null) { return; }          // a is this trip's terminus
-      frontier.push({ nTr: 0, legs: [],
+      if (minS != null && dep < minS) { return; }
+      if (maxS != null && dep > maxS) { return; }
+      if (!tripRunsToday(e.trip)) { return; }
+      frontier.push({ nTr: 0, firstDep: dep, legs: [],
         pending: { trip: e.trip, boardIdx: e.idx } });
     });
     while (frontier.length) {
@@ -7127,31 +7422,75 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
         for (var k = bIdx + 1; k < stops.length; k++) {   // RIDE forward
           var sfid = stops[k][0], arr = stopArr(stops, k);
           if (arr == null) { continue; }
+          var elapsed = arr - stt.firstDep;
+          // Prune states that are already worse than the best-so-far,
+          // including the destination check — same elapsed-based
+          // domination as the seen[] map (gives a useful early-exit
+          // when a fast direct route was already found).
+          if (best && elapsed >= best.elapsed) { continue; }
           var legs2 = stt.legs.concat(
             [{ trip: trip, boardIdx: bIdx, alightIdx: k }]);
           if (sfid === b) {                               // reached B
-            if (!best || arr < best.arrSec) {
-              best = { legs: legs2, arrSec: arr, nTr: stt.nTr };
+            if (!best || elapsed < best.elapsed) {
+              best = { legs: legs2, arrSec: arr,
+                       firstDep: stt.firstDep,
+                       elapsed: elapsed, nTr: stt.nTr };
             }
             continue;
           }
           if (!hubSet[sfid]) { continue; }       // transfer only at hub
           if (stt.nTr + 1 > ROUTEBUILD_MAX_TRANSFERS) { continue; }
           var sk = sfid + '|' + (stt.nTr + 1);
-          if (seen[sk] != null && seen[sk] <= arr) { continue; }
-          seen[sk] = arr;
+          // Pareto domination on BOTH elapsed AND wall-clock arrival.
+          // Elapsed-only pruning is a real correctness bug — two trips
+          // from the same origin can reach the same hub with IDENTICAL
+          // elapsed but DIFFERENT wall-clock arrivals (e.g. IC 16:30 →
+          // Wien Hbf 19:03 vs IC 18:30 → Wien Hbf 21:03, both 153 min
+          // from boarding). With the old `seen[sk] <= elapsed` rule
+          // whichever was processed second got pruned and its valid
+          // onward transfers were lost; the 16:30 IC's 19:15-departing
+          // S2-W to Neubau-Kreuzstetten reached dest in 225 min but
+          // was never enqueued, producing a phantom HARD-FAIL in the
+          // R10 gate. Track a Pareto-optimal list of (elapsed, arr)
+          // per (sfid, nTr) and prune only states dominated on BOTH
+          // axes. The Python `_find_route` mirror at the end of this
+          // notebook carries the identical Pareto change.
+          var seenList = seen[sk] = seen[sk] || [];
+          var dominated = false;
+          for (var si = 0; si < seenList.length; si++) {
+            if (seenList[si][0] <= elapsed && seenList[si][1] <= arr) {
+              dominated = true; break;
+            }
+          }
+          if (dominated) { continue; }
+          // Remove any entry this new state dominates, then append.
+          var kept = [];
+          for (var si2 = 0; si2 < seenList.length; si2++) {
+            if (!(elapsed <= seenList[si2][0]
+                  && arr <= seenList[si2][1])) {
+              kept.push(seenList[si2]);
+            }
+          }
+          kept.push([elapsed, arr]);
+          seen[sk] = kept;
           var conns = tripsCallingAt[sfid] || [];
           for (var ci = 0; ci < conns.length; ci++) {
             var e2 = conns[ci];
             if (e2.trip === trip) { continue; }    // not the same train
             var dep2 = stopDep(tripStops[e2.trip], e2.idx);
             if (dep2 == null || dep2 < arr) { continue; }
-            nextF.push({ nTr: stt.nTr + 1, legs: legs2,
+            if (!tripRunsToday(e2.trip)) { continue; }
+            nextF.push({ nTr: stt.nTr + 1, firstDep: stt.firstDep,
+              legs: legs2,
               pending: { trip: e2.trip, boardIdx: e2.idx } });
           }
         }
       }
-      if (best) { break; }   // first transfer-level reaching B wins
+      // CONTINUE past first-reach. The outer transfer-count bound
+      // (ROUTEBUILD_MAX_TRANSFERS) plus the elapsed-domination
+      // pruning keeps the fan-out bounded; the upside is that a
+      // 2-transfer journey can legitimately beat a 0-transfer one
+      // when end-to-end is the optimisation target.
       frontier = nextF;
     }
     return best ? buildSegment(best) : null;
@@ -7180,12 +7519,51 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
     };
       }
 
-      // one real trip leg: board stop+time -> alight stop+time.
+      // one real trip leg: a header line with emoji + train name + the
+      // class's average speed, followed by board stop+time -> alight
+      // stop+time. Train metadata from tripMeta (baked into the parquet
+      // by compute_route_network); the speed override promotes any
+      // >150 km/h trip to 🚄 regardless of class.
       function renderLegs(part) {
     var st = part.stops, a = st[0], z = st[st.length - 1];
-    return '<div>&#128642; <b>' + fmtT(a[2]) + '</b> '
-      + (nameOf[a[0]] || a[0]) + '<br>&nbsp;&nbsp;&#8595; <b>'
-      + fmtT(z[1]) + '</b> ' + (nameOf[z[0]] || z[0]) + '</div>';
+    var m = tripMeta[part.trip] || {};
+    var em = emojiOf(m.cls, m.kmh);
+    var headerLine = '<div style="margin-top:2px;"><b>' + em
+      + (m.cls ? ' ' + m.cls : '')
+      + '</b>'
+      + (m.kmh > 0
+          ? ' <span style="color:#888;font-size:11px;">~'
+            + Math.round(m.kmh) + ' km/h</span>'
+          : '')
+      + '</div>';
+    return headerLine
+      + '<div><b>' + fmtT(a[2]) + '</b> '
+        + (nameOf[a[0]] || a[0]) + '</div>'
+      + '<div>&nbsp;&nbsp;&#8595; <b>' + fmtT(z[1]) + '</b> '
+        + (nameOf[z[0]] || z[0]) + '</div>';
+      }
+
+      // Render one alternative's worth of seg parts (or "no journey
+      // found" when null). Returns an HTML fragment.
+      function renderAltBody(seg, legNo) {
+    if (!seg) {
+      return '<div style="color:#888;font-style:italic;">no journey '
+        + 'in this window</div>';
+    }
+    var h = '<div style="color:#666;">'
+      + (seg.direct ? 'direct'
+         : seg.n_transfers + ' transfer'
+           + (seg.n_transfers === 1 ? '' : 's'))
+      + ', <b>' + seg.travel_min + ' min</b></div>';
+    for (var pi = 0; pi < seg.parts.length; pi++) {
+      if (pi > 0) {
+        var hub = seg.parts[pi].stops[0];
+        h += '<div style="color:#b06000;">🔁 transfer at '
+          + (nameOf[hub[0]] || hub[0]) + '</div>';
+      }
+      h += renderLegs(seg.parts[pi]);
+    }
+    return h;
       }
 
       function renderPanel() {
@@ -7205,58 +7583,125 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
         + (nameOf[route[i]] || route[i]);
     }
     h += '</div>';
-    var totMin = 0, totTr = 0, okAll = true;
-    for (var s = 0; s < routeSegs.length; s++) {
-      var seg = routeSegs[s];
-      h += '<hr style="border:none;border-top:1px solid #ddd;'
-        + 'margin:5px 0;">';
-      if (!seg) {
-        h += '<div style="color:#b00;">leg ' + (s + 1)
-          + ': no route found</div>';
-        okAll = false;
-        continue;
-      }
-      totMin += seg.travel_min;
-      totTr += seg.n_transfers;
-      h += '<div style="color:#666;">leg ' + (s + 1) + ' &mdash; '
-        + (seg.direct ? 'direct'
-           : seg.n_transfers + ' transfer'
-             + (seg.n_transfers === 1 ? '' : 's'))
-        + ', ' + seg.travel_min + ' min</div>';
-      for (var pi = 0; pi < seg.parts.length; pi++) {
-        if (pi > 0) {                  // transfer between two real trips
-          var hub = seg.parts[pi].stops[0];
-          h += '<div style="color:#b06000;">&#8597; transfer at '
-            + (nameOf[hub[0]] || hub[0]) + '</div>';
-        }
-        h += renderLegs(seg.parts[pi]);
-      }
+    // Travel-date picker. Picking a date selects its weekday for the
+    // calendar filter on findRoute, so trips not operating on that
+    // weekday (per gtfs.calendar.txt) are dropped from the 3-window
+    // alternatives. Defaults to today.
+    var DOW_NAMES = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+    var dowName = DOW_NAMES[activeIsoWeekday()];
+    h += '<div style="margin-top:6px;color:#555;font-size:11px;">'
+      + 'Travel date: '
+      + '<input type="date" id="route-date" value="' + activeDateIso() + '"'
+      + ' style="font-size:11px;padding:1px 3px;border:1px solid #ccc;'
+      + 'border-radius:3px;">'
+      + ' <span id="route-date-dow" style="color:#888;font-weight:bold;">('
+      + dowName + ')</span>'
+      + '</div>';
+    // Window tabs — clicking redraws the map line + stop icons for the
+    // chosen alternative. The panel itself ALWAYS shows all three
+    // (per the design — user sees the comparison at a glance).
+    h += '<div style="margin-top:6px;display:flex;gap:4px;">';
+    for (var wi = 0; wi < WINDOWS.length; wi++) {
+      var w = WINDOWS[wi];
+      var sel = (w.key === ACTIVE_KEY);
+      h += '<span data-win="' + w.key + '" '
+        + 'class="route-tab" '
+        + 'style="cursor:pointer;padding:2px 6px;border-radius:3px;'
+        + 'font-size:11px;'
+        + (sel
+            ? 'background:#1b5fa8;color:#fff;font-weight:bold;'
+            : 'background:#eee;color:#333;')
+        + '">' + w.label + '</span>';
     }
-    if (routeSegs.length && okAll) {
+    h += '</div>';
+    // Per leg: a 3-column-style stack of alternatives.
+    for (var s = 0; s < routeSegs.length; s++) {
       h += '<hr style="border:none;border-top:1px solid #ddd;'
-        + 'margin:5px 0;"><b>Total: ' + totMin + ' min, ' + totTr
-        + ' transfer' + (totTr === 1 ? '' : 's') + '</b>';
+        + 'margin:6px 0;"><div style="color:#444;font-weight:bold;'
+        + 'font-size:12px;">Leg ' + (s + 1) + ' &mdash; '
+        + (nameOf[route[s]] || route[s]) + ' → '
+        + (nameOf[route[s + 1]] || route[s + 1]) + '</div>';
+      var triple = routeSegs[s] || {};
+      for (var wj = 0; wj < WINDOWS.length; wj++) {
+        var ww = WINDOWS[wj];
+        var sel2 = (ww.key === ACTIVE_KEY);
+        h += '<div style="margin-top:4px;padding:4px 6px;'
+          + 'border-left:3px solid '
+          + (sel2 ? '#1b5fa8' : '#ddd')
+          + ';background:'
+          + (sel2 ? 'rgba(27,95,168,0.06)' : '#fafafa')
+          + ';">';
+        h += '<div style="color:' + (sel2 ? '#1b5fa8' : '#888')
+          + ';font-size:11px;font-weight:bold;">' + ww.label
+          + '</div>';
+        h += renderAltBody(triple[ww.key], s + 1);
+        h += '</div>';
+      }
     }
     panel.innerHTML = h;
     var cb = document.getElementById('route-clear');
     if (cb) {
       cb.addEventListener('click', function () {
-        route = []; routeSegs = []; redraw();
+        route = []; routeSegs = []; ACTIVE_KEY = 'd'; redraw();
+      });
+    }
+    // Wire up the window tabs.
+    var tabs = panel.getElementsByClassName('route-tab');
+    for (var ti = 0; ti < tabs.length; ti++) {
+      tabs[ti].addEventListener('click', function (ev) {
+        var k = ev.currentTarget.getAttribute('data-win');
+        if (k && k !== ACTIVE_KEY) {
+          ACTIVE_KEY = k;
+          redraw();
+        }
+      });
+    }
+    // Wire the travel-date picker — on change, re-query findRoute for
+    // every stored leg against the new weekday so the alternatives
+    // refresh.
+    var dateEl = document.getElementById('route-date');
+    if (dateEl) {
+      dateEl.addEventListener('change', function (ev) {
+        SELECTED_DATE_STR = ev.target.value || null;
+        recomputeAllSegs();
+        redraw();
       });
     }
       }
 
+      // Pull the [board_stop, alight_stop] pair for each part of a seg —
+      // every stop where the user starts or ends a leg (including the
+      // intermediate transfer points where one leg ends and the next
+      // begins). Used by the on-map stop-icon overlay.
+      function tripPartEndpoints(seg) {
+    if (!seg) { return []; }
+    var out = [];
+    for (var i = 0; i < seg.parts.length; i++) {
+      var pt = seg.parts[i];
+      var st = pt.stops;
+      out.push({ stopRow: st[0], part: pt, role: 'board' });
+      out.push({ stopRow: st[st.length - 1], part: pt, role: 'alight' });
+    }
+    return out;
+      }
+
       function redraw() {
+    // route-src: polyline of the ACTIVE window's journey for each leg.
+    // Inactive windows' lines stay off the map; the panel still shows
+    // their summary so the user can compare at a glance.
     var rf = [];
     for (var s = 0; s < routeSegs.length; s++) {
-      if (routeSegs[s] && routeSegs[s].coords.length > 1) {
+      var triple = routeSegs[s] || {};
+      var seg = triple[ACTIVE_KEY];
+      if (seg && seg.coords.length > 1) {
         rf.push({ type: 'Feature', properties: {},
           geometry: { type: 'LineString',
-                      coordinates: routeSegs[s].coords } });
+                      coordinates: seg.coords } });
       }
     }
     M.getSource('route-src').setData(
       { type: 'FeatureCollection', features: rf });
+    // pick-src: yellow numbered circles at the user-clicked waypoints.
     var pf = [];
     for (var i = 0; i < route.length; i++) {
       var xy = coordOf[route[i]];
@@ -7268,7 +7713,103 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
     }
     M.getSource('pick-src').setData(
       { type: 'FeatureCollection', features: pf });
+    // route-stops-src: emoji-marked Points at every stop touched by
+    // the ACTIVE alternative — 🟢 origin / 🔴 destination / 🔁 transfer
+    // / class emoji at intermediate boarding/alighting points.
+    // Skipped for the user-clicked endpoints (those already carry the
+    // yellow numbered pick-pin) — adding the green/red emoji on top
+    // would visually clutter the waypoints.
+    var stopsFeatures = [];
+    if (routeSegs.length) {
+      for (var sIdx = 0; sIdx < routeSegs.length; sIdx++) {
+        var triple2 = routeSegs[sIdx] || {};
+        var aseg = triple2[ACTIVE_KEY];
+        if (!aseg) { continue; }
+        var endpoints = tripPartEndpoints(aseg);
+        for (var ei = 0; ei < endpoints.length; ei++) {
+          var endpoint = endpoints[ei];
+          var sfid = endpoint.stopRow[0];
+          var xy2 = coordOf[sfid];
+          if (!xy2) { continue; }
+          // Skip the user-clicked waypoint sfids — pick-pin owns them.
+          if (route.indexOf(sfid) >= 0) { continue; }
+          var icon;
+          if (endpoint.role === 'board' && ei > 0) {
+            // First boarding inside a journey after a transfer.
+            icon = '🔁';
+          } else {
+            var m2 = tripMeta[endpoint.part.trip] || {};
+            icon = emojiOf(m2.cls, m2.kmh);
+          }
+          stopsFeatures.push({
+            type: 'Feature',
+            properties: { icon: icon, sfid: sfid },
+            geometry: { type: 'Point', coordinates: xy2 }
+          });
+        }
+        // 🟢 at the very first stop of leg 0; 🔴 at the very last
+        // stop of the LAST leg — but only if those sfids aren't
+        // user-clicked waypoints already (they always are for the
+        // route as a whole, so this branch is effectively a no-op
+        // and pick-pin shows the numbered marker instead).
+        // Kept for completeness when shift-click chains the user
+        // through stations they didn't explicitly click.
+      }
+    }
+    M.getSource('route-stops-src').setData(
+      { type: 'FeatureCollection', features: stopsFeatures });
     renderPanel();
+      }
+
+      // Selected travel date — `null` falls back to today (the
+      // route-builder always picks SOME date for the calendar filter).
+      // Updated by the panel's <input type="date"> on change; when set,
+      // findRoute filters out trips whose runs_dow bitmask doesn't
+      // include this date's weekday so the alternatives match the
+      // user's actual travel day.
+      var SELECTED_DATE_STR = null;     // 'YYYY-MM-DD' or null
+
+      function activeDate() {
+    if (SELECTED_DATE_STR) {
+      var d = new Date(SELECTED_DATE_STR + 'T00:00:00');
+      if (!isNaN(d.getTime())) { return d; }
+    }
+    return new Date();
+      }
+      // Date.getDay() returns 0=Sun..6=Sat; convert to ISO 0=Mon..6=Sun
+      // so the bit positions match the parquet's runs_dow encoding.
+      function activeIsoWeekday() {
+    return (activeDate().getDay() + 6) % 7;
+      }
+      function activeDateIso() {
+    var t = activeDate();
+    function pad(n) { return (n < 10 ? '0' : '') + n; }
+    return t.getFullYear() + '-' + pad(t.getMonth() + 1)
+      + '-' + pad(t.getDate());
+      }
+
+      // Per shift-click: query each of the 3 windows, store all 3
+      // alternatives. The active alternative drives the on-map
+      // line + stop icons; the panel always shows all 3.
+      function findRouteAllWindows(a, b) {
+    var triple = {};
+    var weekday = activeIsoWeekday();
+    for (var wi = 0; wi < WINDOWS.length; wi++) {
+      var w = WINDOWS[wi];
+      var found = findRoute(a, b, w.min, w.max, weekday);
+      triple[w.key] = found;
+    }
+    return triple;
+      }
+
+      // Recompute all stored route segments — used when the user picks
+      // a new travel date / weekday so the alternatives refresh.
+      function recomputeAllSegs() {
+    if (route.length < 2) { return; }
+    routeSegs = [];
+    for (var i = 1; i < route.length; i++) {
+      routeSegs.push(findRouteAllWindows(route[i - 1], route[i]));
+    }
       }
 
       M.on('click', 'routebuild-station-dot', function (e) {
@@ -7278,7 +7819,7 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
     if (e.originalEvent && e.originalEvent.shiftKey && route.length) {
       var prev = route[route.length - 1];
       if (prev === sid) { return; }
-      routeSegs.push(findRoute(prev, sid));
+      routeSegs.push(findRouteAllWindows(prev, sid));
       route.push(sid);
     } else {
       route = [sid];
@@ -7317,6 +7858,14 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
                     "data": {"type": "FeatureCollection", "features": []},
                 },
                 "pick-src": {
+                    "type": "geojson",
+                    "data": {"type": "FeatureCollection", "features": []},
+                },
+                # Per-stop emoji icons for the currently-selected route
+                # alternative; populated by JS redraw() with one Point
+                # per stop touched (origin / destination / transfer /
+                # intermediate-boarding-alighting).
+                "route-stops-src": {
                     "type": "geojson",
                     "data": {"type": "FeatureCollection", "features": []},
                 },
@@ -7541,17 +8090,21 @@ def _(dag_run_states, mo):
     _VAL_SEED = 2026_05_15           # bump only on intentional re-baseline
     _VAL_N = 20
     _VAL_MAX_TRANSFERS = 4           # mirror route-builder cap (line 6998)
-    _VAL_SEARCH_WINDOW = 14400       # 4h MOTIS searchWindow seconds —
-                                     # short enough that MOTIS picks
-                                     # only same-day-morning trips,
-                                     # wide enough that "next departure"
-                                     # land for rural stops (Wolfsbergkogel
-                                     # at 09:00 in the old 1h window
-                                     # missed all real services).
-    _VAL_DEPART_WINDOW_S = 14400     # Mirror it on our side: when the
-                                     # gate's depart_iso is 09:00, our
-                                     # findRoute considers first-leg
-                                     # trips with dep_s in [09:00, 13:00].
+    # Three non-overlapping 8h depart windows tiling the 24h GTFS
+    # service-day in Europe/Vienna LOCAL time. Mirrors exactly the JS
+    # route-builder's WINDOWS array. For each window the gate runs:
+    #   * _find_route with [min_depart_s=lo, max_depart_s=hi)
+    #   * MOTIS /api/v5/plan with `time` = window-START in UTC and
+    #     `searchWindow` = full 8h window width
+    # so both planners pick the FASTEST journey departing inside the
+    # same time band. 60 MOTIS calls per cold run (3 windows × 20
+    # pairs); warm re-runs are zero-network via the sha1 disk cache.
+    _VAL_WINDOWS = [
+        (0,            8 * 3600),
+        (8  * 3600,   16 * 3600),
+        (16 * 3600,   24 * 3600),
+    ]
+    _VAL_WINDOW_LABELS = ["00-08", "08-16", "16-24"]
     _VAL_NUM_ITINERARIES = 3
     _VAL_REQ_TIMEOUT = 25            # per-request seconds
     _VAL_HARDFAIL_MIN_AHEAD = 60     # MOTIS faster by >=N min -> hard-fail
@@ -7564,9 +8117,19 @@ def _(dag_run_states, mo):
     # but MOTIS finds no rail route within 24h: it's a coverage gap
     # downgrade — soft-flag, not hard-fail.
     _VAL_MOTIS_OFFSETS_MIN = 20
-    _RAIL_MODES = {
+    # MOTIS' transit-leg mode set — ACCEPT ALL TRANSIT MODES, not just
+    # rail. The gate now compares our rail-only planner against the
+    # actual globally-fastest journey MOTIS finds (which may include
+    # subway, tram, bus, ferry connectors). That's the user-centric
+    # "are we close to realistic fastest" comparison — vs the prior
+    # rail-only-vs-rail-only comparison that gave MOTIS rail-only the
+    # same handicap as us and produced inverted "we faster than MOTIS"
+    # soft-flags on cross-Vienna pairs where reality is U-Bahn.
+    _TRANSIT_MODES = {
         "RAIL", "HIGHSPEED_RAIL", "LONG_DISTANCE", "NIGHT_RAIL",
         "REGIONAL_FAST_RAIL", "REGIONAL_RAIL", "SUBURBAN",
+        "SUBWAY", "TRAM", "BUS", "COACH", "FERRY", "AIRPLANE",
+        "FUNICULAR", "AERIAL_LIFT", "ODM", "OTHER",
     }
 
     _STAGING_BASE = "https://staging.api.transitous.org/api/v5"
@@ -7602,23 +8165,32 @@ def _(dag_run_states, mo):
         _ua_email = "anonymous@local"
     _UA = f"ecovoyage-r10-gate/2026.05 ({_ua_email})"
 
-    # depart-at = next Wednesday at 09:00 Europe/Vienna -> UTC ISO.
-    # Wednesday avoids weekend reduced service; 09:00 is busy band.
+    # depart-DAY = next Wednesday in Europe/Vienna (Wednesday avoids
+    # weekend reduced service). The 3-window scan tiles 00:00-24:00 of
+    # that day; each window's MOTIS query uses the window-start as
+    # `time` and `searchWindow` = window-width. The full-day midnight
+    # ISO is used as the evidence-JSON reference timestamp.
     _now_vie = _val_dt.now(_val_ZI("Europe/Vienna"))
     _d2w = (2 - _now_vie.weekday()) % 7 or 7   # always future Wed
-    _depart_local = (_now_vie + _val_td(days=_d2w)).replace(
-        hour=9, minute=0, second=0, microsecond=0)
-    _depart_iso = _depart_local.astimezone(_val_tz.utc).strftime(
+    _depart_day_local = (_now_vie + _val_td(days=_d2w)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    _depart_day_iso = _depart_day_local.astimezone(_val_tz.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
-    # `_depart_s_floor` = seconds-after-midnight in Europe/Vienna LOCAL
-    # time. GTFS stop_times.txt encodes dep_s in local time of the
-    # operating service, so this is the right frame to filter
-    # austria-routehub-paths.parquet against (the parquet's `dep_s`
-    # is the GTFS literal). 09:00 local = 32400 s.
-    _depart_s_floor = (_depart_local.hour * 3600
-                       + _depart_local.minute * 60
-                       + _depart_local.second)
-    _depart_s_ceil = _depart_s_floor + _VAL_DEPART_WINDOW_S
+    # ISO weekday (Mon=0..Sun=6) used to filter trips by the parquet's
+    # `runs_dow` bitmask — both planners see only services that operate
+    # on this day. `_now_vie.weekday()` matches Python's stdlib
+    # convention (Mon=0..Sun=6). Pre-computed so the for-loop below
+    # passes a constant.
+    _depart_weekday = _depart_day_local.weekday()
+
+    def _iso_at_seconds(_s_of_day):
+        """Convert a seconds-after-midnight value (Europe/Vienna local
+        clock) for the depart-day into a UTC ISO string MOTIS accepts
+        as `time=`. The GTFS parquet's `dep_s` is in this same local-
+        clock frame, so the two planners see the same time horizon."""
+        _dt_local = _depart_day_local + _val_td(seconds=_s_of_day)
+        return _dt_local.astimezone(_val_tz.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
 
     # ── 1. Sample 20 stratified pairs ──────────────────────────────
     _val_db = _val_duckdb.connect(
@@ -7685,6 +8257,51 @@ def _(dag_run_states, mo):
         _samples.append({"o": _o, "d": _d, "stratum": "padding"})
     _samples = _samples[:_VAL_N]
 
+    # ── HARD-FAIL / SOFT-FLAG CORPUS — persistent regression ledger ─
+    # Every pair that has produced a non-PASS verdict in any prior
+    # gate run is persisted to `_CORPUS_PATH` (committed to git, not
+    # gitignored). Future gate runs ALWAYS retest these pairs (every
+    # window) alongside the seeded random sample, so regressions and
+    # historical edge cases get coverage forever. New non-PASS pairs
+    # from THIS run are appended at the end. The file is the source
+    # of truth — operators can hand-edit to remove stale entries.
+    _CORPUS_PATH = _R10_DIR / "hardfail-corpus.json"
+    _corpus = {"version": 1, "pairs": []}
+    if _CORPUS_PATH.exists():
+        try:
+            _corpus = _val_json.loads(_CORPUS_PATH.read_text())
+            if not isinstance(_corpus, dict) or "pairs" not in _corpus:
+                _corpus = {"version": 1, "pairs": []}
+        except Exception:
+            _corpus = {"version": 1, "pairs": []}
+    _corpus_pairs = _corpus.get("pairs") or []
+    # Build sfid → row map for the corpus's coord/name resolution.
+    _by_sfid = {
+        r["station_feature_id"]: r
+        for r in _stations.iter_rows(named=True)
+    }
+    _seen_in_samples = {
+        (s["o"]["station_feature_id"], s["d"]["station_feature_id"])
+        for s in _samples
+    }
+    for _cp in _corpus_pairs:
+        _o_sfid = _cp.get("origin_sfid")
+        _d_sfid = _cp.get("dest_sfid")
+        if not _o_sfid or not _d_sfid:
+            continue
+        if (_o_sfid, _d_sfid) in _seen_in_samples:
+            continue
+        _o_row = _by_sfid.get(_o_sfid)
+        _d_row = _by_sfid.get(_d_sfid)
+        if _o_row is None or _d_row is None:
+            # Station removed from rail-served set since the corpus
+            # was written — skip silently. Operator can delete the
+            # stale corpus entry.
+            continue
+        _samples.append({"o": _o_row, "d": _d_row,
+                         "stratum": "corpus"})
+        _seen_in_samples.add((_o_sfid, _d_sfid))
+
     # ── 2. Build the timetable graph from the parquet ──────────────
     _paths_p = _val_Path("/workspace/tiles/work/"
                          "austria-routehub-paths.parquet")
@@ -7697,6 +8314,7 @@ def _(dag_run_states, mo):
     _paths = _val_pl.read_parquet(_paths_p)
 
     _trip_stops = {}    # "trip/<id>" -> [[sfid, arr_s, dep_s, is_hub], ...]
+    _trip_dow = {}      # "trip/<id>" -> 7-bit runs-on-weekday bitmask
     _trips_at = {}      # sfid -> [(trip_osm_id, idx), ...]
     _hub_set = set()
     for _row in _paths.filter(
@@ -7708,33 +8326,36 @@ def _(dag_run_states, mo):
         if len(_ss) < 2:
             continue
         _trip_stops[_row["osm_id"]] = _ss
+        _trip_dow[_row["osm_id"]] = int(_row.get("runs_dow") or 127)
         for _i, _s in enumerate(_ss):
             _sfid = _s[0]
             _trips_at.setdefault(_sfid, []).append((_row["osm_id"], _i))
             if _s[3]:
                 _hub_set.add(_sfid)
 
-    def _find_route(_a, _b, _min_depart_s=None, _max_depart_s=None):
-        """Server-side replay of JS findRoute (lines 7110-7158).
+    def _find_route(_a, _b, _min_depart_s=None, _max_depart_s=None,
+                    _weekday=None):
+        """Server-side replay of JS findRoute.
 
-        Bounded hub-restricted BFS by transfer count. RIDE any trip
-        calling at A forward freely through any hubs; CHANGE only at
-        a hub, onto a DIFFERENT trip whose dep >= our arrival.
-        Within each transfer-count level, earliest arrival wins.
+        Bounded hub-restricted search A → B over the real timetable,
+        optimised for MINIMUM END-TO-END ELAPSED TIME (arr - firstDep).
+        State per (sfid, nTr) tracks elapsed; dominated states pruned.
+        Best-across-all-transfer-levels updated as B is reached — the
+        outer loop continues past first reach so a transfer-using
+        journey can beat a 0-transfer slower one.
 
-        `_min_depart_s` / `_max_depart_s` restrict the FIRST leg's
-        boarding `dep_s` to a window of seconds-after-midnight; this
-        is what makes the replay calendar/depart-time-aware instead
-        of picking a 02:00 night train for a 09:00 query. Both bounds
-        are optional — when None, the JS interactive map's "earliest
-        absolute arrival regardless of clock time" semantics hold.
-        Once boarded, subsequent legs are still constrained by
-        "transfer trip's dep >= our arrival" (line 7739) — that
-        relative-time check is independent of the absolute depart
-        window.
+        Bounds: `_min_depart_s` / `_max_depart_s` restrict the FIRST
+        leg's boarding dep_s (window-of-day search). `_weekday`
+        (0=Mon..6=Sun) filters trips by their `runs_dow` bitmask.
+        All three optional.
         """
         if not _a or not _b or _a == _b:
             return None
+        _dow_mask = (1 << _weekday) if _weekday is not None else 0
+        def _runs_today(_trip_id):
+            if _dow_mask == 0:
+                return True
+            return bool(_trip_dow.get(_trip_id, 127) & _dow_mask)
         _frontier, _seen, _best = [], {}, None
         for _trip, _idx in _trips_at.get(_a, []):
             _dep = _trip_stops[_trip][_idx][2]
@@ -7745,23 +8366,34 @@ def _(dag_run_states, mo):
                 continue
             if _max_depart_s is not None and _dep_i > _max_depart_s:
                 continue
-            _frontier.append({"n_tr": 0, "legs": [],
+            if not _runs_today(_trip):
+                continue
+            _frontier.append({"n_tr": 0, "first_dep": _dep_i,
+                              "legs": [],
                               "pending": (_trip, _idx)})
         while _frontier:
             _next = []
             for _stt in _frontier:
                 _trip, _bidx = _stt["pending"]
                 _stops = _trip_stops[_trip]
+                _first_dep = _stt["first_dep"]
                 for _k in range(_bidx + 1, len(_stops)):
                     _sfid = _stops[_k][0]
                     _arr_v = _stops[_k][1]
                     if _arr_v == "" or _arr_v is None:
                         continue
                     _arr = int(_arr_v)
+                    _elapsed = _arr - _first_dep
+                    if _best is not None and _elapsed >= _best["elapsed"]:
+                        continue
                     _legs2 = _stt["legs"] + [(_trip, _bidx, _k)]
                     if _sfid == _b:
-                        if _best is None or _arr < _best["arr"]:
-                            _best = {"arr": _arr, "legs": _legs2,
+                        if (_best is None
+                                or _elapsed < _best["elapsed"]):
+                            _best = {"arr": _arr,
+                                     "first_dep": _first_dep,
+                                     "elapsed": _elapsed,
+                                     "legs": _legs2,
                                      "n_tr": _stt["n_tr"]}
                         continue
                     if _sfid not in _hub_set:
@@ -7769,9 +8401,33 @@ def _(dag_run_states, mo):
                     if _stt["n_tr"] + 1 > _VAL_MAX_TRANSFERS:
                         continue
                     _sk = (_sfid, _stt["n_tr"] + 1)
-                    if _sk in _seen and _seen[_sk] <= _arr:
+                    # Pareto domination on BOTH elapsed AND wall-clock
+                    # arrival. Elapsed-only pruning is a correctness bug:
+                    # two trips from the same origin can reach the same
+                    # hub with IDENTICAL elapsed but DIFFERENT wall-clock
+                    # arrivals (IC 16:30 → Wien Hbf 19:03 vs IC 18:30 →
+                    # Wien Hbf 21:03, both 153 min from boarding). With
+                    # the old `seen[_sk] <= elapsed` rule, whichever was
+                    # processed second got pruned — losing all its
+                    # otherwise-valid onward transfers. The 16:30 IC's
+                    # 19:15-departing S2-W is what reaches Neubau-Kreuz-
+                    # stetten in 225 min, but the BFS never enqueued it,
+                    # producing a phantom HARD-FAIL. Track a Pareto-
+                    # optimal list of (elapsed, arr) per (sfid, n_tr) and
+                    # prune only states dominated on BOTH axes.
+                    _seen_list = _seen.setdefault(_sk, [])
+                    _is_dominated = False
+                    for _se, _sa in _seen_list:
+                        if _se <= _elapsed and _sa <= _arr:
+                            _is_dominated = True
+                            break
+                    if _is_dominated:
                         continue
-                    _seen[_sk] = _arr
+                    _seen_list[:] = [
+                        (_se, _sa) for (_se, _sa) in _seen_list
+                        if not (_elapsed <= _se and _arr <= _sa)
+                    ]
+                    _seen_list.append((_elapsed, _arr))
                     for _trip2, _idx2 in _trips_at.get(_sfid, []):
                         if _trip2 == _trip:
                             continue
@@ -7780,72 +8436,83 @@ def _(dag_run_states, mo):
                             continue
                         if int(_dep2) < _arr:
                             continue
+                        if not _runs_today(_trip2):
+                            continue
                         _next.append({"n_tr": _stt["n_tr"] + 1,
+                                      "first_dep": _first_dep,
                                       "legs": _legs2,
                                       "pending": (_trip2, _idx2)})
-            if _best:
-                break
+            # Continue past first-reach so a transfer-using journey can
+            # beat a 0-transfer slower one. Transfer-count cap +
+            # elapsed-domination pruning keep the fan-out bounded.
             _frontier = _next
         if not _best:
             return None
-        _lg0 = _best["legs"][0]
-        _dep0_v = _trip_stops[_lg0[0]][_lg0[1]][2]
-        _dep0 = int(_dep0_v) if _dep0_v not in ("", None) else 0
         return {
-            "travel_min": round((_best["arr"] - _dep0) / 60),
+            "travel_min": round(_best["elapsed"] / 60),
             "n_transfers": _best["n_tr"],
             "trip_ids": [_lg[0].split("/", 1)[1] for _lg in _best["legs"]],
         }
 
     # ── 3. MOTIS client with disk cache ────────────────────────────
-    def _cache_key(_osfid, _dsfid):
+    def _cache_key(_osfid, _dsfid, _w_lo, _w_hi, _w_time_iso):
         # `v` is the cache-schema version. Bump when any field of the
         # MOTIS request that AFFECTS THE RESPONSE changes (transitModes,
-        # searchWindow, maxMatchingDistance, …). The bump invalidates
-        # prior cache so a re-run actually re-fetches with the new
-        # parameter set instead of replaying a stale response.
+        # searchWindow, maxMatchingDistance, window bucket, …). The
+        # bump invalidates prior cache so a re-run actually re-fetches
+        # with the new parameter set instead of replaying a stale
+        # response.
         return _val_hashlib.sha1(_val_json.dumps({
-            "o": _osfid, "d": _dsfid, "t": _depart_iso,
+            "o": _osfid, "d": _dsfid,
+            "t": _w_time_iso,
+            "win": [_w_lo, _w_hi],
             "ep": _MOTIS_BASE,
             "modes": "RAIL_EXPLICIT",
-            "search_window": _VAL_SEARCH_WINDOW,
             "max_tr": _VAL_MAX_TRANSFERS,
             "max_match": 200,
-            "v": 2,
+            "v": 6,           # v=6 = MOTIS globally-fastest (any transit mode)
         }, sort_keys=True).encode()).hexdigest()
 
-    def _motis_plan(_o, _d):
-        _ck = _cache_key(_o["station_feature_id"], _d["station_feature_id"])
+    def _motis_plan(_o, _d, _w_lo, _w_hi):
+        # Window-keyed cache + MOTIS call. The window's START (in UTC)
+        # is what we send as `time=`; MOTIS' `searchWindow` covers the
+        # full window width so both planners scan the same time band
+        # for the FASTEST journey within it.
+        _w_time_iso = _iso_at_seconds(_w_lo)
+        _w_width = _w_hi - _w_lo
+        _ck = _cache_key(
+            _o["station_feature_id"], _d["station_feature_id"],
+            _w_lo, _w_hi, _w_time_iso,
+        )
         _cf = _CACHE_DIR / f"{_ck}.json"
         if _cf.exists():
             try:
                 return _val_json.loads(_cf.read_text()), "cache"
             except Exception:
                 _cf.unlink(missing_ok=True)
-        # MOTIS' `transitModes=RAIL` is a PREFERENCE alias, NOT a strict
-        # whitelist — it returns SUBWAY/TRAM itineraries alongside rail
-        # when those exist (verified: Wien Heiligenstadt → Wien Hbf with
-        # transitModes=RAIL returned 17 itineraries, 15× WALK→SUBWAY→
-        # WALK→SUBWAY and 2× WALK→SUBWAY→WALK→SUBURBAN). To match the
-        # set our route-builder uses (austria-railway tiles = OSM
-        # `railway=rail|narrow_gauge|funicular|monorail|tram|light_rail`
-        # in the route-network sense), send the explicit rail family
-        # so MOTIS' planner ranks pure-rail itineraries first.
+        # Let MOTIS pick its GLOBALLY FASTEST itinerary using all
+        # transit modes (rail + subway + tram + bus + ferry as the
+        # endpoints offer). Sending `transitModes=TRANSIT` is the
+        # MOTIS-default "any mode" — explicit so the request is
+        # self-documenting. The earlier rail-family-only filter (R10
+        # baseline commit) made MOTIS pick weird cross-region rail
+        # detours where the real fastest is a 25min U-Bahn hop
+        # (e.g. Wien Heiligenstadt → Wien Hbf via U4+U1, 25min). Our
+        # rail-only planner naturally won't pick U-Bahn — and that's
+        # the user-relevant comparison: "are we close to the realistic
+        # fastest", not "are we close to MOTIS-with-same-handicap".
         _params = [
             ("fromPlace", f"{_o['station_lat']},{_o['station_lon']}"),
             ("toPlace",   f"{_d['station_lat']},{_d['station_lon']}"),
-            ("time",      _depart_iso),
+            ("time",      _w_time_iso),
             ("arriveBy",  "false"),
             ("numItineraries", str(_VAL_NUM_ITINERARIES)),
             ("maxTransfers", str(_VAL_MAX_TRANSFERS)),
-            ("searchWindow", str(_VAL_SEARCH_WINDOW)),
+            ("searchWindow", str(_w_width)),
             ("pedestrianProfile", "FOOT"),
             ("maxMatchingDistance", "200"),
+            ("transitModes", "TRANSIT"),
         ]
-        for _m in ("REGIONAL_RAIL", "SUBURBAN", "HIGHSPEED_RAIL",
-                   "LONG_DISTANCE", "NIGHT_RAIL", "REGIONAL_FAST_RAIL",
-                   "RAIL"):
-            _params.append(("transitModes", _m))
         _url = f"{_MOTIS_BASE}/plan?" + _val_urlp.urlencode(_params)
         _req = _val_urlr.Request(_url, headers={
             "User-Agent": _UA, "Accept": "application/json"})
@@ -7873,38 +8540,49 @@ def _(dag_run_states, mo):
         return _s
 
     def _summarise_motis(_plan):
-        """Pick the fastest RAIL-only itinerary; return
-        {travel_min, n_transfers, trip_ids} or None."""
+        """Pick MOTIS' globally-fastest itinerary across ALL transit
+        modes; return {travel_min, n_transfers, trip_ids, modes} or
+        None. WALK legs (first/last-mile access) are skipped but
+        every other mode (RAIL, SUBWAY, TRAM, BUS, FERRY, …) counts
+        as a transit leg. `modes` is the set of transit modes used —
+        surfaced so we can flag "MOTIS wins via non-rail" cases that
+        our rail-only planner can't match by design."""
         if not isinstance(_plan, dict) or "_error" in _plan:
             return None
         _its = _plan.get("itineraries") or []
         _best = None
         for _it in _its:
             _legs = _it.get("legs") or []
-            _trip_ids, _mode_ok = [], True
+            _trip_ids, _modes_used, _ok = [], set(), True
             for _lg in _legs:
                 _m = _lg.get("mode") or ""
                 if _m == "WALK":
                     continue
-                if _m not in _RAIL_MODES:
-                    _mode_ok = False
+                if _m not in _TRANSIT_MODES:
+                    # Unknown mode → don't silently accept; flag and
+                    # skip this itinerary. Forces us to update the
+                    # _TRANSIT_MODES set if MOTIS ever emits a new
+                    # mode label rather than silently mis-classifying.
+                    _ok = False
                     break
+                _modes_used.add(_m)
                 _tid = ((_lg.get("trip") or {}).get("tripId")
                         or _lg.get("tripId"))
                 if _tid:
                     _trip_ids.append(_bare_trip(_tid))
-            if not _mode_ok or not _trip_ids:
+            if not _ok or not _trip_ids:
                 continue
             _dur = int(_it.get("duration") or 0)
             _trs = int(_it.get("transfers") or 0)
             if _best is None or _dur < _best[0]:
-                _best = (_dur, _trs, _trip_ids)
+                _best = (_dur, _trs, _trip_ids, _modes_used)
         if _best is None:
             return None
         return {
             "travel_min": round(_best[0] / 60),
             "n_transfers": _best[1],
             "trip_ids": _best[2],
+            "modes": sorted(_best[3]),
         }
 
     def _is_domestic(_sfid):
@@ -7924,118 +8602,167 @@ def _(dag_run_states, mo):
         _head = ",".join(_lst[:3])
         return _head + ("..." if len(_lst) > 3 else "")
 
-    # ── 4. Run gate ────────────────────────────────────────────────
+    # ── 4. Run gate (3 windows × 20 pairs = 60 calls cold) ─────────
     _rows, _evidence = [], []
     _cache_hits = _network_calls = _errors = 0
     for _samp in _samples:
         _o, _d, _stratum = _samp["o"], _samp["d"], _samp["stratum"]
-        _ours = _find_route(
-            _o["station_feature_id"], _d["station_feature_id"],
-            _min_depart_s=_depart_s_floor,
-            _max_depart_s=_depart_s_ceil)
-        _motis_raw, _src = _motis_plan(_o, _d)
-        if _src == "cache":
-            _cache_hits += 1
-        elif _src == "network":
-            _network_calls += 1
-        else:
-            _errors += 1
-        _motis = _summarise_motis(_motis_raw)
-        # MOTIS debugOutput.n_start_offsets / n_dest_offsets count how
-        # many walkable OSM offsets MOTIS resolved from the input
-        # coords to the nearest transit stops. Numbers under
-        # `_VAL_MOTIS_OFFSETS_MIN` indicate a low-coverage endpoint on
-        # MOTIS' side (rural stop, missing OSM detail) — when "we
-        # route + MOTIS does not" on a pair with such low offsets, it's
-        # most likely a MOTIS data-gap rather than a phantom in our
-        # graph; downgrade to soft-flag.
-        _mdbg = (_motis_raw or {}).get("debugOutput") or {}
-        _motis_n_start = int(_mdbg.get("n_start_offsets") or 0)
-        _motis_n_dest  = int(_mdbg.get("n_dest_offsets")  or 0)
-        _motis_low_coverage = (_motis_n_start < _VAL_MOTIS_OFFSETS_MIN
-                               or _motis_n_dest  < _VAL_MOTIS_OFFSETS_MIN)
-
-        _verdict, _reasons, _overlap = "?", [], None
         _both_domestic = (_is_domestic(_o["station_feature_id"])
                           and _is_domestic(_d["station_feature_id"]))
-        if _src == "error":
-            _verdict = "motis-error"
-            _reasons.append(_motis_raw.get("_error", "?"))
-        elif _ours is None and _motis is None:
-            _verdict = "both-fail"
-        elif _ours is None and _motis is not None:
-            # MOTIS found a route we missed. Domestic = real regression
-            # (HARD-FAIL); cross-border = feed-coverage gap (SOFT-FLAG).
-            if _both_domestic:
-                _verdict = "hard-fail"
-                _reasons.append("motis-only (domestic)")
+        for _w_idx, (_w_lo, _w_hi) in enumerate(_VAL_WINDOWS):
+            _w_label = _VAL_WINDOW_LABELS[_w_idx]
+            _ours = _find_route(
+                _o["station_feature_id"], _d["station_feature_id"],
+                _min_depart_s=_w_lo, _max_depart_s=_w_hi,
+                _weekday=_depart_weekday)
+            _motis_raw, _src = _motis_plan(_o, _d, _w_lo, _w_hi)
+            if _src == "cache":
+                _cache_hits += 1
+            elif _src == "network":
+                _network_calls += 1
             else:
-                _verdict = "soft-flag"
-                _reasons.append("motis-only (cross-border feed)")
-        elif _ours is not None and _motis is None:
-            # We routed, MOTIS didn't. Classify by where the gap is.
-            if _motis_low_coverage:
-                _verdict = "soft-flag"
-                _reasons.append(
-                    f"motis low coverage (n_start={_motis_n_start}, "
-                    f"n_dest={_motis_n_dest}) — likely MOTIS OSM gap, "
-                    "not a phantom in our graph")
-            elif _both_domestic:
-                _verdict = "hard-fail"
-                _reasons.append("phantom (domestic): we routed, motis did not")
-            else:
-                _verdict = "soft-flag"
-                _reasons.append("phantom (cross-border calendar/feed)")
-        else:
-            # Both succeed. Trip-id overlap is INFORMATIONAL (our
-            # planner is calendar-blind so specific trip_ids legitimately
-            # differ from MOTIS' calendar-aware picks even on the same
-            # feed). Travel-time + transfer-count carry the verdict.
-            _overlap = len(set(_ours["trip_ids"]) & set(_motis["trip_ids"]))
-            _tmin_d = abs(_ours["travel_min"] - _motis["travel_min"])
-            _tmin_p = _tmin_d / max(1, _motis["travel_min"])
-            _tr_d   = abs(_ours["n_transfers"] - _motis["n_transfers"])
-            _ahead  = _ours["travel_min"] - _motis["travel_min"]
-            if _ahead >= _VAL_HARDFAIL_MIN_AHEAD and _both_domestic:
-                _verdict = "hard-fail"
-                _reasons.append(f"we slower by {_ahead} min (domestic)")
-            elif _tmin_p > _VAL_SOFTFLAG_PCT or _tr_d > _VAL_SOFTFLAG_TR_DELTA:
-                _verdict = "soft-flag"
-                _reasons.append(
-                    f"delta-time={_tmin_d}m ({_tmin_p*100:.0f}%) "
-                    f"delta-transfers={_tr_d}")
-            else:
-                _verdict = "pass"
+                _errors += 1
+            _motis = _summarise_motis(_motis_raw)
+            # MOTIS debugOutput.n_start_offsets / n_dest_offsets count
+            # how many walkable OSM offsets MOTIS resolved from the
+            # input coords to the nearest transit stops. Numbers under
+            # `_VAL_MOTIS_OFFSETS_MIN` indicate a low-coverage endpoint
+            # on MOTIS' side (rural stop, missing OSM detail) — when
+            # "we route + MOTIS does not" on a pair with such low
+            # offsets, it's most likely a MOTIS data-gap rather than a
+            # phantom in our graph; downgrade to soft-flag.
+            _mdbg = (_motis_raw or {}).get("debugOutput") or {}
+            _motis_n_start = int(_mdbg.get("n_start_offsets") or 0)
+            _motis_n_dest  = int(_mdbg.get("n_dest_offsets")  or 0)
+            _motis_low_coverage = (
+                _motis_n_start < _VAL_MOTIS_OFFSETS_MIN
+                or _motis_n_dest  < _VAL_MOTIS_OFFSETS_MIN
+            )
 
-        _rows.append({
-            "stratum":     _stratum,
-            "origin_sfid": _o["station_feature_id"],
-            "origin_name": _o["station_name"],
-            "dest_sfid":   _d["station_feature_id"],
-            "dest_name":   _d["station_name"],
-            "ours_min":    _ours["travel_min"]   if _ours  else None,
-            "ours_tr":     _ours["n_transfers"]  if _ours  else None,
-            "ours_trips":  _trip_brief(_ours["trip_ids"]) if _ours else None,
-            "motis_min":   _motis["travel_min"]  if _motis else None,
-            "motis_tr":    _motis["n_transfers"] if _motis else None,
-            "motis_trips": _trip_brief(_motis["trip_ids"]) if _motis else None,
-            "overlap":     _overlap,
-            "verdict":     _verdict,
-            "reasons":     "; ".join(_reasons),
-        })
-        _evidence.append({
-            "sample": {"o": _o, "d": _d, "stratum": _stratum,
-                       "depart_iso": _depart_iso},
-            "ours": _ours,
-            "motis": _motis,
-            "motis_error": (_motis_raw.get("_error")
-                            if isinstance(_motis_raw, dict)
-                            and "_error" in _motis_raw else None),
-            "overlap": _overlap,
-            "verdict": _verdict,
-            "reasons": _reasons,
-            "src": _src,
-        })
+            _verdict, _reasons, _overlap = "?", [], None
+            if _src == "error":
+                _verdict = "motis-error"
+                _reasons.append(_motis_raw.get("_error", "?"))
+            elif _ours is None and _motis is None:
+                _verdict = "both-fail"
+            elif _ours is None and _motis is not None:
+                # MOTIS found a route we missed. Soft-flag when MOTIS
+                # used non-rail modes (BUS/SUBWAY/TRAM/FERRY) — our
+                # rail-only planner can't match by design. Hard-fail
+                # only when MOTIS used pure rail (we should have).
+                _motis_modes_mo = set(_motis.get("modes") or [])
+                _rail_only_modes_mo = {
+                    "RAIL", "HIGHSPEED_RAIL", "LONG_DISTANCE",
+                    "NIGHT_RAIL", "REGIONAL_FAST_RAIL",
+                    "REGIONAL_RAIL", "SUBURBAN",
+                }
+                _motis_non_rail_mo = _motis_modes_mo - _rail_only_modes_mo
+                if _both_domestic and not _motis_non_rail_mo:
+                    _verdict = "hard-fail"
+                    _reasons.append(
+                        "motis-only (domestic, MOTIS rail-only)")
+                elif _both_domestic and _motis_non_rail_mo:
+                    _verdict = "soft-flag"
+                    _reasons.append(
+                        f"motis-only via non-rail "
+                        f"({','.join(sorted(_motis_non_rail_mo))}); our "
+                        "rail-only planner can't match by design")
+                else:
+                    _verdict = "soft-flag"
+                    _reasons.append("motis-only (cross-border feed)")
+            elif _ours is not None and _motis is None:
+                # We routed, MOTIS didn't.
+                if _motis_low_coverage:
+                    _verdict = "soft-flag"
+                    _reasons.append(
+                        f"motis low coverage (n_start={_motis_n_start}, "
+                        f"n_dest={_motis_n_dest}) — likely MOTIS OSM "
+                        "gap, not a phantom in our graph")
+                elif _both_domestic:
+                    _verdict = "hard-fail"
+                    _reasons.append(
+                        "phantom (domestic): we routed, motis did not")
+                else:
+                    _verdict = "soft-flag"
+                    _reasons.append(
+                        "phantom (cross-border calendar/feed)")
+            else:
+                # Both succeed. Trip-id overlap informational only.
+                _overlap = len(
+                    set(_ours["trip_ids"]) & set(_motis["trip_ids"]))
+                _tmin_d = abs(_ours["travel_min"] - _motis["travel_min"])
+                _tmin_p = _tmin_d / max(1, _motis["travel_min"])
+                _tr_d   = abs(_ours["n_transfers"]
+                              - _motis["n_transfers"])
+                _ahead  = _ours["travel_min"] - _motis["travel_min"]
+                # MOTIS' best may use modes our rail-only planner
+                # cannot match (SUBWAY for cross-Vienna, BUS for last-
+                # mile, FERRY at the Bodensee). When MOTIS wins via
+                # non-rail we don't blame our planner — it's working as
+                # designed (rail only). Soft-flag with the mode set so
+                # the operator can see why.
+                _rail_only_modes = {
+                    "RAIL", "HIGHSPEED_RAIL", "LONG_DISTANCE",
+                    "NIGHT_RAIL", "REGIONAL_FAST_RAIL",
+                    "REGIONAL_RAIL", "SUBURBAN",
+                }
+                _motis_modes = set(_motis.get("modes") or [])
+                _motis_non_rail = _motis_modes - _rail_only_modes
+                if (_ahead >= _VAL_HARDFAIL_MIN_AHEAD
+                        and _both_domestic
+                        and not _motis_non_rail):
+                    _verdict = "hard-fail"
+                    _reasons.append(
+                        f"we slower by {_ahead} min "
+                        f"(domestic, MOTIS rail-only)")
+                elif (_ahead >= _VAL_HARDFAIL_MIN_AHEAD
+                      and _motis_non_rail):
+                    _verdict = "soft-flag"
+                    _reasons.append(
+                        f"MOTIS faster by {_ahead}min via non-rail "
+                        f"({','.join(sorted(_motis_non_rail))}); our "
+                        "rail-only planner can't match by design")
+                elif (_tmin_p > _VAL_SOFTFLAG_PCT
+                      or _tr_d > _VAL_SOFTFLAG_TR_DELTA):
+                    _verdict = "soft-flag"
+                    _reasons.append(
+                        f"delta-time={_tmin_d}m ({_tmin_p*100:.0f}%) "
+                        f"delta-transfers={_tr_d}")
+                else:
+                    _verdict = "pass"
+
+            _rows.append({
+                "window":      _w_label,
+                "stratum":     _stratum,
+                "origin_sfid": _o["station_feature_id"],
+                "origin_name": _o["station_name"],
+                "dest_sfid":   _d["station_feature_id"],
+                "dest_name":   _d["station_name"],
+                "ours_min":    _ours["travel_min"]   if _ours  else None,
+                "ours_tr":     _ours["n_transfers"]  if _ours  else None,
+                "ours_trips":  _trip_brief(_ours["trip_ids"]) if _ours else None,
+                "motis_min":   _motis["travel_min"]  if _motis else None,
+                "motis_tr":    _motis["n_transfers"] if _motis else None,
+                "motis_trips": _trip_brief(_motis["trip_ids"]) if _motis else None,
+                "overlap":     _overlap,
+                "verdict":     _verdict,
+                "reasons":     "; ".join(_reasons),
+            })
+            _evidence.append({
+                "window": _w_label,
+                "window_seconds": [_w_lo, _w_hi],
+                "depart_iso": _iso_at_seconds(_w_lo),
+                "sample": {"o": _o, "d": _d, "stratum": _stratum},
+                "ours": _ours,
+                "motis": _motis,
+                "motis_error": (_motis_raw.get("_error")
+                                if isinstance(_motis_raw, dict)
+                                and "_error" in _motis_raw else None),
+                "overlap": _overlap,
+                "verdict": _verdict,
+                "reasons": _reasons,
+                "src": _src,
+            })
 
     _val_df = _val_pl.DataFrame(_rows)
     _hard    = int((_val_df["verdict"] == "hard-fail").sum())
@@ -8043,14 +8770,68 @@ def _(dag_run_states, mo):
     _pass    = int((_val_df["verdict"] == "pass").sum())
     _bothf   = int((_val_df["verdict"] == "both-fail").sum())
     _moterr  = int((_val_df["verdict"] == "motis-error").sum())
+    # Per-window aggregates so the summary surfaces which time band
+    # is producing the failures. A regression that only appears at
+    # night-train hours would otherwise hide inside an overall pass
+    # count.
+    _by_win = (
+        _val_df
+        .group_by("window")
+        .agg([
+            (_val_pl.col("verdict") == "pass").sum().alias("pass"),
+            (_val_pl.col("verdict") == "soft-flag").sum().alias("soft"),
+            (_val_pl.col("verdict") == "hard-fail").sum().alias("hard"),
+            (_val_pl.col("verdict") == "both-fail").sum().alias("both"),
+            (_val_pl.col("verdict") == "motis-error").sum().alias("merr"),
+        ])
+        .sort("window")
+    )
+
+    # ── 5a. Update the HARD-FAIL / SOFT-FLAG corpus ────────────────
+    # Append any (origin_sfid, dest_sfid) pair from this run with a
+    # non-PASS verdict that isn't already in the corpus. Pairs that
+    # PASS all 3 windows in THIS run do NOT get demoted automatically
+    # — they stay in the corpus as long-term regression coverage; a
+    # passing test of a known-flaky pair is a green-light signal, not
+    # a removal trigger. Operators delete stale entries by hand-edit.
+    _existing_corpus_keys = {
+        (cp.get("origin_sfid"), cp.get("dest_sfid"))
+        for cp in _corpus_pairs
+    }
+    _now_iso = _val_dt.now(_val_tz.utc).isoformat()
+    for _ev in _evidence:
+        if _ev["verdict"] == "pass":
+            continue
+        _o_sfid = _ev["sample"]["o"]["station_feature_id"]
+        _d_sfid = _ev["sample"]["d"]["station_feature_id"]
+        _key = (_o_sfid, _d_sfid)
+        if _key in _existing_corpus_keys:
+            continue
+        _existing_corpus_keys.add(_key)
+        _corpus_pairs.append({
+            "origin_sfid": _o_sfid,
+            "origin_name": _ev["sample"]["o"]["station_name"],
+            "dest_sfid":   _d_sfid,
+            "dest_name":   _ev["sample"]["d"]["station_name"],
+            "first_seen_utc":   _now_iso,
+            "first_seen_window": _ev["window"],
+            "first_seen_verdict": _ev["verdict"],
+            "first_seen_reasons": _ev["reasons"],
+        })
+    _corpus["pairs"] = _corpus_pairs
+    _corpus["last_updated_utc"] = _now_iso
+    _CORPUS_PATH.write_text(_val_json.dumps(_corpus, indent=2,
+                                            ensure_ascii=False))
 
     # ── 5. Write evidence JSON ─────────────────────────────────────
     _now_stamp = _val_dt.now(_val_tz.utc).strftime("%Y%m%dT%H%M%SZ")
     _ev_path = _R10_DIR / f"transitous-validation-{_now_stamp}.json"
     _ev_path.write_text(_val_json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "ran_utc": _val_dt.now(_val_tz.utc).isoformat(),
-        "ran_for_depart_iso": _depart_iso,
+        "ran_for_depart_day_iso": _depart_day_iso,
+        "windows_local": _VAL_WINDOWS,
+        "window_labels": _VAL_WINDOW_LABELS,
         "motis_endpoint": _MOTIS_BASE,
         "transitous_env": _TRANSITOUS_ENV,
         "user_agent": _UA,
@@ -8064,6 +8845,7 @@ def _(dag_run_states, mo):
             "hard_fail": _hard, "both_fail": _bothf,
             "motis_error": _moterr,
         },
+        "by_window": _by_win.to_dicts(),
         "pairs": _evidence,
     }, indent=2))
 
@@ -8073,20 +8855,27 @@ def _(dag_run_states, mo):
         "SOFT-FLAG ONLY" if _hard == 0 else
         "HARD-FAIL"
     )
+    _per_win_md = "\n".join(
+        f"  - **{_r['window']}**: ✅ `{_r['pass']}` · ⚪ `{_r['both']}` "
+        f"· 🟡 `{_r['soft']}` · 🔴 `{_r['hard']}` · ⚠️ `{_r['merr']}`"
+        for _r in _by_win.to_dicts()
+    )
     _summary_md = mo.md(
         f"### Transitous (MOTIS) route-comparison gate — {_tag}\n\n"
         f"- **Endpoint** `{_MOTIS_BASE}` "
         f"(`TRANSITOUS_ENV={_TRANSITOUS_ENV}`)\n"
-        f"- **Depart-at** `{_depart_iso}` "
-        f"(next Wed 09:00 Europe/Vienna)\n"
-        f"- **Seed** `{_VAL_SEED}` · {len(_samples)} pairs "
+        f"- **Depart-day** `{_depart_day_iso}` (next Wed, Europe/Vienna); "
+        f"3 windows tile 00:00–24:00 local\n"
+        f"- **Seed** `{_VAL_SEED}` · {len(_samples)} pairs × "
+        f"{len(_VAL_WINDOWS)} windows = `{len(_rows)}` verdicts "
         f"(8 hub-hub, 6 hub-nonhub, 4 nonhub-nonhub, 2 cross-border; "
         f"padding from hubs if any stratum underran)\n"
         f"- **HTTP** `{_network_calls}` network · `{_cache_hits}` cache "
         f"· `{_errors}` errors · User-Agent `{_UA}`\n"
-        f"- **Verdicts** `{_pass}` pass · `{_bothf}` both-fail "
-        f"· `{_soft}` soft-flag · `{_hard}` hard-fail "
-        f"· `{_moterr}` motis-error\n"
+        f"- **Verdicts (overall)** ✅ `{_pass}` pass · ⚪ `{_bothf}` "
+        f"both-fail · 🟡 `{_soft}` soft-flag · 🔴 `{_hard}` hard-fail "
+        f"· ⚠️ `{_moterr}` motis-error\n"
+        f"- **Verdicts (per window)**\n{_per_win_md}\n"
         f"- **Evidence** `{_ev_path}`\n\n"
         "**Acceptance**: HARD-FAIL count must be **0** for commit at "
         "`fully tested and validated`. Each SOFT-FLAG must be "

@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "pairs": [
+    {
+      "origin_sfid": "node/62823673",
+      "origin_name": "Flughafen Wien Bahnhof",
+      "dest_sfid": "way/423692233",
+      "dest_name": "Wien Hauptbahnhof",
+      "first_seen_utc": "2026-05-15T11:50:22.338663+00:00",
+      "first_seen_window": "00-08",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": [
+        "delta-time=8m (36%) delta-transfers=0"
+      ]
+    },
+    {
+      "origin_sfid": "node/3558062739",
+      "origin_name": "Bleiburg Bahnhof",
+      "dest_sfid": "node/8091423",
+      "dest_name": "Wien Heiligenstadt",
+      "first_seen_utc": "2026-05-15T11:50:22.338663+00:00",
+      "first_seen_window": "00-08",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": [
+        "delta-time=53m (22%) delta-transfers=0"
+      ]
+    },
+    {
+      "origin_sfid": "gtfs/N:9c5f417526902494df617f64e83d48b2",
+      "origin_name": "Nürnberg Hauptbahnhof",
+      "dest_sfid": "gtfs/N:4067f94193bb7e934384436db88eb15a",
+      "dest_name": "Udine stazione",
+      "first_seen_utc": "2026-05-15T11:50:22.338663+00:00",
+      "first_seen_window": "00-08",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": [
+        "motis-only (cross-border feed)"
+      ]
+    },
+    {
+      "origin_sfid": "way/856313795",
+      "origin_name": "Villach Hauptbahnhof",
+      "dest_sfid": "node/4047460842",
+      "dest_name": "Attnang-Puchheim Bahnhof",
+      "first_seen_utc": "2026-05-15T11:50:22.338663+00:00",
+      "first_seen_window": "00-08",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": [
+        "delta-time=6m (3%) delta-transfers=2"
+      ]
+    },
+    {
+      "origin_sfid": "node/3591878656",
+      "origin_name": "Bruck/Mur Bahnhof",
+      "dest_sfid": "node/282294550",
+      "dest_name": "Puchenau West Bahnhst",
+      "first_seen_utc": "2026-05-15T11:50:22.338663+00:00",
+      "first_seen_window": "00-08",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": [
+        "motis-only via non-rail (BUS); our rail-only planner can't match by design"
+      ]
+    },
+    {
+      "origin_sfid": "node/619805688",
+      "origin_name": "Salzburg Hauptbahnhof",
+      "dest_sfid": "node/3596046479",
+      "dest_name": "Wolfsbergkogel Bahnhof",
+      "first_seen_utc": "2026-05-15T11:50:22.338663+00:00",
+      "first_seen_window": "00-08",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": [
+        "delta-time=45m (16%) delta-transfers=2"
+      ]
+    },
+    {
+      "origin_sfid": "node/1429066392",
+      "origin_name": "Obersee OÖ Bahnhst",
+      "dest_sfid": "node/3406085985",
+      "dest_name": "Hetzmannsdorf-Wullersdorf Bhf.",
+      "first_seen_utc": "2026-05-15T11:50:22.338663+00:00",
+      "first_seen_window": "08-16",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": [
+        "delta-time=57m (22%) delta-transfers=1"
+      ]
+    },
+    {
+      "origin_sfid": "cz:0:5436275:0:1",
+      "origin_name": "Šatov, železniční stanice",
+      "dest_sfid": "gtfs/N:d1c42c2225f8e1832fe5d5dd4eceecbc",
+      "dest_name": "Tarvisio Citta Boscoverde",
+      "first_seen_utc": "2026-05-15T11:50:22.338663+00:00",
+      "first_seen_window": "08-16",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": [
+        "delta-time=112m (31%) delta-transfers=0"
+      ]
+    },
+    {
+      "origin_sfid": "gtfs/N:f6ca09d548d669b1bfea831b424e528c",
+      "origin_name": "Brennero, Stazione di Brennero",
+      "dest_sfid": "gtfs/N:f5aa4bb3a0ad424a11374932415cf974",
+      "dest_name": "Winterthur Hauptbahnhof",
+      "first_seen_utc": "2026-05-15T11:50:22.338663+00:00",
+      "first_seen_window": "16-24",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": [
+        "delta-time=98m (34%) delta-transfers=0"
+      ]
+    }
+  ],
+  "last_updated_utc": "2026-05-15T11:50:22.338663+00:00"
+}

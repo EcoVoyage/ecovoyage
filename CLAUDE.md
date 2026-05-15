@@ -572,24 +572,33 @@ The notebook-change acceptance battery, in order:
    `validate_routes_against_transitous` cell (last cell of
    `gtfs-austria.py`, inserted after "Route-optimised transfer
    hubs") replays our JS `findRoute` server-side in Python over
-   the 20 seeded OD pairs (with a depart-time WINDOW filter — see
-   below — so the replay is calendar/depart-time-aware instead of
-   picking the parquet's absolute-earliest trip), calls **Transitous
-   `/api/v5/plan`** with the same `(origin, destination, depart_at,
-   maxTransfers=4)`, sending the EXPLICIT rail-mode list
-   (`REGIONAL_RAIL, SUBURBAN, HIGHSPEED_RAIL, LONG_DISTANCE,
-   NIGHT_RAIL, REGIONAL_FAST_RAIL, RAIL`) instead of the
-   `transitModes=RAIL` alias — that alias turns out to be a MOTIS
-   preference, not a strict whitelist, and admits `SUBWAY`/`TRAM`
-   itineraries alongside rail (verified: Wien Heiligenstadt → Wien
-   Hauptbahnhof with `transitModes=RAIL` returned 17 itineraries,
-   15× SUBWAY-only and 2× SUBWAY+SUBURBAN — no pure-rail at all).
-   The explicit list forces MOTIS' planner to rank rail-only
-   itineraries. `searchWindow=14400` (4h) and our depart-window
-   filter on `_find_route` is mirrored at the same width so both
-   planners see the same time horizon. `maxMatchingDistance=200`
-   widens MOTIS' OSM-snap radius from the default 25m so
-   rural-station coords resolve more reliably. **Production**
+   the 20 seeded OD pairs × **3 non-overlapping 8h depart windows
+   tiling the 24h GTFS service-day** (00–08, 08–16, 16–24, in
+   Europe/Vienna local time — the same windows the interactive
+   route-builder map exposes via its tabs). Per (pair, window):
+   `_find_route(min_depart_s=window_lo, max_depart_s=window_hi)` +
+   one **Transitous `/api/v5/plan`** call with `time` = window-start
+   UTC and `searchWindow` = the full 8h window width, so both
+   planners scan the same time band. **60 MOTIS calls per cold run**
+   (3 windows × 20 pairs); warm re-runs stay zero-network via the
+   sha1 disk cache. MOTIS' request sends `transitModes=TRANSIT` —
+   the MOTIS-default "any mode" — so MOTIS picks its
+   GLOBALLY-FASTEST itinerary using rail + subway + tram + bus +
+   ferry as the endpoints offer; the verdict classifier then
+   distinguishes "MOTIS won via non-rail (soft-flag — our planner
+   is rail-only by design)" from "MOTIS won via pure rail
+   (hard-fail if domestic)". An earlier baseline sent the explicit
+   rail-family list (`REGIONAL_RAIL, SUBURBAN, HIGHSPEED_RAIL,
+   LONG_DISTANCE, NIGHT_RAIL, REGIONAL_FAST_RAIL, RAIL`) to force
+   rail-only MOTIS picks — that produced rail-detour itineraries
+   that didn't reflect the realistic best (e.g. Wien Heiligenstadt
+   → Wien Hbf via U-Bahn is the actual fastest, 22 min, but
+   rail-only MOTIS returned 70+ min via a Salzburg detour). The
+   comparison the gate enforces is "are we close to the realistic
+   fastest", not "are we close to MOTIS-with-same-handicap".
+   `maxMatchingDistance=200` widens MOTIS' OSM-snap radius from
+   the default 25m so rural-station coords resolve more reliably.
+   **Production**
    (`https://api.transitous.org/api/v5`) by default — staging
    (`https://staging.api.transitous.org/api/v5`) is documented to
    carry "limited OSM data" and in practice returns 0 itineraries
@@ -604,15 +613,18 @@ The notebook-change acceptance battery, in order:
    `phantom` HARD-FAIL because MOTIS finds nothing — useful only to
    confirm the cell's wiring, never as the acceptance signal.
    **Three planner-model differences the gate accounts for**:
-   1. Depart-time semantics: our findRoute is **schedule-blind by
+   1. Depart-time semantics: our `findRoute` is **schedule-blind by
       default** (the interactive map says "click a station, see the
       earliest-arriving journey across every trip in the parquet"),
-      so without an explicit `_min_depart_s` filter it picks a 02:00
-      night train for a 09:00 query. The gate passes
-      `_min_depart_s=09:00s, _max_depart_s=13:00s` so the replay
-      considers only the same time window MOTIS sees via
-      `searchWindow`. (The interactive map keeps its absolute-earliest
-      semantics; only the gate's replay filters.)
+      so without an explicit `_min_depart_s` / `_max_depart_s` it
+      picks a 02:00 night train for a 09:00 query. The route-builder
+      now invokes `findRoute` three times per shift-click — once per
+      8h window — and the panel shows all three alternatives
+      side-by-side. The gate mirrors that 3-window scan
+      (`_VAL_WINDOWS = [(0, 8h), (8h, 16h), (16h, 24h)]`) against
+      MOTIS' window-aligned `time` + `searchWindow` so each pair
+      produces 3 verdicts and a regression that only manifests at,
+      e.g., night-train hours can't slip past a single-window gate.
    2. We only ingest the **Transitous Austria GTFS feed**; MOTIS
       routes via the full Transitous index (CZ, HU, DE, SI, IT, …).
       So cross-border pairs may exhibit `phantom` or `motis-only`
@@ -621,11 +633,55 @@ The notebook-change acceptance battery, in order:
       `node/*` / `relation/*`); "foreign" = a feed-prefixed
       stop_id (`hu:`, `de:`, `cz:`, …) or a synthetic name-cluster
       (`gtfs/N:<hash>`).
-   3. Calendar-day specifics: even on the same feed and within the
-      same depart window, our planner picks GTFS `trip_id`s that
-      may differ from MOTIS' calendar-aware picks (we don't filter
-      by `calendar.txt` service-day at all). Trip-id overlap is
-      therefore **informational only**, never a verdict trigger.
+   3. Calendar-day specifics: our gate replay DOES filter by the
+      simulated depart-day weekday (`runs_dow` bitmask joined from
+      `gtfs.calendar`) so the same Wed/Sat-only services MOTIS sees
+      are the ones the replay considers. Trip-id overlap between the
+      two planners remains informational only — even with the same
+      feed and same depart window, GTFS lets multiple `trip_id`s
+      label the same physical service across calendar variants and
+      different versions of the Transitous-Austria feed assign run-
+      indices differently. The verdict is shaped by travel-time +
+      transfer-count agreement, not trip-id overlap.
+
+   **Two algorithmic invariants the gate hardened** (R10 lessons
+   that gated the cutover from 6 HARD-FAILs to 0):
+
+   * **Hub-objective `savings` (vs cost-capped aggregators).** The
+     greedy in `compute_optimal_hubs` evaluates each candidate hub
+     by aggregating per-pair journey cost over a 6000-pair OD
+     sample. Cost-capped aggregators (`mean`, `p95`, `p99`, `max`,
+     `topk_mean`) PLATEAU at the BIG=24h sentinel when more than
+     `(1 - quantile)%` of the sample is unroutable — and the random
+     6000-pair sample over 6789 served stations exposes thousands
+     of rural-rural pairs that have no single-trip ride from either
+     side. So `p95(cand_cost)=BIG` for every candidate; the greedy
+     stops at MIN=8 with marginal_gain=0 from #2 onwards, and the
+     remaining picks degenerate to anchor-rank tie-breaking (the
+     "routing" greedy isn't actually optimising routing). The
+     `OPTIMAL_HUB_OBJ = "savings"` aggregator (current default)
+     replaces the plateau with `BIG·M - Σ max(0, BIG-cand_cost)`:
+     unroutable pairs contribute 0, routable pairs contribute the
+     residual savings, so every committed hub visibly moves the
+     objective. The empirically-verified effect: 17 routing-picked
+     hubs instead of 8 (the major Austrian Hbfs now picked by
+     ROUTING optimisation, not the connectivity fallback); 5 of
+     the 6 baseline HARD-FAILs eliminated.
+
+   * **Pareto domination in `findRoute` (vs elapsed-only).** Both
+     Python `_find_route` (gate cell) and JS `findRoute` (route-
+     builder cell) used `seen[(sfid, n_tr)] ≤ elapsed` to prune
+     dominated states. This is a real correctness bug: two trips
+     from the same origin can reach the same hub with IDENTICAL
+     elapsed but DIFFERENT wall-clock arrivals — e.g. IC 16:30 →
+     Wien Hbf 19:03 and IC 18:30 → Wien Hbf 21:03 both ride 153
+     min from boarding. Whichever was processed second by the BFS
+     got pruned, losing all its otherwise-valid onward transfers.
+     The 16:30 IC's 19:15-departing S2-W reaches Neubau-Kreuzstetten
+     in 225 min — but the BFS never enqueued it, producing a phantom
+     HARD-FAIL. Fix (both planners): track a Pareto-optimal LIST
+     of (elapsed, arr) per (sfid, n_tr), prune only states dominated
+     on BOTH axes. The last HARD-FAIL eliminated.
 
    **Acceptance matrix** (per pair):
    - **PASS**: both planners agree on no-route (`both-fail`), or
@@ -657,16 +713,35 @@ The notebook-change acceptance battery, in order:
      investigates (network, AUP, schema drift); never silently
      dropped.
 
-   Evidence artefacts: the 20-row diagnostic DataFrame +
-   `/workspace/.r10/transitous-validation-<utc-iso>.json` with the
-   per-pair request / response. Disk cache at
-   `/workspace/.r10/transitous-cache/<sha1>.json` keyed by
-   `(origin_sfid, dest_sfid, depart_iso, motis_endpoint,
-   mode-list-version, search_window, max_match, maxTransfers,
-   schema-version `v`)` — bump `v` whenever any field that affects
-   the MOTIS response shape changes (the cache schema otherwise
-   silently replays stale responses with the wrong request set).
-   Warm re-runs are pure-disk.
+   Evidence artefacts: the **60-row diagnostic DataFrame** (3 windows
+   × 20 pairs, one row per verdict) + the per-window aggregate table
+   in the markdown summary + `/workspace/.r10/transitous-validation-
+   <utc-iso>.json` with per-pair-per-window request / response.
+   Disk cache at `/workspace/.r10/transitous-cache/<sha1>.json` keyed
+   by `(origin_sfid, dest_sfid, window_time_iso, window_lo,
+   window_hi, motis_endpoint, mode-list-version, max_match,
+   maxTransfers, schema-version `v` = current 3)` — bump `v`
+   whenever any field that affects the MOTIS response shape changes
+   (the cache schema otherwise silently replays stale responses with
+   the wrong request set). Warm re-runs are pure-disk.
+
+   **Train-class metadata in the parquet** (used by the route-builder
+   JS to render an emoji per leg, NOT by the gate's verdict logic —
+   purely visual): `compute_route_network` joins `gtfs.trips` →
+   `gtfs.routes` and emits two new columns on every `theme='trip'`
+   row: `route_short_name` (the OBB feed's line code — RJ, RJX, IC,
+   EC, EN, NJ, REX, R, S1, S40, …; COALESCE-chain falls back to
+   `route_long_name` and finally `route_id` so the field is never
+   null) and `avg_kmh` (great-circle distance over the trip's
+   stop sequence ÷ first-to-last travel time, baked at parquet-build
+   time). The JS `EMOJI_BY_CLASS` table maps RJ/RJX/ICE/TGV → 🚄,
+   EC/IC/EN/NJ/D → 🚆, EX/REX → 🚆, R/RB → 🚂, S<n>/SB → 🚈;
+   `emojiOf(cls, kmh)` applies a speed override that promotes any
+   trip with `avg_kmh > 150` to 🚄 regardless of class. The on-map
+   `route-stops-src` source paints one of those emojis (or 🔁 at
+   transfer points) at every stop touched by the currently-selected
+   route alternative — three window-tab buttons in the panel switch
+   which alternative the map draws (default: ☀️ 08–16 daytime).
    AUP compliance: User-Agent carries
    `ecovoyage-r10-gate/<calver> (<git-user.email>)`; 20-pair cap
    + disk cache keep the load polite; bump `_VAL_SEED` only on
@@ -1005,7 +1080,7 @@ the open-source planner.
 | | |
 |---|---|
 | Engine | MOTIS 2 ([OpenAPI](https://redocly.github.io/redoc/?url=https://raw.githubusercontent.com/motis-project/motis/refs/tags/v2.8.3/openapi.yaml)) |
-| Journey endpoint | `GET /api/v5/plan` — `fromPlace=<lat,lon>&toPlace=<lat,lon>&time=<ISO-UTC>&numItineraries=3&maxTransfers=4&searchWindow=14400&arriveBy=false&maxMatchingDistance=200` + repeated `transitModes=REGIONAL_RAIL&transitModes=SUBURBAN&transitModes=HIGHSPEED_RAIL&transitModes=LONG_DISTANCE&transitModes=NIGHT_RAIL&transitModes=REGIONAL_FAST_RAIL&transitModes=RAIL` (the explicit rail family — `transitModes=RAIL` alone is a preference alias and admits SUBWAY/TRAM itineraries) |
+| Journey endpoint | `GET /api/v5/plan` — `fromPlace=<lat,lon>&toPlace=<lat,lon>&time=<window-start UTC>&numItineraries=3&maxTransfers=4&searchWindow=<window-width = 28800 for 8h>&arriveBy=false&maxMatchingDistance=200` + repeated `transitModes=REGIONAL_RAIL&transitModes=SUBURBAN&transitModes=HIGHSPEED_RAIL&transitModes=LONG_DISTANCE&transitModes=NIGHT_RAIL&transitModes=REGIONAL_FAST_RAIL&transitModes=RAIL` (the explicit rail family — `transitModes=RAIL` alone is a preference alias and admits SUBWAY/TRAM itineraries). One call per (pair, window); 60 calls per cold gate run. |
 | Prod base | `https://api.transitous.org/api/v5` |
 | Staging base | `https://staging.api.transitous.org/api/v5` (full Austria GTFS; limited OSM coverage) |
 | Auth | **User-Agent with contact info MANDATORY** per their AUP. The gate sends `ecovoyage-r10-gate/<calver> (<git config user.email>)`. |
