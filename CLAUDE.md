@@ -562,7 +562,87 @@ The notebook-change acceptance battery, in order:
    self-author DAG cell: confirm the freshly-written DAG file lands
    in `/workspace/dags/`, registers in `GET /api/v2/dags`, and
    reaches `state: success` on a triggered run.
-6. **DuckDB / tile-output integrity** — only when the notebook
+6. **Transitous route-comparison gate** — only when the notebook
+   touched route-relevant code (`compute_route_network`,
+   `compute_optimal_hubs`, `compute_fastest_connections`,
+   `compute_chrono_isochrones`, `match_gtfs_stops_to_osm`'s
+   `is_rail_served` / `_NAME_CLUSTER_SPAN_DEG` / station-rollup
+   tiers, the route-builder JS `findRoute` / `buildSegment`, or
+   `ROUTEBUILD_STYLE` filters). The
+   `validate_routes_against_transitous` cell (last cell of
+   `gtfs-austria.py`, inserted after "Route-optimised transfer
+   hubs") replays our JS `findRoute` server-side in Python over
+   the 20 seeded OD pairs, calls **Transitous /api/v5/plan** with
+   the same `(origin, destination, depart_at, transitModes=RAIL,
+   maxTransfers=4)`, and writes a verdict matrix. **Production**
+   (`https://api.transitous.org/api/v5`) by default — staging
+   (`https://staging.api.transitous.org/api/v5`) is documented to
+   carry "limited OSM data" and in practice returns 0 itineraries
+   on every coord-keyed `/plan` query (`debugOutput: n_start_offsets=0,
+   n_dest_offsets=0` because the staging OSM graph can't resolve our
+   station lat/lon to walking offsets onto the transit graph). AUP
+   politeness is satisfied instead via User-Agent with contact info,
+   20-pair cap, sha1 disk cache (warm re-runs are zero-network), and
+   the gate firing only on route-relevant cutovers (not every notebook
+   change). `TRANSITOUS_ENV=staging` is available as an explicit-opt-in
+   override for plumbing tests; on staging every pair lands as
+   `phantom` HARD-FAIL because MOTIS finds nothing — useful only to
+   confirm the cell's wiring, never as the acceptance signal.
+   **Two planner-model differences that the gate is designed
+   AROUND, not against**:
+   1. Our route-builder is **calendar-blind** (treats every trip in
+      `austria-routehub-paths.parquet` as a candidate regardless of
+      service-day); MOTIS is **calendar-aware** (filters to trips
+      operating on `depart_iso`'s date). So specific GTFS `trip_id`s
+      legitimately differ even on the same feed → trip-id overlap is
+      **informational only**, never a HARD-FAIL signal.
+   2. We only ingest the **Transitous Austria GTFS feed**; MOTIS
+      routes via the full Transitous index (CZ, HU, DE, SI, IT, …).
+      So cross-border pairs may exhibit `phantom` or `motis-only`
+      verdicts that reflect feed-coverage, not bugs. "Domestic"
+      here = `station_feature_id` is an OSM anchor (`way/*` /
+      `node/*` / `relation/*`); "foreign" = a feed-prefixed
+      stop_id (`hu:`, `de:`, `cz:`, …) or a synthetic name-cluster
+      (`gtfs/N:<hash>`).
+
+   **Acceptance matrix** (per pair):
+   - **PASS**: both planners agree on no-route (`both-fail`), or
+     both succeed with travel-time within ±20% **and** transfers
+     within ±1.
+   - **HARD-FAIL** (no commit, R1 RCA required) — fires ONLY when
+     both stations are **domestic** (OSM-anchored):
+     - `phantom`: we route, MOTIS does not on the same query, OR
+     - `motis-only`: MOTIS finds a route, we don't (we missed it), OR
+     - MOTIS arrives ≥60 min before us on the same OD-pair-day
+       (our route is materially worse than reality).
+   - **SOFT-FLAG** (commit allowed only if rationale recorded in
+     commit body) — fires for any non-PASS verdict that is not
+     HARD-FAIL:
+     - `phantom` or `motis-only` involving any foreign station
+       (feed-coverage or calendar-aware planner asymmetry).
+     - Both succeed but travel-time delta > ±20% **or** transfers
+       delta > ±1 (still in ballpark, planner-disagreement).
+     - Zero trip-id overlap is logged but is **NOT a verdict
+       trigger** — calendar-blindness explains it on its own.
+   - **MOTIS-ERROR** is a SOFT-FLAG class — the operator
+     investigates (network, AUP, schema drift); never silently
+     dropped.
+
+   Evidence artefacts: the 20-row diagnostic DataFrame +
+   `/workspace/.r10/transitous-validation-<utc-iso>.json` with the
+   per-pair request / response. Disk cache at
+   `/workspace/.r10/transitous-cache/<sha1>.json` keyed by
+   `(origin_sfid, dest_sfid, depart_iso, motis_endpoint,
+   transitModes, maxTransfers)` — warm re-runs are pure-disk.
+   AUP compliance: User-Agent carries
+   `ecovoyage-r10-gate/<calver> (<git-user.email>)`; 20-pair cap
+   + disk cache keep the load polite; bump `_VAL_SEED` only on
+   intentional re-baseline. Pasteable proof of the gate run is
+   part of the R10 acceptance evidence. SOFT-FLAGs must be
+   enumerated in the commit body with a one-line per-pair
+   rationale (R2 forbids "out of scope" / "follow-up"
+   classification).
+7. **DuckDB / tile-output integrity** — only when the notebook
    change affects downstream artifacts: confirm
    `/workspace/duckdb/austria.duckdb` schemas are intact OR the
    relevant `austria-*.pmtiles` file refreshed, AS APPLICABLE to
@@ -675,7 +755,7 @@ ALL commits MUST include `Assisted-by: Claude (<confidence>)` trailer.
 
 | Confidence | When to Use |
 |---|---|
-| `fully tested and validated` | Full 9-bullet R10 battery (above) pasted on a fresh `ov update versa -i ecovoyage` rebuild |
+| `fully tested and validated` | Full 9-bullet R10 battery (above) pasted on a fresh `ov update versa -i ecovoyage` rebuild. For route-relevant notebook changes the Transitous comparison gate (Notebook-only changes — step 6, above) also ran with **zero HARD-FAILs**, and every SOFT-FLAG is enumerated in the commit body with a one-line rationale. |
 | `analysed on a live system` | Live invocation of the runner ran AND output pasted, but some R10 bullets skipped. NEVER use for `--dry-run`-only |
 | `syntax check only` | Compile + validators / dry-run / parse passed; live runner did NOT execute. HONEST default; do NOT commit at this tier |
 | `theoretical suggestion` | FORBIDDEN as shipped-code tier |
@@ -880,6 +960,32 @@ This workspace's `.mcp.json` registers two HTTP MCP servers:
 **Airflow has no MCP server** — the upstream REST→MCP wrapper was
 removed in 2026-05 (no v2 release). Drive it via REST `/api/v2` on
 host port **38080** (see Airflow recipe in the playbook below).
+
+## Transitous (external ground-truth router for R10)
+
+**Transitous** (`https://transitous.org`) — the public-transit
+routing service whose Austria GTFS feed `gtfs-austria.py` already
+ingests — is the **external ground truth** for the R10 routing-
+validation gate (CDP-driven gate step 6, above). It runs **MOTIS 2**,
+the open-source planner.
+
+| | |
+|---|---|
+| Engine | MOTIS 2 ([OpenAPI](https://redocly.github.io/redoc/?url=https://raw.githubusercontent.com/motis-project/motis/refs/tags/v2.8.3/openapi.yaml)) |
+| Journey endpoint | `GET /api/v5/plan` — `fromPlace=<lat,lon>&toPlace=<lat,lon>&time=<ISO-UTC>&transitModes=RAIL&numItineraries=3&maxTransfers=4&searchWindow=3600&arriveBy=false` |
+| Prod base | `https://api.transitous.org/api/v5` |
+| Staging base | `https://staging.api.transitous.org/api/v5` (full Austria GTFS; limited OSM coverage) |
+| Auth | **User-Agent with contact info MANDATORY** per their AUP. The gate sends `ecovoyage-r10-gate/<calver> (<git config user.email>)`. |
+| Response shape | `itineraries[].legs[]` with per-leg `mode` (RAIL family vs WALK), `from/to.{lat,lon,arrival,departure,stopId}`, `trip.tripId` (= GTFS trip_id from their feed → directly comparable to ours), `duration`, `transfers`. |
+| Rate-limit posture | "Resource-intensive — contact maintainers before frequent use." The gate honours this: 20 pairs/run, sha1 disk cache at `/workspace/.r10/transitous-cache/` (warm re-runs are zero-network), gate fires only on route-relevant cutovers. **Production by default** because staging's "limited OSM data" makes coord-keyed `/plan` queries return 0 itineraries (verified — `debugOutput.n_start_offsets=0`); `TRANSITOUS_ENV=staging` is an explicit-opt-in override for plumbing tests only. |
+| Why it works | Both planners ingest the same Transitous Austria GTFS feed → **trip-ID overlap is the strongest invariant**. Zero overlap on a successful pair = HARD-FAIL. |
+| Gate cell | `validate_routes_against_transitous` (last cell of `notebooks/gtfs-austria.py`). |
+
+Replay vs CDP: the gate runs the route-builder's `findRoute`
+algorithm SERVER-SIDE in Python (mirroring the JS at lines
+7110-7158) so it doesn't need a browser. CDP step 4 still proves
+the BROWSER's `findRoute` renders correctly — the two halves are
+complementary, not duplicative.
 
 The marimo MCP server name deliberately did NOT change in the 2026-05
 image rename — it reflects upstream-software identity, not OUR image

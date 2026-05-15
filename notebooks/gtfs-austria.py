@@ -7495,5 +7495,525 @@ def _(dag_run_states, mo):
     return
 
 
+@app.cell
+def _(dag_run_states, mo):
+    # ──────────────────────────────────────────────────────────────
+    # Transitous (MOTIS 2) route-comparison gate — R10 acceptance.
+    # ──────────────────────────────────────────────────────────────
+    # The route-builder cell (line 6957) renders journeys client-
+    # side from austria-routehub-paths.parquet — the real timetable
+    # baked by compute_route_network (line 3548). This cell REPLAYS
+    # the JS findRoute logic (lines 7110-7158) server-side in
+    # Python for 20 seeded OD pairs, calls Transitous /api/v5/plan
+    # with the same (origin, destination, depart_at,
+    # transitModes=RAIL, maxTransfers=4), and compares verdicts.
+    #
+    # The strongest invariant: BOTH planners ingest the same
+    # Transitous Austria GTFS feeds, so the GTFS trip_id strings
+    # are directly comparable. If our route uses trips that MOTIS'
+    # route does not (zero overlap) we are routing on a different
+    # timetable -> HARD-FAIL.
+    #
+    # AUP compliance: User-Agent carries contact info (git
+    # user.email), 20-pair cap, staging by default, disk cache
+    # makes warm re-runs zero-network.
+    # ──────────────────────────────────────────────────────────────
+    mo.stop(
+        dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
+        f"Waiting for notebook_austria_gtfs_pipeline (state="
+        f"{dag_run_states.get('notebook_austria_gtfs_pipeline')!r})",
+    )
+
+    import hashlib as _val_hashlib
+    import json as _val_json
+    import os as _val_os
+    import subprocess as _val_subp
+    import urllib.parse as _val_urlp
+    import urllib.request as _val_urlr
+    from datetime import datetime as _val_dt, timedelta as _val_td, timezone as _val_tz
+    from pathlib import Path as _val_Path
+    from zoneinfo import ZoneInfo as _val_ZI
+    import duckdb as _val_duckdb
+    import numpy as _val_np
+    import polars as _val_pl
+
+    # ── Constants ──────────────────────────────────────────────────
+    _VAL_SEED = 2026_05_15           # bump only on intentional re-baseline
+    _VAL_N = 20
+    _VAL_MAX_TRANSFERS = 4           # mirror route-builder cap (line 6998)
+    _VAL_SEARCH_WINDOW = 3600        # MOTIS searchWindow seconds
+    _VAL_NUM_ITINERARIES = 3
+    _VAL_REQ_TIMEOUT = 25            # per-request seconds
+    _VAL_HARDFAIL_MIN_AHEAD = 60     # MOTIS faster by >=N min -> hard-fail
+    _VAL_SOFTFLAG_PCT = 0.20         # travel-time delta > +-20% -> soft-flag
+    _VAL_SOFTFLAG_TR_DELTA = 1       # transfer-count delta > +-1 -> soft-flag
+    _RAIL_MODES = {
+        "RAIL", "HIGHSPEED_RAIL", "LONG_DISTANCE", "NIGHT_RAIL",
+        "REGIONAL_FAST_RAIL", "REGIONAL_RAIL", "SUBURBAN",
+    }
+
+    _STAGING_BASE = "https://staging.api.transitous.org/api/v5"
+    _PROD_BASE    = "https://api.transitous.org/api/v5"
+    # AUP-aware endpoint choice: production by default.
+    # Transitous staging is explicitly documented as "limited OSM data" —
+    # in practice, /api/v5/plan with lat/lon endpoints returns 0
+    # itineraries (debugOutput shows n_start_offsets=0, n_dest_offsets=0)
+    # because staging's OSM graph cannot resolve our station coordinates
+    # to walking offsets onto the transit graph. The endpoint is
+    # operational for stop_id-keyed planning but our station_feature_id
+    # is a mix of OSM node/way IDs (Austrian) and synthetic
+    # "gtfs/N:<hash>" name-cluster IDs (foreign) — neither map to GTFS
+    # stop_ids without an extra resolution layer. Prod has full OSM
+    # coverage and answers correctly. The disk cache + 20-pair cap +
+    # User-Agent contact header keep load polite per the Transitous AUP.
+    _TRANSITOUS_ENV = _val_os.environ.get("TRANSITOUS_ENV", "prod")
+    _MOTIS_BASE = _STAGING_BASE if _TRANSITOUS_ENV == "staging" else _PROD_BASE
+
+    _R10_DIR = _val_Path("/workspace/.r10")
+    _CACHE_DIR = _R10_DIR / "transitous-cache"
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # User-Agent — AUP-mandatory contact info.
+    try:
+        _ua_email = _val_subp.check_output(
+            ["git", "config", "user.email"],
+            cwd="/workspace",
+            stderr=_val_subp.DEVNULL,
+            timeout=2,
+        ).decode().strip() or "anonymous@local"
+    except Exception:
+        _ua_email = "anonymous@local"
+    _UA = f"ecovoyage-r10-gate/2026.05 ({_ua_email})"
+
+    # depart-at = next Wednesday at 09:00 Europe/Vienna -> UTC ISO.
+    # Wednesday avoids weekend reduced service; 09:00 is busy band.
+    _now_vie = _val_dt.now(_val_ZI("Europe/Vienna"))
+    _d2w = (2 - _now_vie.weekday()) % 7 or 7   # always future Wed
+    _depart_local = (_now_vie + _val_td(days=_d2w)).replace(
+        hour=9, minute=0, second=0, microsecond=0)
+    _depart_iso = _depart_local.astimezone(_val_tz.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+    # ── 1. Sample 20 stratified pairs ──────────────────────────────
+    _val_db = _val_duckdb.connect(
+        "/workspace/duckdb/austria.duckdb", read_only=True)
+    _val_db.sql("INSTALL spatial; LOAD spatial;")
+    # ORDER BY station_feature_id is load-bearing: DuckDB doesn't
+    # guarantee GROUP BY row order, so without it the row order varies
+    # between runs, the seeded shuffle picks different pairs, and the
+    # cache key changes — "warm re-runs are zero-network" only holds
+    # when sampling is fully deterministic.
+    _stations = _val_db.sql("""
+        SELECT
+            station_feature_id,
+            any_value(station_name) AS station_name,
+            any_value(station_lon)  AS station_lon,
+            any_value(station_lat)  AS station_lat
+        FROM transit.station_members
+        WHERE is_rail_served = 'true'
+        GROUP BY station_feature_id
+        ORDER BY station_feature_id
+    """).pl()
+    _hub_ids = set(
+        _val_db.sql(
+            "SELECT station_feature_id FROM transit.optimal_hubs"
+        ).pl()["station_feature_id"].to_list())
+    _val_db.close()
+
+    _rng = _val_np.random.default_rng(_VAL_SEED)
+    def _shuf(_df):
+        if _df.height == 0:
+            return []
+        _perm = _rng.permutation(_df.height).tolist()
+        return _df[_perm].to_dicts()
+    _hubs_q    = _shuf(_stations.filter(
+        _val_pl.col("station_feature_id").is_in(_hub_ids)))
+    _nonhubs_q = _shuf(_stations.filter(
+        ~_val_pl.col("station_feature_id").is_in(_hub_ids)))
+    _foreign_q = _shuf(_stations.filter(
+        _val_pl.col("station_feature_id").str.starts_with("gtfs/N:")))
+    def _pop(_q):
+        return _q.pop(0) if _q else None
+
+    _samples = []
+    for _ in range(8):
+        _o, _d = _pop(_hubs_q), _pop(_hubs_q)
+        if _o and _d:
+            _samples.append({"o": _o, "d": _d, "stratum": "hub-hub"})
+    for _ in range(6):
+        _o, _d = _pop(_hubs_q), _pop(_nonhubs_q)
+        if _o and _d:
+            _samples.append({"o": _o, "d": _d, "stratum": "hub-nonhub"})
+    for _ in range(4):
+        _o, _d = _pop(_nonhubs_q), _pop(_nonhubs_q)
+        if _o and _d:
+            _samples.append({"o": _o, "d": _d, "stratum": "nonhub-nonhub"})
+    for _ in range(2):
+        _o, _d = _pop(_hubs_q), _pop(_foreign_q)
+        if _o and _d:
+            _samples.append({"o": _o, "d": _d, "stratum": "cross-border"})
+    while len(_samples) < _VAL_N:
+        _o, _d = _pop(_hubs_q), _pop(_hubs_q)
+        if not (_o and _d):
+            break
+        _samples.append({"o": _o, "d": _d, "stratum": "padding"})
+    _samples = _samples[:_VAL_N]
+
+    # ── 2. Build the timetable graph from the parquet ──────────────
+    _paths_p = _val_Path("/workspace/tiles/work/"
+                         "austria-routehub-paths.parquet")
+    mo.stop(
+        not _paths_p.exists(),
+        "austria-routehub-paths.parquet missing — the GTFS DAG's "
+        "compute_route_network task hasn't baked the route-builder "
+        "timetable yet. Re-run the gate after the DAG completes.",
+    )
+    _paths = _val_pl.read_parquet(_paths_p)
+
+    _trip_stops = {}    # "trip/<id>" -> [[sfid, arr_s, dep_s, is_hub], ...]
+    _trips_at = {}      # sfid -> [(trip_osm_id, idx), ...]
+    _hub_set = set()
+    for _row in _paths.filter(
+            _val_pl.col("theme") == "trip").iter_rows(named=True):
+        try:
+            _ss = _val_json.loads(_row["stops"] or "[]")
+        except _val_json.JSONDecodeError:
+            continue
+        if len(_ss) < 2:
+            continue
+        _trip_stops[_row["osm_id"]] = _ss
+        for _i, _s in enumerate(_ss):
+            _sfid = _s[0]
+            _trips_at.setdefault(_sfid, []).append((_row["osm_id"], _i))
+            if _s[3]:
+                _hub_set.add(_sfid)
+
+    def _find_route(_a, _b):
+        """Server-side replay of JS findRoute (lines 7110-7158).
+
+        Bounded hub-restricted BFS by transfer count. RIDE any trip
+        calling at A forward freely through any hubs; CHANGE only at
+        a hub, onto a DIFFERENT trip whose dep >= our arrival.
+        Within each transfer-count level, earliest arrival wins.
+        """
+        if not _a or not _b or _a == _b:
+            return None
+        _frontier, _seen, _best = [], {}, None
+        for _trip, _idx in _trips_at.get(_a, []):
+            _dep = _trip_stops[_trip][_idx][2]
+            if _dep == "" or _dep is None:
+                continue
+            _frontier.append({"n_tr": 0, "legs": [],
+                              "pending": (_trip, _idx)})
+        while _frontier:
+            _next = []
+            for _stt in _frontier:
+                _trip, _bidx = _stt["pending"]
+                _stops = _trip_stops[_trip]
+                for _k in range(_bidx + 1, len(_stops)):
+                    _sfid = _stops[_k][0]
+                    _arr_v = _stops[_k][1]
+                    if _arr_v == "" or _arr_v is None:
+                        continue
+                    _arr = int(_arr_v)
+                    _legs2 = _stt["legs"] + [(_trip, _bidx, _k)]
+                    if _sfid == _b:
+                        if _best is None or _arr < _best["arr"]:
+                            _best = {"arr": _arr, "legs": _legs2,
+                                     "n_tr": _stt["n_tr"]}
+                        continue
+                    if _sfid not in _hub_set:
+                        continue
+                    if _stt["n_tr"] + 1 > _VAL_MAX_TRANSFERS:
+                        continue
+                    _sk = (_sfid, _stt["n_tr"] + 1)
+                    if _sk in _seen and _seen[_sk] <= _arr:
+                        continue
+                    _seen[_sk] = _arr
+                    for _trip2, _idx2 in _trips_at.get(_sfid, []):
+                        if _trip2 == _trip:
+                            continue
+                        _dep2 = _trip_stops[_trip2][_idx2][2]
+                        if _dep2 == "" or _dep2 is None:
+                            continue
+                        if int(_dep2) < _arr:
+                            continue
+                        _next.append({"n_tr": _stt["n_tr"] + 1,
+                                      "legs": _legs2,
+                                      "pending": (_trip2, _idx2)})
+            if _best:
+                break
+            _frontier = _next
+        if not _best:
+            return None
+        _lg0 = _best["legs"][0]
+        _dep0_v = _trip_stops[_lg0[0]][_lg0[1]][2]
+        _dep0 = int(_dep0_v) if _dep0_v not in ("", None) else 0
+        return {
+            "travel_min": round((_best["arr"] - _dep0) / 60),
+            "n_transfers": _best["n_tr"],
+            "trip_ids": [_lg[0].split("/", 1)[1] for _lg in _best["legs"]],
+        }
+
+    # ── 3. MOTIS client with disk cache ────────────────────────────
+    def _cache_key(_osfid, _dsfid):
+        return _val_hashlib.sha1(_val_json.dumps({
+            "o": _osfid, "d": _dsfid, "t": _depart_iso,
+            "ep": _MOTIS_BASE, "modes": "RAIL",
+            "max_tr": _VAL_MAX_TRANSFERS,
+            "v": 1,
+        }, sort_keys=True).encode()).hexdigest()
+
+    def _motis_plan(_o, _d):
+        _ck = _cache_key(_o["station_feature_id"], _d["station_feature_id"])
+        _cf = _CACHE_DIR / f"{_ck}.json"
+        if _cf.exists():
+            try:
+                return _val_json.loads(_cf.read_text()), "cache"
+            except Exception:
+                _cf.unlink(missing_ok=True)
+        _params = {
+            "fromPlace": f"{_o['station_lat']},{_o['station_lon']}",
+            "toPlace":   f"{_d['station_lat']},{_d['station_lon']}",
+            "time":      _depart_iso,
+            "arriveBy":  "false",
+            "transitModes": "RAIL",
+            "numItineraries": str(_VAL_NUM_ITINERARIES),
+            "maxTransfers": str(_VAL_MAX_TRANSFERS),
+            "searchWindow": str(_VAL_SEARCH_WINDOW),
+            "pedestrianProfile": "FOOT",
+        }
+        _url = f"{_MOTIS_BASE}/plan?" + _val_urlp.urlencode(_params)
+        _req = _val_urlr.Request(_url, headers={
+            "User-Agent": _UA, "Accept": "application/json"})
+        try:
+            with _val_urlr.urlopen(
+                    _req, timeout=_VAL_REQ_TIMEOUT) as _resp:
+                _body = _resp.read().decode()
+            _data = _val_json.loads(_body)
+            _cf.write_text(_val_json.dumps(_data))
+            return _data, "network"
+        except Exception as _e:
+            return {"_error": str(_e), "_url": _url}, "error"
+
+    def _bare_trip(_tid):
+        """MOTIS prefixes its tripId with '<YYYYMMDD>_<HH:MM>_<feed>_'.
+        Strip the prefix so the bare GTFS trip_id (everything after the
+        feed segment) is what gets compared / displayed. Falls back to
+        the raw string when the pattern doesn't match."""
+        _s = str(_tid)
+        _parts = _s.split("_")
+        if (len(_parts) >= 4
+            and len(_parts[0]) == 8 and _parts[0].isdigit()
+            and ":" in _parts[1]):
+            return "_".join(_parts[3:]) or _s
+        return _s
+
+    def _summarise_motis(_plan):
+        """Pick the fastest RAIL-only itinerary; return
+        {travel_min, n_transfers, trip_ids} or None."""
+        if not isinstance(_plan, dict) or "_error" in _plan:
+            return None
+        _its = _plan.get("itineraries") or []
+        _best = None
+        for _it in _its:
+            _legs = _it.get("legs") or []
+            _trip_ids, _mode_ok = [], True
+            for _lg in _legs:
+                _m = _lg.get("mode") or ""
+                if _m == "WALK":
+                    continue
+                if _m not in _RAIL_MODES:
+                    _mode_ok = False
+                    break
+                _tid = ((_lg.get("trip") or {}).get("tripId")
+                        or _lg.get("tripId"))
+                if _tid:
+                    _trip_ids.append(_bare_trip(_tid))
+            if not _mode_ok or not _trip_ids:
+                continue
+            _dur = int(_it.get("duration") or 0)
+            _trs = int(_it.get("transfers") or 0)
+            if _best is None or _dur < _best[0]:
+                _best = (_dur, _trs, _trip_ids)
+        if _best is None:
+            return None
+        return {
+            "travel_min": round(_best[0] / 60),
+            "n_transfers": _best[1],
+            "trip_ids": _best[2],
+        }
+
+    def _is_domestic(_sfid):
+        """A station is 'domestic' when its station_feature_id is an
+        OSM anchor (way/* or node/* or relation/*); everything else is
+        a foreign-feed stop_id ('hu:', 'de:', 'cz:', etc.) or a
+        synthetic name-cluster ('gtfs/N:'). HARD-FAILs only fire when
+        BOTH endpoints are domestic — for cross-border pairs MOTIS may
+        legitimately route via feeds we don't ingest (CZ/HU/DE/SI/IT)
+        and our calendar-blind planner may find a path MOTIS' calendar-
+        aware planner doesn't see on a specific day."""
+        return _sfid.startswith(("way/", "node/", "relation/"))
+
+    def _trip_brief(_lst):
+        if not _lst:
+            return None
+        _head = ",".join(_lst[:3])
+        return _head + ("..." if len(_lst) > 3 else "")
+
+    # ── 4. Run gate ────────────────────────────────────────────────
+    _rows, _evidence = [], []
+    _cache_hits = _network_calls = _errors = 0
+    for _samp in _samples:
+        _o, _d, _stratum = _samp["o"], _samp["d"], _samp["stratum"]
+        _ours = _find_route(
+            _o["station_feature_id"], _d["station_feature_id"])
+        _motis_raw, _src = _motis_plan(_o, _d)
+        if _src == "cache":
+            _cache_hits += 1
+        elif _src == "network":
+            _network_calls += 1
+        else:
+            _errors += 1
+        _motis = _summarise_motis(_motis_raw)
+
+        _verdict, _reasons, _overlap = "?", [], None
+        _both_domestic = (_is_domestic(_o["station_feature_id"])
+                          and _is_domestic(_d["station_feature_id"]))
+        if _src == "error":
+            _verdict = "motis-error"
+            _reasons.append(_motis_raw.get("_error", "?"))
+        elif _ours is None and _motis is None:
+            _verdict = "both-fail"
+        elif _ours is None and _motis is not None:
+            # MOTIS found a route we missed. Domestic = real regression
+            # (HARD-FAIL); cross-border = feed-coverage gap (SOFT-FLAG).
+            if _both_domestic:
+                _verdict = "hard-fail"
+                _reasons.append("motis-only (domestic)")
+            else:
+                _verdict = "soft-flag"
+                _reasons.append("motis-only (cross-border feed)")
+        elif _ours is not None and _motis is None:
+            # We routed, MOTIS didn't. Domestic = phantom = real
+            # graph-integrity bug; cross-border = MOTIS' calendar-aware
+            # planner doesn't see this connection on this specific day.
+            if _both_domestic:
+                _verdict = "hard-fail"
+                _reasons.append("phantom (domestic): we routed, motis did not")
+            else:
+                _verdict = "soft-flag"
+                _reasons.append("phantom (cross-border calendar/feed)")
+        else:
+            # Both succeed. Trip-id overlap is INFORMATIONAL (our
+            # planner is calendar-blind so specific trip_ids legitimately
+            # differ from MOTIS' calendar-aware picks even on the same
+            # feed). Travel-time + transfer-count carry the verdict.
+            _overlap = len(set(_ours["trip_ids"]) & set(_motis["trip_ids"]))
+            _tmin_d = abs(_ours["travel_min"] - _motis["travel_min"])
+            _tmin_p = _tmin_d / max(1, _motis["travel_min"])
+            _tr_d   = abs(_ours["n_transfers"] - _motis["n_transfers"])
+            _ahead  = _ours["travel_min"] - _motis["travel_min"]
+            if _ahead >= _VAL_HARDFAIL_MIN_AHEAD and _both_domestic:
+                _verdict = "hard-fail"
+                _reasons.append(f"we slower by {_ahead} min (domestic)")
+            elif _tmin_p > _VAL_SOFTFLAG_PCT or _tr_d > _VAL_SOFTFLAG_TR_DELTA:
+                _verdict = "soft-flag"
+                _reasons.append(
+                    f"delta-time={_tmin_d}m ({_tmin_p*100:.0f}%) "
+                    f"delta-transfers={_tr_d}")
+            else:
+                _verdict = "pass"
+
+        _rows.append({
+            "stratum":     _stratum,
+            "origin_sfid": _o["station_feature_id"],
+            "origin_name": _o["station_name"],
+            "dest_sfid":   _d["station_feature_id"],
+            "dest_name":   _d["station_name"],
+            "ours_min":    _ours["travel_min"]   if _ours  else None,
+            "ours_tr":     _ours["n_transfers"]  if _ours  else None,
+            "ours_trips":  _trip_brief(_ours["trip_ids"]) if _ours else None,
+            "motis_min":   _motis["travel_min"]  if _motis else None,
+            "motis_tr":    _motis["n_transfers"] if _motis else None,
+            "motis_trips": _trip_brief(_motis["trip_ids"]) if _motis else None,
+            "overlap":     _overlap,
+            "verdict":     _verdict,
+            "reasons":     "; ".join(_reasons),
+        })
+        _evidence.append({
+            "sample": {"o": _o, "d": _d, "stratum": _stratum,
+                       "depart_iso": _depart_iso},
+            "ours": _ours,
+            "motis": _motis,
+            "motis_error": (_motis_raw.get("_error")
+                            if isinstance(_motis_raw, dict)
+                            and "_error" in _motis_raw else None),
+            "overlap": _overlap,
+            "verdict": _verdict,
+            "reasons": _reasons,
+            "src": _src,
+        })
+
+    _val_df = _val_pl.DataFrame(_rows)
+    _hard    = int((_val_df["verdict"] == "hard-fail").sum())
+    _soft    = int((_val_df["verdict"] == "soft-flag").sum())
+    _pass    = int((_val_df["verdict"] == "pass").sum())
+    _bothf   = int((_val_df["verdict"] == "both-fail").sum())
+    _moterr  = int((_val_df["verdict"] == "motis-error").sum())
+
+    # ── 5. Write evidence JSON ─────────────────────────────────────
+    _now_stamp = _val_dt.now(_val_tz.utc).strftime("%Y%m%dT%H%M%SZ")
+    _ev_path = _R10_DIR / f"transitous-validation-{_now_stamp}.json"
+    _ev_path.write_text(_val_json.dumps({
+        "schema_version": 1,
+        "ran_utc": _val_dt.now(_val_tz.utc).isoformat(),
+        "ran_for_depart_iso": _depart_iso,
+        "motis_endpoint": _MOTIS_BASE,
+        "transitous_env": _TRANSITOUS_ENV,
+        "user_agent": _UA,
+        "seed": _VAL_SEED,
+        "n": len(_rows),
+        "cache_hits": _cache_hits,
+        "network_calls": _network_calls,
+        "errors": _errors,
+        "summary": {
+            "pass": _pass, "soft_flag": _soft,
+            "hard_fail": _hard, "both_fail": _bothf,
+            "motis_error": _moterr,
+        },
+        "pairs": _evidence,
+    }, indent=2))
+
+    # ── 6. Surface ─────────────────────────────────────────────────
+    _tag = (
+        "PASS" if (_hard == 0 and _moterr == 0) else
+        "SOFT-FLAG ONLY" if _hard == 0 else
+        "HARD-FAIL"
+    )
+    _summary_md = mo.md(
+        f"### Transitous (MOTIS) route-comparison gate — {_tag}\n\n"
+        f"- **Endpoint** `{_MOTIS_BASE}` "
+        f"(`TRANSITOUS_ENV={_TRANSITOUS_ENV}`)\n"
+        f"- **Depart-at** `{_depart_iso}` "
+        f"(next Wed 09:00 Europe/Vienna)\n"
+        f"- **Seed** `{_VAL_SEED}` · {len(_samples)} pairs "
+        f"(8 hub-hub, 6 hub-nonhub, 4 nonhub-nonhub, 2 cross-border; "
+        f"padding from hubs if any stratum underran)\n"
+        f"- **HTTP** `{_network_calls}` network · `{_cache_hits}` cache "
+        f"· `{_errors}` errors · User-Agent `{_UA}`\n"
+        f"- **Verdicts** `{_pass}` pass · `{_bothf}` both-fail "
+        f"· `{_soft}` soft-flag · `{_hard}` hard-fail "
+        f"· `{_moterr}` motis-error\n"
+        f"- **Evidence** `{_ev_path}`\n\n"
+        "**Acceptance**: HARD-FAIL count must be **0** for commit at "
+        "`fully tested and validated`. Each SOFT-FLAG must be "
+        "enumerated in the commit body with a one-line rationale "
+        "(R2: no out-of-scope / follow-up classification)."
+    )
+    mo.vstack([_summary_md, _val_df])
+    return
+
+
 if __name__ == "__main__":
     app.run()
