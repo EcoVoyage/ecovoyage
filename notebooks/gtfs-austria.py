@@ -290,6 +290,22 @@ def _(Path, os, textwrap):
         # station spacing. 1 deg lat ≈ 111320 m at 47.5°N → 0.002695.
         _STATION_SNAP_DEG = 0.002695  # ≈ 300 m at Austrian latitude
 
+        # Bounding-box span ceiling for the tier-3b "name-cluster" rollup
+        # — the fallback that merges FOREIGN multi-platform stations
+        # (München Hbf = 25 per-platform stop_ids, no parent_station, no
+        # Austrian OSM anchor) into ONE synthetic station. Stops are
+        # grouped by lower(trim(stop_name)) and a group only merges when
+        # its lon AND lat spans both stay under this ceiling — the
+        # geographic-spread guard so a name reused in two cities never
+        # collapses. A census of the residual (tier-1/2/3-unresolved)
+        # set found 87 multi-stop name groups; the WIDEST genuine
+        # station span is TP Summerau(Gr) at 0.00431° (~0.5 km) and
+        # München Hbf at 0.00394° (~0.4 km). At 0.006° (~0.7 km) all
+        # 87/87 groups merge with ZERO cross-city name collisions —
+        # comfortably above the largest terminus platform field, far
+        # below inter-station spacing.
+        _NAME_CLUSTER_SPAN_DEG = 0.006  # ≈ 0.7 km at Austrian latitude
+
         # Bare generic station-type names (no place qualifier) that an
         # OSM station node sometimes carries — the place is left to map
         # context. When the resolved anchor name is one of these, the
@@ -1354,6 +1370,73 @@ def _(Path, os, textwrap):
                             ), a.feature_id
                         ) = 1
                       ),
+                      -- TIER 3b: name-cluster. FOREIGN multi-platform
+                      -- stations have no GTFS parent_station and no
+                      -- Austrian OSM anchor, so tiers 1-3 cannot see
+                      -- them — they would shatter into per-platform
+                      -- self-stations (München Hbf = 25 fragments).
+                      -- Group the residual stops by their (non-generic)
+                      -- name; a group merges into ONE synthetic station
+                      -- only when its lon AND lat spans both stay under
+                      -- _NAME_CLUSTER_SPAN_DEG (the geographic-spread
+                      -- guard so a name reused in two cities never
+                      -- collapses).
+                      t3b_residual AS (
+                        SELECT
+                            s.stop_id,
+                            s.stop_name,
+                            s.stop_lon,
+                            s.stop_lat,
+                            lower(trim(s.stop_name)) AS name_key
+                        FROM gtfs.stops s
+                        WHERE s.stop_id NOT IN (
+                                SELECT stop_id FROM tier1 WHERE stop_id IS NOT NULL
+                            )
+                          AND s.stop_id NOT IN (
+                                SELECT stop_id FROM tier2 WHERE stop_id IS NOT NULL
+                            )
+                          AND s.stop_id NOT IN (
+                                SELECT stop_id FROM tier3 WHERE stop_id IS NOT NULL
+                            )
+                          AND s.stop_lon IS NOT NULL
+                          AND s.stop_lat IS NOT NULL
+                          AND NULLIF(trim(s.stop_name), '') IS NOT NULL
+                          AND lower(trim(s.stop_name))
+                              NOT IN ({_GENERIC_NAME_SET})
+                      ),
+                      t3b_groups AS (
+                        SELECT
+                            name_key,
+                            count(*)                       AS n_stops,
+                            min(stop_lon)                  AS min_lon,
+                            max(stop_lon)                  AS max_lon,
+                            min(stop_lat)                  AS min_lat,
+                            max(stop_lat)                  AS max_lat,
+                            avg(stop_lon)                  AS centroid_lon,
+                            avg(stop_lat)                  AS centroid_lat
+                        FROM t3b_residual
+                        GROUP BY name_key
+                        HAVING count(*) >= 2
+                           AND max(stop_lon) - min(stop_lon)
+                               <= {_NAME_CLUSTER_SPAN_DEG}
+                           AND max(stop_lat) - min(stop_lat)
+                               <= {_NAME_CLUSTER_SPAN_DEG}
+                      ),
+                      tier3b AS (
+                        SELECT
+                            r.stop_id,
+                            'gtfs/N:' || md5(
+                                g.name_key || ':'
+                                || round(g.centroid_lon, 3) || ':'
+                                || round(g.centroid_lat, 3)
+                            ) AS station_feature_id,
+                            r.stop_name AS station_name,
+                            g.centroid_lon AS station_lon,
+                            g.centroid_lat AS station_lat,
+                            'name_cluster' AS resolution_kind
+                        FROM t3b_residual r
+                        JOIN t3b_groups g USING (name_key)
+                      ),
                       -- TIER 4: self — every stop not resolved above
                       -- becomes its own station.
                       tier4 AS (
@@ -1374,32 +1457,87 @@ def _(Path, os, textwrap):
                           AND s.stop_id NOT IN (
                                 SELECT stop_id FROM tier3 WHERE stop_id IS NOT NULL
                             )
+                          AND s.stop_id NOT IN (
+                                SELECT stop_id FROM tier3b WHERE stop_id IS NOT NULL
+                            )
                       ),
                       resolved AS (
                         SELECT * FROM tier1
                         UNION ALL SELECT * FROM tier2
                         UNION ALL SELECT * FROM tier3
+                        UNION ALL SELECT * FROM tier3b
                         UNION ALL SELECT * FROM tier4
                       ),
-                      -- Per-station name consolidation: a station_feature_id
-                      -- can be reached by several tiers (a platform via
-                      -- gtfs_parent, a nearby orphan stop via spatial),
-                      -- and only tier 1 knows the GTFS parent name. Pick
-                      -- ONE name per station_feature_id — the non-generic
-                      -- one if any member contributed it — so every member
-                      -- of a station shows the same, best label.
+                      -- Per-stop timetable weight: how many times each
+                      -- stop_id is called in stop_times. The station's
+                      -- display name is the name carried by the member
+                      -- stop(s) with the most calls — the user's rule
+                      -- "the name with the most connections wins".
+                      stop_calls AS (
+                        SELECT stop_id, count(*) AS n_calls
+                        FROM gtfs.stop_times
+                        GROUP BY stop_id
+                      ),
+                      -- Candidate names per station: each member stop's
+                      -- RAW gtfs.stops name, weighted by its call count.
+                      -- Sourced from gtfs.stops (NOT resolved) because
+                      -- every resolved member already carries the same
+                      -- consolidated name — the raw per-stop names are
+                      -- where the "which label is real" signal lives.
+                      -- This is what stops "Salzburg Hauptbahnhof"
+                      -- (12 stops / 3387 calls) losing to the
+                      -- co-located OSM anchor "Salzburg Hauptbahnhof
+                      -- (S-Bahn)" (0 calls): max(name) sorted lexically,
+                      -- arg_max(name, calls) picks the busy one.
+                      name_calls AS (
+                        SELECT
+                            r.station_feature_id,
+                            COALESCE(s.stop_name, '') AS cand_name,
+                            sum(COALESCE(sc.n_calls, 0)) AS total_calls
+                        FROM resolved r
+                        JOIN gtfs.stops s USING (stop_id)
+                        LEFT JOIN stop_calls sc USING (stop_id)
+                        GROUP BY r.station_feature_id, s.stop_name
+                      ),
+                      -- Per-station name consolidation: ONE name per
+                      -- station_feature_id — the busiest non-generic
+                      -- candidate, falling back to the busiest candidate
+                      -- overall. Every station_feature_id in resolved is
+                      -- present here (resolved JOIN gtfs.stops on a key
+                      -- that always exists), so the grain holds.
                       station_name_final AS (
                         SELECT
                             station_feature_id,
                             COALESCE(
-                                max(station_name) FILTER (
-                                    WHERE lower(trim(station_name))
+                                arg_max(cand_name, total_calls) FILTER (
+                                    WHERE lower(trim(cand_name))
                                           NOT IN ({_GENERIC_NAME_SET})
+                                      AND NULLIF(trim(cand_name), '')
+                                          IS NOT NULL
                                 ),
-                                max(station_name)
+                                arg_max(cand_name, total_calls)
                             ) AS station_name
-                        FROM resolved
+                        FROM name_calls
                         GROUP BY station_feature_id
+                      ),
+                      -- Per-station rail-served flag: does any member
+                      -- stop_id appear on a rail trip (route_type = 2)?
+                      -- A station that fails this is bus-only (route_type
+                      -- = 3) or unserved — clicking it in the route-
+                      -- builder yields "no route" regardless of the hub
+                      -- set, because findRoute traverses rail trips
+                      -- only. Used by ROUTEBUILD_STYLE to hide such
+                      -- dots, by compute_route_network's catalogue to
+                      -- skip them, and surfaced as a string ('true' /
+                      -- 'false') because the freestiler parquet -> MVT
+                      -- round-trip drops bools.
+                      rail_served AS (
+                        SELECT DISTINCT r.station_feature_id
+                        FROM gtfs.stop_times st
+                        JOIN gtfs.trips t  USING (trip_id)
+                        JOIN gtfs.routes rt USING (route_id)
+                        JOIN resolved r ON r.stop_id = st.stop_id
+                        WHERE rt.route_type = 2
                       )
                     SELECT
                         r.stop_id,
@@ -1407,30 +1545,42 @@ def _(Path, os, textwrap):
                         snf.station_name,
                         r.station_lon,
                         r.station_lat,
-                        r.resolution_kind
+                        r.resolution_kind,
+                        CASE WHEN rs.station_feature_id IS NOT NULL
+                             THEN 'true' ELSE 'false'
+                             END AS is_rail_served
                     FROM resolved r
                     JOIN station_name_final snf USING (station_feature_id)
+                    LEFT JOIN rail_served rs USING (station_feature_id)
                 """)
                 # resolution_kind histogram — mirrors the match-rate log
                 # above. grain MUST hold: one row per GTFS stop_id.
                 res = con.sql("""
                     SELECT
-                        count(*) FILTER (WHERE resolution_kind='gtfs_parent') AS by_parent,
-                        count(*) FILTER (WHERE resolution_kind='uic_ref')     AS by_uic,
-                        count(*) FILTER (WHERE resolution_kind='spatial')     AS by_spatial,
-                        count(*) FILTER (WHERE resolution_kind='self')        AS by_self,
+                        count(*) FILTER (WHERE resolution_kind='gtfs_parent')  AS by_parent,
+                        count(*) FILTER (WHERE resolution_kind='uic_ref')      AS by_uic,
+                        count(*) FILTER (WHERE resolution_kind='spatial')      AS by_spatial,
+                        count(*) FILTER (WHERE resolution_kind='name_cluster') AS by_name_cluster,
+                        count(*) FILTER (WHERE resolution_kind='self')         AS by_self,
                         count(*)                AS total_rows,
                         count(DISTINCT stop_id) AS distinct_stop_ids,
-                        (SELECT count(*) FROM gtfs.stops) AS total_gtfs_stops
+                        (SELECT count(*) FROM gtfs.stops) AS total_gtfs_stops,
+                        count(DISTINCT station_feature_id) FILTER (
+                            WHERE is_rail_served='true')   AS rail_served_st,
+                        count(DISTINCT station_feature_id) AS total_st
                     FROM transit.station_members
                 """).fetchone()
                 print(
                     f"[match_gtfs_stops_to_osm] station roll-up: "
                     f"by_parent={res[0]}, by_uic={res[1]}, "
-                    f"by_spatial={res[2]}, by_self={res[3]}, "
-                    f"total_rows={res[4]}, distinct_stop_ids={res[5]}, "
-                    f"total_gtfs_stops={res[6]} "
-                    f"(grain OK = {res[4] == res[5] == res[6]})"
+                    f"by_spatial={res[2]}, by_name_cluster={res[3]}, "
+                    f"by_self={res[4]}, "
+                    f"total_rows={res[5]}, distinct_stop_ids={res[6]}, "
+                    f"total_gtfs_stops={res[7]} "
+                    f"(grain OK = {res[5] == res[6] == res[7]}); "
+                    f"rail-served stations={res[8]} of {res[9]} "
+                    "(remainder bus-only / unserved — hidden by the "
+                    "route-builder dot filter)"
                 )
 
                 # Fold the station identity back onto matched_stops so
@@ -1846,6 +1996,17 @@ def _(Path, os, textwrap):
                                 ), s.stop_id
                             ) = 1 THEN 'true' ELSE 'false' END
                                 AS is_station_label,
+                            -- Per-station rail-served flag (one row per
+                            -- stop_id but every member of the same
+                            -- station_feature_id carries the same
+                            -- value). ROUTEBUILD_STYLE filters its
+                            -- station-dot + -label layers on this so
+                            -- only stations the route-builder can
+                            -- actually route from are clickable. String
+                            -- for the parquet -> MVT round-trip; see
+                            -- the same comment on is_station_label.
+                            CAST(sm.is_rail_served AS VARCHAR)
+                                AS is_rail_served,
                             -- Transfer-hub importance, per station_feature_id
                             -- (so every member row carries the station's
                             -- value). hub_rank drives both the progressive
@@ -2025,6 +2186,7 @@ def _(Path, os, textwrap):
                            station_feature_id,
                            station_name,
                            is_station_label,
+                           is_rail_served,
                            hub_score,
                            hub_rank
                     FROM read_parquet('{transit_parquet_path}')
@@ -2522,6 +2684,7 @@ def _(Path, os, textwrap):
                         "station_feature_id": sfid_by_st[
                             int(cand_arr[pick])],
                         "selection_order": k,
+                        "selection_reason": "routing",
                         "marginal_gain": marginal,
                         "cumulative_objective": best_obj,
                         "rel_gain": rel,
@@ -2533,11 +2696,174 @@ def _(Path, os, textwrap):
                     })
                     prev_obj = best_obj
 
+                # ---- Connectivity-guarantee pass ----------------------
+                # The routing greedy maximises journey QUALITY but never
+                # GUARANTEES every rail station is ROUTING-REACHABLE from
+                # the hub network. Whole branch lines whose trips touch
+                # no greedy-picked hub (Franz-Josefs-Bahn, Mühlkreisbahn)
+                # would otherwise be unroutable in the hub-restricted
+                # browser search. This pass promotes the minimum extra
+                # bridge hubs so EVERY rail station that is physically
+                # connected to the main network becomes routing-
+                # reachable. It is intentionally NOT capped by
+                # OPTIMAL_HUB_MAX — coverage is a guarantee, not a budget.
+                #
+                # MODEL — exactly the route-builder's findRoute graph:
+                # you RIDE a trip freely through all its stops and may
+                # only CHANGE trips at a hub. So a station is routing-
+                # reachable iff it lies on a trip boardable (transitively,
+                # transfer-at-hub) from the seed hub set. The check is a
+                # BFS over (hub -> its trips -> their stations -> the
+                # hubs among them). It is NOT "shares one trip with any
+                # hub": promoting an ISOLATED branch station as a hub
+                # satisfies that weaker test yet leaves the new hub
+                # unreachable from Wien Hbf — a useless island in the
+                # hub-reachability graph. The correct fix promotes a
+                # REACHABLE non-hub station whose trips reach into the
+                # still-unreachable territory — a genuine BRIDGE.
+                #
+                # Per iteration, pick the reachable non-hub station that
+                # unlocks the MOST new stations (ties: anchor_score, then
+                # station_feature_id). Such a station always exists while
+                # a reachable trip straddles reachable + unreachable
+                # stations — and within one physical rail component it
+                # always does — so the BFS reachable set grows to cover
+                # the entire main physical network and terminates.
+                # Stations in physically-DISCONNECTED components (no
+                # shared station with the main mass at all — a genuinely
+                # separate heritage line) are never reached and never
+                # promoted: they are not "connected to the main network"
+                # and no hub can make them routable.
+                #
+                # Built from a rail-only (route_type=2) trip->stations
+                # query — the exact graph austria-routehub bakes and the
+                # route-builder / chronomap / fastlink passes traverse.
+                import collections as _collections
+
+                _con = duckdb.connect(db_path, read_only=True)
+                _trip_rows = _con.sql("""
+                    SELECT st.trip_id, sm.station_feature_id AS sfid
+                    FROM gtfs.stop_times st
+                    JOIN gtfs.trips t  USING (trip_id)
+                    JOIN gtfs.routes r USING (route_id)
+                    JOIN transit.station_members sm
+                      ON sm.stop_id = st.stop_id
+                    WHERE r.route_type = 2
+                      AND sm.station_feature_id IS NOT NULL
+                    GROUP BY st.trip_id, sm.station_feature_id
+                """).fetchall()
+                _con.close()
+
+                _trip_st = _collections.defaultdict(set)   # trip -> {sfid}
+                _st_trips = _collections.defaultdict(set)   # sfid -> {trip}
+                for _tid, _sf in _trip_rows:
+                    _trip_st[_tid].add(_sf)
+                    _st_trips[_sf].add(_tid)
+                # a trip needs >= 2 distinct stations to be a real edge
+                _trip_st = {t: ss for t, ss in _trip_st.items()
+                            if len(ss) >= 2}
+
+                _hubs = {sfid_by_st[int(cand_arr[ci])] for ci in H_ci}
+                _final_obj = (rows[-1]["cumulative_objective"]
+                              if rows else 0.0)
+                _all_rail_st = set(_st_trips)
+
+                # BFS reachability: from each explored hub, every trip it
+                # calls is boardable -> every station on that trip is
+                # reachable -> reachable hubs are explored in turn.
+                _reachable = set()
+                _explored = set()
+                _worklist = [h for h in _hubs if h in _st_trips]
+                _reachable.update(_worklist)
+
+                def _drain():
+                    while _worklist:
+                        _h = _worklist.pop()
+                        if _h in _explored:
+                            continue
+                        _explored.add(_h)
+                        for _t in _st_trips.get(_h, ()):
+                            if _t not in _trip_st:
+                                continue
+                            for _s in _trip_st[_t]:
+                                _reachable.add(_s)
+                                if _s in _hubs and _s not in _explored:
+                                    _worklist.append(_s)
+
+                def _promote(_sf):
+                    # add _sf to the hub set, propagate reachability, and
+                    # append its connectivity row (selection_order is
+                    # derived from rows so no counter to keep in sync).
+                    _hubs.add(_sf)
+                    _worklist.append(_sf)
+                    _drain()
+                    _a = _anch.get(_sf, _ZERO_ANCH)
+                    rows.append({
+                        "station_feature_id": _sf,
+                        "selection_order": len(rows) + 1,
+                        "selection_reason": "connectivity",
+                        "marginal_gain": 0.0,
+                        "cumulative_objective": _final_obj,
+                        "rel_gain": 0.0,
+                        "hubcost_mean": _final_obj,
+                        "anchor_score": float(_a[0]),
+                        "n_calls": int(_a[1]),
+                        "n_termini_reached": int(_a[2]),
+                        "max_terminus_km": float(_a[3]),
+                    })
+
+                _drain()
+                while True:
+                    # INNER — bridge greedy: while a reachable non-hub
+                    # station has trips reaching into unreachable land,
+                    # promote the one unlocking the MOST new stations.
+                    while True:
+                        _best, _best_key = None, None
+                        for _sf in _reachable:
+                            if _sf in _hubs:
+                                continue
+                            _new = set()
+                            for _t in _st_trips.get(_sf, ()):
+                                if _t not in _trip_st:
+                                    continue
+                                for _s in _trip_st[_t]:
+                                    if _s not in _reachable:
+                                        _new.add(_s)
+                            if not _new:
+                                continue
+                            _a0 = _anch.get(_sf, _ZERO_ANCH)[0]
+                            _key = (len(_new), _a0, _sf)
+                            if _best_key is None or _key > _best_key:
+                                _best, _best_key = _sf, _key
+                        if _best is None:
+                            break          # reachable set is maximal
+                        _promote(_best)
+                    # OUTER — a whole physical rail component may still
+                    # be unreached (the Mühlkreisbahn genuinely shares no
+                    # rail with the main network — it terminates at Linz
+                    # Urfahr, Danube-separated from Linz Hbf). It can
+                    # never connect to the main hub network, but it MUST
+                    # still be internally routable: seed it with its
+                    # highest-anchor station and let the inner greedy
+                    # bridge the rest of that component.
+                    _unreached = _all_rail_st - _reachable
+                    if not _unreached:
+                        break
+                    _seed = max(
+                        _unreached,
+                        key=lambda s: (_anch.get(s, _ZERO_ANCH)[0],
+                                       len(_st_trips[s]), s),
+                    )
+                    _promote(_seed)
+                _n_conn_hubs = len(rows) - len(H_ci)
+                _n_rail_st = len(_st_trips)
+
                 hub_df = pl.DataFrame(
                     rows,
                     schema={
                         "station_feature_id": pl.Utf8,
                         "selection_order": pl.Int64,
+                        "selection_reason": pl.Utf8,
                         "marginal_gain": pl.Float64,
                         "cumulative_objective": pl.Float64,
                         "rel_gain": pl.Float64,
@@ -2603,6 +2929,7 @@ def _(Path, os, textwrap):
                 for rr in rows:
                     print(
                         f"[compute_optimal_hubs]   #{rr['selection_order']:2d}"
+                        f" [{rr['selection_reason'][:4]}]"
                         f" {rr['station_feature_id']:24s}"
                         f" obj={rr['cumulative_objective'] / 60.0:7.2f}min"
                         f" delta={rr['marginal_gain'] / 60.0:6.2f}min"
@@ -2614,13 +2941,23 @@ def _(Path, os, textwrap):
                     )
                 print(
                     "[compute_optimal_hubs] selected "
-                    f"{len(H_ci)} hubs (derived count); {_missed} of them "
+                    f"{len(rows)} hubs ({len(H_ci)} routing + "
+                    f"{_n_conn_hubs} connectivity); {_missed} of them "
                     "rank >25 (or are absent) in the old structural "
                     f"hub_score; {_n_unconn} OD pairs need >2 interchanges; "
                     f"min pairwise hub distance={_min_pair_km:.1f} km; "
                     f"mean anchor_score={_sel_anchor.mean() / 1000.0:.0f}k "
                     "connection-km (candidate-pool mean="
                     f"{float(anchor_score.mean()) / 1000.0:.0f}k)"
+                )
+                print(
+                    "[compute_optimal_hubs] connectivity guarantee: "
+                    f"{_n_conn_hubs} bridge hubs promoted; all "
+                    f"{_n_rail_st} rail stations are routing-reachable "
+                    "within their physical component (the main network "
+                    "is one connected hub graph; the Mühlkreisbahn — "
+                    "rail-disconnected at Linz Urfahr — is internally "
+                    "routable but cannot reach the main network by rail)"
                 )
                 return str(out)
 
@@ -3321,7 +3658,12 @@ def _(Path, os, textwrap):
                     WHERE ts.has_hub = 1 AND ts.n_calls >= 2
                     ORDER BY r.trip_id, r.seq
                 """).pl()
-                # Station catalogue (one row per station: coord + name).
+                # Station catalogue (one row per rail-served station:
+                # coord + name). Filtering to is_rail_served='true' drops
+                # bus-only / unserved stations from the routehub tile's
+                # theme='station' rows — they can never be the endpoint
+                # of a findRoute leg anyway. Keeps coordOf / nameOf in
+                # the route-builder JS aligned with the routable set.
                 _stcat = con.sql("""
                     SELECT station_feature_id,
                            any_value(station_name) AS station_name,
@@ -3329,6 +3671,7 @@ def _(Path, os, textwrap):
                            any_value(station_lat)  AS station_lat
                     FROM transit.station_members
                     WHERE station_feature_id IS NOT NULL
+                      AND is_rail_served = 'true'
                     GROUP BY station_feature_id
                 """).pl()
                 con.close()
@@ -5629,9 +5972,11 @@ def _theme_styles():
     #     `austria-routehub` source: renders nothing, but forces martin
     #     to load the source's tiles so querySourceFeatures can read the
     #     journey `stops` lists client-side.
-    #   * routebuild-station-dot / -label — every parent station (the
-    #     `austria-transit` is_station_label points), the click targets;
-    #     NO hub_rank gate so any station is pickable.
+    #   * routebuild-station-dot / -label — every RAIL-SERVED parent
+    #     station (the `austria-transit` is_station_label + is_rail_served
+    #     points), the click targets. Bus-only / unserved stations are
+    #     hidden — they can never be the endpoint of a findRoute leg.
+    #     NO hub_rank gate so any rail-served station is pickable.
     #   * route-leg-casing / route-leg — the stitched route, from the
     #     client `route-src` GeoJSON.
     #   * route-pick / route-pick-label — the numbered picked waypoints,
@@ -5646,7 +5991,8 @@ def _theme_styles():
          "minzoom": 7,
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
-                    ["==", ["get", "is_station_label"], "true"]],
+                    ["==", ["get", "is_station_label"], "true"],
+                    ["==", ["get", "is_rail_served"], "true"]],
          "paint": {
             "circle-radius": ["interpolate", ["linear"], ["zoom"],
                               7, 2.4, 11, 4.0, 14, 5.5],
@@ -5660,7 +6006,8 @@ def _theme_styles():
          "minzoom": 9,
          "filter": ["all",
                     ["==", ["geometry-type"], "Point"],
-                    ["==", ["get", "is_station_label"], "true"]],
+                    ["==", ["get", "is_station_label"], "true"],
+                    ["==", ["get", "is_rail_served"], "true"]],
          "layout": {
             "text-field": ["get", "station_name"],
             "text-font": ["noto_sans_regular"],
@@ -6642,8 +6989,13 @@ def _(Path, ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
     )
     # Route-builder search bound: a journey shown to the user changes
     # trains at most this many times. Caps the client-side search
-    # fan-out; a route-builder tunable, not baked data.
-    _max_transfers = 2
+    # fan-out; a route-builder tunable, not baked data. 4 routes
+    # ~99.5% of reachable pairs (measured on the post-RC1 hub set);
+    # 2 routed only ~81% — long cross-country village-to-village trips
+    # genuinely need 3-4 changes. findRoute timing at this cap is
+    # ~50-600 ms per click (fast for typical pairs, hard pairs still
+    # interactive).
+    _max_transfers = 4
     # The route-builder interaction, injected via the helper's
     # `extra_js`. Coupled to source_name="austria-routehub" (map var
     # `map_austria_routehub` / container `map-austria-routehub`), the
@@ -7052,11 +7404,16 @@ def _(dag_run_states, mo):
     # station originating many trains to far termini outranks a
     # junction whose trains are minutes from their end. The greedy
     # STOPS when the routing gain diminishes, so both the hub set AND
-    # its count are derived. These hubs (transit.optimal_hubs) seed the
-    # chronomap / fastest-connections / route-builder CSA passes.
-    # `old_hub_rank` is where the previous purely-structural hub_score
-    # heuristic would have ranked each pick — values > 25 are hubs the
-    # old hardcoded top-25 cutoff would have missed.
+    # its count are derived. A second CONNECTIVITY-GUARANTEE pass then
+    # promotes the minimum extra hubs (`selection_reason='connectivity'`)
+    # so EVERY served station has a one-seat ride to/from a hub — without
+    # it, whole main lines whose trips touch no routing hub (the
+    # Franz-Josefs-Bahn, the Mühlkreisbahn) would be unroutable in the
+    # hub-restricted browser search. These hubs (transit.optimal_hubs)
+    # seed the chronomap / fastest-connections / route-builder CSA
+    # passes. `old_hub_rank` is where the previous purely-structural
+    # hub_score heuristic would have ranked each pick — values > 25 are
+    # hubs the old hardcoded top-25 cutoff would have missed.
     mo.stop(
         dag_run_states.get("notebook_austria_gtfs_pipeline") != "success",
         f"Waiting for notebook_austria_gtfs_pipeline (state="
@@ -7070,6 +7427,7 @@ def _(dag_run_states, mo):
     _opt_hubs = _oh_con.sql("""
         SELECT
             oh.selection_order,
+            oh.selection_reason,
             min(m.station_name)                       AS station_name,
             oh.station_feature_id,
             round(oh.hubcost_mean / 60.0, 1)          AS hubcost_min,
@@ -7085,7 +7443,8 @@ def _(dag_run_states, mo):
           ON m.station_feature_id = oh.station_feature_id
         LEFT JOIN transit.station_hub_scores hs
           ON hs.station_feature_id = oh.station_feature_id
-        GROUP BY oh.selection_order, oh.station_feature_id,
+        GROUP BY oh.selection_order, oh.selection_reason,
+                 oh.station_feature_id,
                  oh.hubcost_mean, oh.marginal_gain, oh.rel_gain,
                  oh.anchor_score, oh.n_calls, oh.n_termini_reached,
                  oh.max_terminus_km, hs.hub_rank
@@ -7093,15 +7452,26 @@ def _(dag_run_states, mo):
     """).pl()
     _oh_con.close()
     _n_hubs = _opt_hubs.height
+    _n_routing = _opt_hubs.filter(
+        _opt_hubs["selection_reason"] == "routing"
+    ).height
+    _n_conn = _opt_hubs.filter(
+        _opt_hubs["selection_reason"] == "connectivity"
+    ).height
     _n_missed = _opt_hubs.filter(
         _opt_hubs["old_hub_rank"].is_null()
         | (_opt_hubs["old_hub_rank"] > 25)
     ).height
     mo.vstack([
         mo.md(
-            f"**Route-optimised transfer hubs** — {_n_hubs} hubs, "
+            f"**Route-optimised transfer hubs** — {_n_hubs} hubs "
+            f"({_n_routing} **routing** + {_n_conn} **connectivity**), "
             "**derived** (greedy over real timetable ride times; "
-            "stops on diminishing routing returns). Candidate pool = "
+            "stops on diminishing routing returns). The connectivity "
+            "pass then promotes the minimum extra hubs so EVERY served "
+            "station has a one-seat ride to/from a hub — orphan main "
+            "lines (Franz-Josefs-Bahn, Mühlkreisbahn) that the routing "
+            "greedy skipped are closed here. Candidate pool = "
             "served stations that can actually be an interchange. "
             "`hubcost_min` is the mean one-seat-ride hub-and-spoke "
             "journey time — cheapest A→B route via the direct ride, "
