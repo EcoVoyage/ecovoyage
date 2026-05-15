@@ -572,9 +572,24 @@ The notebook-change acceptance battery, in order:
    `validate_routes_against_transitous` cell (last cell of
    `gtfs-austria.py`, inserted after "Route-optimised transfer
    hubs") replays our JS `findRoute` server-side in Python over
-   the 20 seeded OD pairs, calls **Transitous /api/v5/plan** with
-   the same `(origin, destination, depart_at, transitModes=RAIL,
-   maxTransfers=4)`, and writes a verdict matrix. **Production**
+   the 20 seeded OD pairs (with a depart-time WINDOW filter — see
+   below — so the replay is calendar/depart-time-aware instead of
+   picking the parquet's absolute-earliest trip), calls **Transitous
+   `/api/v5/plan`** with the same `(origin, destination, depart_at,
+   maxTransfers=4)`, sending the EXPLICIT rail-mode list
+   (`REGIONAL_RAIL, SUBURBAN, HIGHSPEED_RAIL, LONG_DISTANCE,
+   NIGHT_RAIL, REGIONAL_FAST_RAIL, RAIL`) instead of the
+   `transitModes=RAIL` alias — that alias turns out to be a MOTIS
+   preference, not a strict whitelist, and admits `SUBWAY`/`TRAM`
+   itineraries alongside rail (verified: Wien Heiligenstadt → Wien
+   Hauptbahnhof with `transitModes=RAIL` returned 17 itineraries,
+   15× SUBWAY-only and 2× SUBWAY+SUBURBAN — no pure-rail at all).
+   The explicit list forces MOTIS' planner to rank rail-only
+   itineraries. `searchWindow=14400` (4h) and our depart-window
+   filter on `_find_route` is mirrored at the same width so both
+   planners see the same time horizon. `maxMatchingDistance=200`
+   widens MOTIS' OSM-snap radius from the default 25m so
+   rural-station coords resolve more reliably. **Production**
    (`https://api.transitous.org/api/v5`) by default — staging
    (`https://staging.api.transitous.org/api/v5`) is documented to
    carry "limited OSM data" and in practice returns 0 itineraries
@@ -588,14 +603,16 @@ The notebook-change acceptance battery, in order:
    override for plumbing tests; on staging every pair lands as
    `phantom` HARD-FAIL because MOTIS finds nothing — useful only to
    confirm the cell's wiring, never as the acceptance signal.
-   **Two planner-model differences that the gate is designed
-   AROUND, not against**:
-   1. Our route-builder is **calendar-blind** (treats every trip in
-      `austria-routehub-paths.parquet` as a candidate regardless of
-      service-day); MOTIS is **calendar-aware** (filters to trips
-      operating on `depart_iso`'s date). So specific GTFS `trip_id`s
-      legitimately differ even on the same feed → trip-id overlap is
-      **informational only**, never a HARD-FAIL signal.
+   **Three planner-model differences the gate accounts for**:
+   1. Depart-time semantics: our findRoute is **schedule-blind by
+      default** (the interactive map says "click a station, see the
+      earliest-arriving journey across every trip in the parquet"),
+      so without an explicit `_min_depart_s` filter it picks a 02:00
+      night train for a 09:00 query. The gate passes
+      `_min_depart_s=09:00s, _max_depart_s=13:00s` so the replay
+      considers only the same time window MOTIS sees via
+      `searchWindow`. (The interactive map keeps its absolute-earliest
+      semantics; only the gate's replay filters.)
    2. We only ingest the **Transitous Austria GTFS feed**; MOTIS
       routes via the full Transitous index (CZ, HU, DE, SI, IT, …).
       So cross-border pairs may exhibit `phantom` or `motis-only`
@@ -604,13 +621,20 @@ The notebook-change acceptance battery, in order:
       `node/*` / `relation/*`); "foreign" = a feed-prefixed
       stop_id (`hu:`, `de:`, `cz:`, …) or a synthetic name-cluster
       (`gtfs/N:<hash>`).
+   3. Calendar-day specifics: even on the same feed and within the
+      same depart window, our planner picks GTFS `trip_id`s that
+      may differ from MOTIS' calendar-aware picks (we don't filter
+      by `calendar.txt` service-day at all). Trip-id overlap is
+      therefore **informational only**, never a verdict trigger.
 
    **Acceptance matrix** (per pair):
    - **PASS**: both planners agree on no-route (`both-fail`), or
      both succeed with travel-time within ±20% **and** transfers
      within ±1.
    - **HARD-FAIL** (no commit, R1 RCA required) — fires ONLY when
-     both stations are **domestic** (OSM-anchored):
+     both stations are **domestic** (OSM-anchored) AND MOTIS' OSM
+     coverage at both endpoints is normal (`n_start_offsets` and
+     `n_dest_offsets` ≥ 20):
      - `phantom`: we route, MOTIS does not on the same query, OR
      - `motis-only`: MOTIS finds a route, we don't (we missed it), OR
      - MOTIS arrives ≥60 min before us on the same OD-pair-day
@@ -620,6 +644,11 @@ The notebook-change acceptance battery, in order:
      HARD-FAIL:
      - `phantom` or `motis-only` involving any foreign station
        (feed-coverage or calendar-aware planner asymmetry).
+     - `phantom` where MOTIS' debugOutput shows fewer than 20
+       `n_start_offsets` or `n_dest_offsets` — that's a MOTIS OSM
+       coverage gap on the endpoint, not a phantom in our graph
+       (verified: Wolfsbergkogel on the Semmeringbahn,
+       `n_dest_offsets=4`; St.Martin-Sittich, `n_dest_offsets=12`).
      - Both succeed but travel-time delta > ±20% **or** transfers
        delta > ±1 (still in ballpark, planner-disagreement).
      - Zero trip-id overlap is logged but is **NOT a verdict
@@ -633,7 +662,11 @@ The notebook-change acceptance battery, in order:
    per-pair request / response. Disk cache at
    `/workspace/.r10/transitous-cache/<sha1>.json` keyed by
    `(origin_sfid, dest_sfid, depart_iso, motis_endpoint,
-   transitModes, maxTransfers)` — warm re-runs are pure-disk.
+   mode-list-version, search_window, max_match, maxTransfers,
+   schema-version `v`)` — bump `v` whenever any field that affects
+   the MOTIS response shape changes (the cache schema otherwise
+   silently replays stale responses with the wrong request set).
+   Warm re-runs are pure-disk.
    AUP compliance: User-Agent carries
    `ecovoyage-r10-gate/<calver> (<git-user.email>)`; 20-pair cap
    + disk cache keep the load polite; bump `_VAL_SEED` only on
@@ -972,7 +1005,7 @@ the open-source planner.
 | | |
 |---|---|
 | Engine | MOTIS 2 ([OpenAPI](https://redocly.github.io/redoc/?url=https://raw.githubusercontent.com/motis-project/motis/refs/tags/v2.8.3/openapi.yaml)) |
-| Journey endpoint | `GET /api/v5/plan` — `fromPlace=<lat,lon>&toPlace=<lat,lon>&time=<ISO-UTC>&transitModes=RAIL&numItineraries=3&maxTransfers=4&searchWindow=3600&arriveBy=false` |
+| Journey endpoint | `GET /api/v5/plan` — `fromPlace=<lat,lon>&toPlace=<lat,lon>&time=<ISO-UTC>&numItineraries=3&maxTransfers=4&searchWindow=14400&arriveBy=false&maxMatchingDistance=200` + repeated `transitModes=REGIONAL_RAIL&transitModes=SUBURBAN&transitModes=HIGHSPEED_RAIL&transitModes=LONG_DISTANCE&transitModes=NIGHT_RAIL&transitModes=REGIONAL_FAST_RAIL&transitModes=RAIL` (the explicit rail family — `transitModes=RAIL` alone is a preference alias and admits SUBWAY/TRAM itineraries) |
 | Prod base | `https://api.transitous.org/api/v5` |
 | Staging base | `https://staging.api.transitous.org/api/v5` (full Austria GTFS; limited OSM coverage) |
 | Auth | **User-Agent with contact info MANDATORY** per their AUP. The gate sends `ecovoyage-r10-gate/<calver> (<git config user.email>)`. |

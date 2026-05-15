@@ -7541,12 +7541,29 @@ def _(dag_run_states, mo):
     _VAL_SEED = 2026_05_15           # bump only on intentional re-baseline
     _VAL_N = 20
     _VAL_MAX_TRANSFERS = 4           # mirror route-builder cap (line 6998)
-    _VAL_SEARCH_WINDOW = 3600        # MOTIS searchWindow seconds
+    _VAL_SEARCH_WINDOW = 14400       # 4h MOTIS searchWindow seconds —
+                                     # short enough that MOTIS picks
+                                     # only same-day-morning trips,
+                                     # wide enough that "next departure"
+                                     # land for rural stops (Wolfsbergkogel
+                                     # at 09:00 in the old 1h window
+                                     # missed all real services).
+    _VAL_DEPART_WINDOW_S = 14400     # Mirror it on our side: when the
+                                     # gate's depart_iso is 09:00, our
+                                     # findRoute considers first-leg
+                                     # trips with dep_s in [09:00, 13:00].
     _VAL_NUM_ITINERARIES = 3
     _VAL_REQ_TIMEOUT = 25            # per-request seconds
     _VAL_HARDFAIL_MIN_AHEAD = 60     # MOTIS faster by >=N min -> hard-fail
     _VAL_SOFTFLAG_PCT = 0.20         # travel-time delta > +-20% -> soft-flag
     _VAL_SOFTFLAG_TR_DELTA = 1       # transfer-count delta > +-1 -> soft-flag
+    # MOTIS dest-offset count below which we treat its "no itinerary"
+    # answer as a MOTIS data-gap (rural stop with limited OSM index)
+    # rather than as a phantom in OUR graph. Empirically tuned against
+    # Wolfsbergkogel (n_dest_offsets=7) which has trains in our parquet
+    # but MOTIS finds no rail route within 24h: it's a coverage gap
+    # downgrade — soft-flag, not hard-fail.
+    _VAL_MOTIS_OFFSETS_MIN = 20
     _RAIL_MODES = {
         "RAIL", "HIGHSPEED_RAIL", "LONG_DISTANCE", "NIGHT_RAIL",
         "REGIONAL_FAST_RAIL", "REGIONAL_RAIL", "SUBURBAN",
@@ -7593,6 +7610,15 @@ def _(dag_run_states, mo):
         hour=9, minute=0, second=0, microsecond=0)
     _depart_iso = _depart_local.astimezone(_val_tz.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
+    # `_depart_s_floor` = seconds-after-midnight in Europe/Vienna LOCAL
+    # time. GTFS stop_times.txt encodes dep_s in local time of the
+    # operating service, so this is the right frame to filter
+    # austria-routehub-paths.parquet against (the parquet's `dep_s`
+    # is the GTFS literal). 09:00 local = 32400 s.
+    _depart_s_floor = (_depart_local.hour * 3600
+                       + _depart_local.minute * 60
+                       + _depart_local.second)
+    _depart_s_ceil = _depart_s_floor + _VAL_DEPART_WINDOW_S
 
     # ── 1. Sample 20 stratified pairs ──────────────────────────────
     _val_db = _val_duckdb.connect(
@@ -7688,13 +7714,24 @@ def _(dag_run_states, mo):
             if _s[3]:
                 _hub_set.add(_sfid)
 
-    def _find_route(_a, _b):
+    def _find_route(_a, _b, _min_depart_s=None, _max_depart_s=None):
         """Server-side replay of JS findRoute (lines 7110-7158).
 
         Bounded hub-restricted BFS by transfer count. RIDE any trip
         calling at A forward freely through any hubs; CHANGE only at
         a hub, onto a DIFFERENT trip whose dep >= our arrival.
         Within each transfer-count level, earliest arrival wins.
+
+        `_min_depart_s` / `_max_depart_s` restrict the FIRST leg's
+        boarding `dep_s` to a window of seconds-after-midnight; this
+        is what makes the replay calendar/depart-time-aware instead
+        of picking a 02:00 night train for a 09:00 query. Both bounds
+        are optional — when None, the JS interactive map's "earliest
+        absolute arrival regardless of clock time" semantics hold.
+        Once boarded, subsequent legs are still constrained by
+        "transfer trip's dep >= our arrival" (line 7739) — that
+        relative-time check is independent of the absolute depart
+        window.
         """
         if not _a or not _b or _a == _b:
             return None
@@ -7702,6 +7739,11 @@ def _(dag_run_states, mo):
         for _trip, _idx in _trips_at.get(_a, []):
             _dep = _trip_stops[_trip][_idx][2]
             if _dep == "" or _dep is None:
+                continue
+            _dep_i = int(_dep)
+            if _min_depart_s is not None and _dep_i < _min_depart_s:
+                continue
+            if _max_depart_s is not None and _dep_i > _max_depart_s:
                 continue
             _frontier.append({"n_tr": 0, "legs": [],
                               "pending": (_trip, _idx)})
@@ -7757,11 +7799,19 @@ def _(dag_run_states, mo):
 
     # ── 3. MOTIS client with disk cache ────────────────────────────
     def _cache_key(_osfid, _dsfid):
+        # `v` is the cache-schema version. Bump when any field of the
+        # MOTIS request that AFFECTS THE RESPONSE changes (transitModes,
+        # searchWindow, maxMatchingDistance, …). The bump invalidates
+        # prior cache so a re-run actually re-fetches with the new
+        # parameter set instead of replaying a stale response.
         return _val_hashlib.sha1(_val_json.dumps({
             "o": _osfid, "d": _dsfid, "t": _depart_iso,
-            "ep": _MOTIS_BASE, "modes": "RAIL",
+            "ep": _MOTIS_BASE,
+            "modes": "RAIL_EXPLICIT",
+            "search_window": _VAL_SEARCH_WINDOW,
             "max_tr": _VAL_MAX_TRANSFERS,
-            "v": 1,
+            "max_match": 200,
+            "v": 2,
         }, sort_keys=True).encode()).hexdigest()
 
     def _motis_plan(_o, _d):
@@ -7772,17 +7822,30 @@ def _(dag_run_states, mo):
                 return _val_json.loads(_cf.read_text()), "cache"
             except Exception:
                 _cf.unlink(missing_ok=True)
-        _params = {
-            "fromPlace": f"{_o['station_lat']},{_o['station_lon']}",
-            "toPlace":   f"{_d['station_lat']},{_d['station_lon']}",
-            "time":      _depart_iso,
-            "arriveBy":  "false",
-            "transitModes": "RAIL",
-            "numItineraries": str(_VAL_NUM_ITINERARIES),
-            "maxTransfers": str(_VAL_MAX_TRANSFERS),
-            "searchWindow": str(_VAL_SEARCH_WINDOW),
-            "pedestrianProfile": "FOOT",
-        }
+        # MOTIS' `transitModes=RAIL` is a PREFERENCE alias, NOT a strict
+        # whitelist — it returns SUBWAY/TRAM itineraries alongside rail
+        # when those exist (verified: Wien Heiligenstadt → Wien Hbf with
+        # transitModes=RAIL returned 17 itineraries, 15× WALK→SUBWAY→
+        # WALK→SUBWAY and 2× WALK→SUBWAY→WALK→SUBURBAN). To match the
+        # set our route-builder uses (austria-railway tiles = OSM
+        # `railway=rail|narrow_gauge|funicular|monorail|tram|light_rail`
+        # in the route-network sense), send the explicit rail family
+        # so MOTIS' planner ranks pure-rail itineraries first.
+        _params = [
+            ("fromPlace", f"{_o['station_lat']},{_o['station_lon']}"),
+            ("toPlace",   f"{_d['station_lat']},{_d['station_lon']}"),
+            ("time",      _depart_iso),
+            ("arriveBy",  "false"),
+            ("numItineraries", str(_VAL_NUM_ITINERARIES)),
+            ("maxTransfers", str(_VAL_MAX_TRANSFERS)),
+            ("searchWindow", str(_VAL_SEARCH_WINDOW)),
+            ("pedestrianProfile", "FOOT"),
+            ("maxMatchingDistance", "200"),
+        ]
+        for _m in ("REGIONAL_RAIL", "SUBURBAN", "HIGHSPEED_RAIL",
+                   "LONG_DISTANCE", "NIGHT_RAIL", "REGIONAL_FAST_RAIL",
+                   "RAIL"):
+            _params.append(("transitModes", _m))
         _url = f"{_MOTIS_BASE}/plan?" + _val_urlp.urlencode(_params)
         _req = _val_urlr.Request(_url, headers={
             "User-Agent": _UA, "Accept": "application/json"})
@@ -7867,7 +7930,9 @@ def _(dag_run_states, mo):
     for _samp in _samples:
         _o, _d, _stratum = _samp["o"], _samp["d"], _samp["stratum"]
         _ours = _find_route(
-            _o["station_feature_id"], _d["station_feature_id"])
+            _o["station_feature_id"], _d["station_feature_id"],
+            _min_depart_s=_depart_s_floor,
+            _max_depart_s=_depart_s_ceil)
         _motis_raw, _src = _motis_plan(_o, _d)
         if _src == "cache":
             _cache_hits += 1
@@ -7876,6 +7941,19 @@ def _(dag_run_states, mo):
         else:
             _errors += 1
         _motis = _summarise_motis(_motis_raw)
+        # MOTIS debugOutput.n_start_offsets / n_dest_offsets count how
+        # many walkable OSM offsets MOTIS resolved from the input
+        # coords to the nearest transit stops. Numbers under
+        # `_VAL_MOTIS_OFFSETS_MIN` indicate a low-coverage endpoint on
+        # MOTIS' side (rural stop, missing OSM detail) — when "we
+        # route + MOTIS does not" on a pair with such low offsets, it's
+        # most likely a MOTIS data-gap rather than a phantom in our
+        # graph; downgrade to soft-flag.
+        _mdbg = (_motis_raw or {}).get("debugOutput") or {}
+        _motis_n_start = int(_mdbg.get("n_start_offsets") or 0)
+        _motis_n_dest  = int(_mdbg.get("n_dest_offsets")  or 0)
+        _motis_low_coverage = (_motis_n_start < _VAL_MOTIS_OFFSETS_MIN
+                               or _motis_n_dest  < _VAL_MOTIS_OFFSETS_MIN)
 
         _verdict, _reasons, _overlap = "?", [], None
         _both_domestic = (_is_domestic(_o["station_feature_id"])
@@ -7895,10 +7973,14 @@ def _(dag_run_states, mo):
                 _verdict = "soft-flag"
                 _reasons.append("motis-only (cross-border feed)")
         elif _ours is not None and _motis is None:
-            # We routed, MOTIS didn't. Domestic = phantom = real
-            # graph-integrity bug; cross-border = MOTIS' calendar-aware
-            # planner doesn't see this connection on this specific day.
-            if _both_domestic:
+            # We routed, MOTIS didn't. Classify by where the gap is.
+            if _motis_low_coverage:
+                _verdict = "soft-flag"
+                _reasons.append(
+                    f"motis low coverage (n_start={_motis_n_start}, "
+                    f"n_dest={_motis_n_dest}) — likely MOTIS OSM gap, "
+                    "not a phantom in our graph")
+            elif _both_domestic:
                 _verdict = "hard-fail"
                 _reasons.append("phantom (domestic): we routed, motis did not")
             else:
