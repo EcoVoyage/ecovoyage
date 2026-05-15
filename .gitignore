@@ -235,14 +235,3 @@ duckdb/
 gtfs/
 tiles/
 
-# R10 routing-validation gate — Transitous external-API ground-truth.
-# The disk cache holds raw MOTIS /api/v5/plan responses keyed by sha1 of
-# (origin_sfid, dest_sfid, depart_iso, motis_endpoint, transitModes,
-# maxTransfers); regeneratable by deleting the cache dir and re-running the
-# gate (one HTTP call per cache miss). The validation JSON is per-run R10
-# pasteable evidence — it carries the operator's git-user.email in the
-# User-Agent trailer and the current UTC timestamp, so it is meant to be
-# pasted into a commit/PR body, not source-controlled.
-.r10/transitous-cache/
-.r10/transitous-validation-*.json
-
