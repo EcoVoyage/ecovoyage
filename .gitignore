@@ -246,3 +246,7 @@ tiles/
 .r10/transitous-cache/
 .r10/transitous-validation-*.json
 
+# Notebook-side derived data — GTFS feed downloads, time-expanded graphs,
+# isochrones, raw inputs. Regeneratable by re-running the producing cells.
+cache/
+
