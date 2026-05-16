@@ -244,6 +244,7 @@ tiles/
 # User-Agent trailer and the current UTC timestamp, so it is meant to be
 # pasted into a commit/PR body, not source-controlled.
 .r10/transitous-cache/
+.r10/transitous-cache-graph/
 .r10/transitous-validation-*.json
 
 # Notebook-side derived data — GTFS feed downloads, time-expanded graphs,

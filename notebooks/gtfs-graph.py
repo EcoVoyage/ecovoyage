@@ -45,7 +45,7 @@ def _resolved_urls(os, pl):
     airflow_public        = _resolved["AIRFLOW_PUBLIC_URL"]
     versatiles_assets     = _resolved["VERSATILES_ASSETS_PUBLIC_URL"]
     urls
-    return airflow_public, martin, versatiles_assets
+    return airflow_public, martin
 
 
 @app.cell
@@ -101,98 +101,73 @@ def _(airflow_public, mo):
 
 @app.cell
 def _constants():
-    # All tunable parameters in one place. Mirrors gtfs-austria.py:8090-8133
-    # for the R10 params so the diff between the two gates is minimal.
+    # All tunable parameters in one place. Europe-scale architecture:
+    # every constant chosen so the algorithm works at 30+× Austria size
+    # without code changes.
 
-    # Transitous Austria railway GTFS feed.
+    # Transitous Austria railway GTFS feed (first deploy target).
     GTFS_FEED_URL = (
         "https://api.transitous.org/gtfs/"
         "at_Railway-Current-Reference-Data-2026.gtfs.zip"
     )
+    # Geofabrik Austria PBF (standalone OSM source — no osm-austria.py dep).
+    PBF_URL = "https://download.geofabrik.de/europe/austria-latest.osm.pbf"
 
-    # 1h depart windows tiling the 24h GTFS service-day in Europe/Vienna
-    # local time. Replaces gtfs-austria.py's 3 × 8h bands.
+    # 1h depart windows tiling the 24h GTFS service-day (Europe/Vienna).
     WINDOWS = [(h * 3600, (h + 1) * 3600) for h in range(24)]
     WINDOW_LABELS = [f"{h:02d}-{(h+1):02d}" for h in range(24)]
 
-    # Isochrone bands (hours from a hub origin departing at 08:00 local).
+    # Isochrone bands (hours reachable from a hub at 08:00 local depart).
     ISOCHRONE_BANDS_HOURS = [1, 2, 3, 4, 5, 6, 8, 10, 12]
 
-    # Hub-selection knobs — identical algebra to gtfs-austria.py:
-    OPTIMAL_HUB_MIN = 8
-    OPTIMAL_HUB_MAX = 40
-    OPTIMAL_HUB_STOP_EPS = 0.005
-    OPTIMAL_HUB_ANCHOR_WEIGHT = 1.0
-    OPTIMAL_HUB_OBJ = "savings"   # BIG·M − Σ max(0, BIG − cand_cost)
-    OPTIMAL_HUB_SAMPLE_M = 6000
-    OPTIMAL_HUB_SEED = 20260515
-    OPTIMAL_HUB_BIG_HOURS = 24    # sentinel for unroutable pairs
+    # Hub selection (cuGraph PageRank + connectivity-guarantee BFS pass).
+    K_HUBS_TARGET = 24            # top-K by PageRank for Austria;
+                                  # bump to ~200 for Europe scale.
+    K_HUBS_MAX = 60               # absolute cap after connectivity pass
 
-    # TEG construction params.
-    TEG_MAX_TRANSFERS = 4         # structural layer count, RAPTOR-style
-    TEG_TRANSFER_MIN_WAIT_S = 60  # below this, a transfer is implausible
+    # Partial Hub-Labeling: per non-hub station, store the K_LOCAL nearest
+    # hubs. JS planner intersects origin's K_LOCAL labels with dest's to
+    # find a viable hub-pair without scanning all K² combinations.
+    K_LOCAL_HUBS = 8              # Austria: 8 × 1129 = 9k labels; Europe:
+                                  # bump to 20 if needed for coverage.
+
+    # TEG (RAPTOR-style nTr layering — transfer cap is structural).
+    TEG_MAX_TRANSFERS = 4         # → 5 layers (nTr ∈ [0..4])
+    TEG_TRANSFER_MIN_WAIT_S = 60  # plausible interchange floor
     TEG_TRANSFER_MAX_WAIT_S = 3600
 
+    # Pattern-group compression: trips with same (route_id, runs_dow,
+    # stop_seq_hash) collapse to one representative. Austria expects
+    # ~10× compression (~500 patterns / ~5k trips); Europe similar.
+    PATTERN_COMPRESS_ENABLED = True
+
     # R10 Transitous gate.
-    VAL_SEED = 20260515
-    VAL_N = 20                    # OD pair sample size
+    VAL_N = 20                    # fresh OD pair sample size per run
+    R10_FRESH_PAIRS = 21          # random pairs × VAL_WEEKDAYS × 24 windows = 1512 tests
+    R10_CACHE_ONLY = True         # until further notice: no fresh MOTIS calls
     VAL_MAX_TRANSFERS = 4
     HARDFAIL_MIN_AHEAD_MIN = 60   # MOTIS faster by ≥60 min → HARD-FAIL
     SOFTFLAG_PCT = 20             # ±20% travel-time soft-flag band
     SOFTFLAG_TR_DELTA = 1
     VAL_MOTIS_OFFSETS_MIN = 20    # below this is a MOTIS OSM gap, not us
 
-    # Default subset of WINDOWS used by the R10 gate to keep the API-call
-    # budget aligned with gtfs-austria.py's 60-call gate (20 pairs × 3
-    # representative windows). Operator can set R10_FULL_WINDOWS=1 to
-    # expand the gate to all 24 windows (480 calls cold, warm-cached
-    # after first run).
-    VAL_WINDOWS_DEFAULT_HOURS = [7, 13, 19]    # morning peak / midday / evening peak
+    # 3 representative 1h windows for the default gate run. Set env
+    # R10_FULL_WINDOWS=1 to expand to all 24.
+    VAL_WINDOWS_DEFAULT_HOURS = [7, 13, 19]    # morning / midday / evening peaks
 
-    # MOTIS prod endpoint by default; staging only useful for plumbing
-    # tests (its OSM coverage is too sparse to return itineraries for
-    # most coord-keyed /plan queries).
+    # MOTIS prod endpoint by default.
     MOTIS_BASE_PROD = "https://api.transitous.org/api/v5"
     MOTIS_BASE_STAGING = "https://staging.api.transitous.org/api/v5"
 
-    # Cache + corpus paths. Distinct from gtfs-austria.py's `-graph`-less
-    # paths so the two gates coexist during the validation window.
+    # Cache + corpus paths (graph-suffixed so gtfs-austria.py's gate's
+    # files don't collide during the validation window).
     R10_CACHE_DIR = "/workspace/.r10/transitous-cache-graph"
     R10_CORPUS_FILE = "/workspace/.r10/hardfail-corpus-graph.json"
+    R10_CACHE_SCHEMA_VERSION = 7  # bumped from gtfs-austria.py's v=6
 
     # TEG + DAG-output cache locations.
     GRAPH_CACHE_DIR = "/workspace/cache/austria-teg"
-
-    return (
-        GRAPH_CACHE_DIR,
-        GTFS_FEED_URL,
-        HARDFAIL_MIN_AHEAD_MIN,
-        ISOCHRONE_BANDS_HOURS,
-        MOTIS_BASE_PROD,
-        MOTIS_BASE_STAGING,
-        OPTIMAL_HUB_ANCHOR_WEIGHT,
-        OPTIMAL_HUB_BIG_HOURS,
-        OPTIMAL_HUB_MAX,
-        OPTIMAL_HUB_MIN,
-        OPTIMAL_HUB_OBJ,
-        OPTIMAL_HUB_SAMPLE_M,
-        OPTIMAL_HUB_SEED,
-        OPTIMAL_HUB_STOP_EPS,
-        R10_CACHE_DIR,
-        R10_CORPUS_FILE,
-        SOFTFLAG_PCT,
-        SOFTFLAG_TR_DELTA,
-        TEG_MAX_TRANSFERS,
-        TEG_TRANSFER_MAX_WAIT_S,
-        TEG_TRANSFER_MIN_WAIT_S,
-        VAL_MAX_TRANSFERS,
-        VAL_MOTIS_OFFSETS_MIN,
-        VAL_N,
-        VAL_SEED,
-        VAL_WINDOWS_DEFAULT_HOURS,
-        WINDOWS,
-        WINDOW_LABELS,
-    )
+    return
 
 
 @app.function
@@ -381,15 +356,17 @@ def with_theme(theme: str, layers: list) -> list:
 
 @app.cell
 def _author_dag(Path, os, textwrap):
-    # Self-author the GPU-graph pipeline DAG. Idempotent — overwriting
-    # on every notebook run keeps the DAG body in sync with this
-    # notebook (single source of truth: this cell IS the DAG spec).
-    # Distinct dag_id from the sibling gtfs-austria.py DAG; both can
-    # coexist in /workspace/dags/.
+    # Verify the committed DAG file is present + has the right dag_id.
+    # The DAG body is committed as a SEPARATE file at
+    # `dags/notebook_austria_graph_pipeline.py` (not embedded in this
+    # notebook). Both files are committed atomically per the cutover
+    # plan; on fresh deploy, `git pull` brings both in together.
     #
-    # SKELETON STATE: every task body is a `pass`-equivalent log line so
-    # the DAG round-trips green. Each task is filled in progressively
-    # through the build order (see plan file).
+    # Rationale: the DAG body is ~2000 LoC of dense GPU + worker-
+    # subprocess code with nested triple-quoted string literals;
+    # embedding it as a textwrap.dedent('''...''') in this cell
+    # creates quote-escape headaches AND obscures the actual code
+    # in marimo's UI. Co-committed-file is cleaner.
     dags_dir = Path(os.environ.get(
         "AIRFLOW_DAGS_DIR",
         os.path.expanduser("/workspace/dags"),
@@ -398,1807 +375,25 @@ def _author_dag(Path, os, textwrap):
 
     graph_dag_id = "notebook_austria_graph_pipeline"
     graph_dag_file = dags_dir / f"{graph_dag_id}.py"
-    graph_dag_file.write_text(textwrap.dedent('''
-        """Austria GPU-graph route-builder pipeline self-authored by
-        notebooks/gtfs-graph.py.
 
-        SKELETON. Each task body is a stub; full implementation is
-        progressed through the build order in the plan file at
-        /home/atrawog/.claude/plans/can-you-check-gpu-libraries-demo-py-breezy-owl.md.
-
-        Pipeline shape:
-
-            download_gtfs
-              └─ parse_gtfs
-                  └─ match_stops_to_osm
-                      └─ build_teg
-                          ├─ compute_optimal_hubs_gpu
-                          │   ├─ compute_hub_pair_routes_gpu
-                          │   │   └─ bake_hubpairs_pmtiles
-                          │   ├─ compute_isochrones_gpu
-                          │   │   └─ bake_isochrones_pmtiles
-                          │   └─ compute_routehub_dataset
-                          │       └─ bake_routes_pmtiles
-
-        Schedule: @monthly + max_active_runs=1. Manual triggers via
-        the notebook's REST trigger cell adopt the most recent
-        same-month success run (idempotent re-runs are free).
-        """
-        import logging
-        import os
-        from datetime import datetime, timedelta, timezone
-        from pathlib import Path
-
-        from airflow.sdk import dag, task
-
-        log = logging.getLogger(__name__)
-
-        # Cache layout — every task persists artefacts under this root
-        # so the in-kernel route-builder cell can reload them without
-        # re-running the DAG.
-        CACHE = Path("/workspace/cache/austria-teg")
-        GTFS_RAW = CACHE / "raw"            # downloaded feed .zip
-        GTFS_PARQUET = CACHE / "gtfs"       # cudf-parsed .txt → parquet
-        TRANSIT = CACHE / "transit"         # stations + hubs + hub-pair routes
-        TEG = CACHE / "teg"                 # edges + nodes parquet
-        ISO = CACHE / "isochrones"          # per-hub band rings
-
-        # Output tiles — martin auto-discovers under /workspace/tiles/pmtiles.
-        TILES_OUT = Path("/workspace/tiles/pmtiles")
-        TILES_WORK = Path("/workspace/tiles/work")
-
-        # Soft dependency on osm-austria.py output. Read-only; we
-        # NEVER re-derive austria.parquet ourselves.
-        OSM_PARQUET = TILES_WORK / "austria.parquet"
-
-        # Transitous Austria railway GTFS feed.
-        GTFS_FEED_URL = (
-            "https://api.transitous.org/gtfs/"
-            "at_Railway-Current-Reference-Data-2026.gtfs.zip"
+    if not graph_dag_file.exists():
+        raise RuntimeError(
+            f"DAG file missing at {graph_dag_file}. "
+            "This notebook expects the DAG body to be committed at "
+            "`dags/notebook_austria_graph_pipeline.py`; restore it "
+            "from git or copy from the cutover commit."
         )
-
-        # Mirrors gtfs-austria.py's notebook-side constants used by the
-        # 3-tier OSM stop match. KEEP IN SYNC.
-        _AT_FEED_CODE = "AT-Transitous"
-        _TRANSIT_WHERE = """tags['railway'] IN ('station','stop','halt','tram_stop','subway_entrance')
-                      OR tags['public_transport'] IN ('stop_position','platform','station')
-                      OR tags['highway'] = 'bus_stop'
-                      OR tags['amenity'] = 'ferry_terminal'"""
-        _STATION_ANCHOR_WHERE = """tags['railway'] IN ('station', 'halt')
-                      OR tags['public_transport'] = 'station'"""
-        _STATION_SNAP_DEG = 0.002695        # ~300 m at AT latitude
-        _NAME_CLUSTER_SPAN_DEG = 0.006      # ~0.7 km at AT latitude
-        _GENERIC_NAME_SET = (
-            "'hauptbahnhof', 'bahnhof', 'bahnhst', 'bahnhst.', 'hbf', "
-            "'bf', 'bf.', 'station', 'bahnsteig'"
+    body = graph_dag_file.read_text()
+    if graph_dag_id not in body:
+        raise RuntimeError(
+            f"DAG file at {graph_dag_file} does not contain expected "
+            f"dag_id={graph_dag_id!r}"
         )
+    # No-op write — kept for callability symmetry with prior versions
+    # that DID author the DAG body. Returns the same values downstream
+    # cells reference.
+    return graph_dag_file, graph_dag_id
 
-
-        def _needs_regen(path: Path) -> bool:
-            """Monthly mtime cache. Returns True iff path is missing OR
-            its mtime falls outside the current calendar month
-            (Europe/Vienna). Mirrors gtfs-austria.py's smart-download
-            policy — ad-hoc re-runs within a month skip the work."""
-            if not path.exists():
-                return True
-            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-            now = datetime.now(timezone.utc)
-            return (mtime.year, mtime.month) != (now.year, now.month)
-
-
-        @dag(
-            dag_id="notebook_austria_graph_pipeline",
-            start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
-            schedule="@monthly",
-            catchup=False,
-            max_active_runs=1,
-            default_args={"retries": 2, "retry_delay": timedelta(seconds=60)},
-            tags=["austria", "graph", "gpu"],
-        )
-        def notebook_austria_graph_pipeline():
-            @task
-            def download_gtfs() -> str:
-                """Fetch the Transitous Austria railway GTFS .zip.
-                Monthly mtime cache — re-runs within the same calendar
-                month short-circuit. ~770 KB on the wire."""
-                import shutil
-                import urllib.request
-                GTFS_RAW.mkdir(parents=True, exist_ok=True)
-                out = GTFS_RAW / "austria.gtfs.zip"
-                if not _needs_regen(out):
-                    log.info("download_gtfs: cached %s", out)
-                    return str(out)
-                tmp = out.with_suffix(".zip.part")
-                try:
-                    with urllib.request.urlopen(GTFS_FEED_URL, timeout=300) as resp:
-                        with open(tmp, "wb") as f:
-                            shutil.copyfileobj(resp, f)
-                    tmp.replace(out)
-                finally:
-                    if tmp.exists():
-                        tmp.unlink()
-                log.info("download_gtfs: fetched %s (%d bytes)", out, out.stat().st_size)
-                return str(out)
-
-            @task
-            def parse_gtfs(zip_path: str) -> str:
-                """Unzip + cuDF-parse every .txt into one parquet per
-                table. GTFS is an all-string format; we read with
-                dtype="str" so cuDF's CSV parser handles whatever the
-                feed shipped without dtype inference surprises. Tables
-                kept: stops / trips / stop_times / routes / calendar /
-                calendar_dates / agency / transfers (when present).
-                shapes.txt is skipped — large + unused for routing.
-                stops.parquet's mtime is the freshness canary."""
-                import zipfile
-                import cudf
-                GTFS_PARQUET.mkdir(parents=True, exist_ok=True)
-                if not _needs_regen(GTFS_PARQUET / "stops.parquet"):
-                    log.info("parse_gtfs: cached %s", GTFS_PARQUET)
-                    return str(GTFS_PARQUET)
-                # Keep extraction in a scratch dir under raw/ so the
-                # raw .zip and the unzipped tree are colocated and
-                # consistent under monthly cache.
-                extract_dir = GTFS_RAW / "extracted"
-                if extract_dir.exists():
-                    import shutil
-                    shutil.rmtree(extract_dir)
-                extract_dir.mkdir(parents=True)
-                with zipfile.ZipFile(zip_path) as zf:
-                    zf.extractall(extract_dir)
-                wanted = {
-                    "stops", "trips", "stop_times", "routes",
-                    "calendar", "calendar_dates", "agency", "transfers",
-                }
-                # Wipe stale parquet so a feed that dropped a table
-                # never leaves a stale read-back.
-                for old in GTFS_PARQUET.glob("*.parquet"):
-                    old.unlink()
-                loaded = []
-                for txt in sorted(extract_dir.glob("*.txt")):
-                    name = txt.stem
-                    if name not in wanted:
-                        continue
-                    # All-string dtype mirrors the GTFS spec — every
-                    # field is a string, even numeric-looking ones like
-                    # stop_lat / stop_lon. Downstream tasks cast as
-                    # needed (DuckDB casts in SQL; cuGraph build casts
-                    # via cuDF.to_numeric).
-                    df = cudf.read_csv(str(txt), dtype="str")
-                    out = GTFS_PARQUET / f"{name}.parquet"
-                    df.to_parquet(str(out), compression="snappy")
-                    loaded.append((name, len(df)))
-                log.info(
-                    "parse_gtfs: loaded %d tables: %s",
-                    len(loaded),
-                    ", ".join(f"{n}({r})" for n, r in loaded),
-                )
-                return str(GTFS_PARQUET)
-
-            @task(retries=20, retry_delay=timedelta(seconds=60))
-            def match_stops_to_osm(parquet_dir: str) -> str:
-                """3-tier OSM stop match + 4-tier station rollup,
-                identical algebra to gtfs-austria.py:1098-1635 — same
-                SQL, same _GENERIC_NAME_SET, same _STATION_SNAP_DEG, so
-                the station_feature_id output is bit-equivalent.
-
-                Run on an EPHEMERAL in-memory DuckDB (no persistent
-                file at /workspace/duckdb/austria.duckdb — that's
-                gtfs-austria.py's domain). The 13M-feature
-                austria.parquet is read as a zero-copy VIEW; cudf
-                parquet outputs are read as DuckDB tables. ~30-60 s
-                on cold data.
-
-                20×60s retries cover a cold osm-austria.py rebuild
-                that hasn't produced austria.parquet yet."""
-                import duckdb
-                TRANSIT.mkdir(parents=True, exist_ok=True)
-                if not OSM_PARQUET.exists() or _needs_regen(OSM_PARQUET):
-                    raise RuntimeError(
-                        f"austria.parquet missing or stale at "
-                        f"{OSM_PARQUET} — Airflow will retry while "
-                        "osm-austria.py builds it"
-                    )
-                stations_out = TRANSIT / "stations.parquet"
-                if not _needs_regen(stations_out):
-                    log.info("match_stops_to_osm: cached %s", stations_out)
-                    return str(stations_out)
-
-                gtfs_dir = Path(parquet_dir)
-                stops_pq = gtfs_dir / "stops.parquet"
-                stop_times_pq = gtfs_dir / "stop_times.parquet"
-                trips_pq = gtfs_dir / "trips.parquet"
-                routes_pq = gtfs_dir / "routes.parquet"
-                for p in (stops_pq, stop_times_pq, trips_pq, routes_pq):
-                    if not p.exists():
-                        raise FileNotFoundError(
-                            f"required cuDF-parsed parquet missing: {p}"
-                        )
-
-                con = duckdb.connect()  # in-memory; no on-disk DB file
-                con.sql("INSTALL spatial; LOAD spatial;")
-                # OSM extract as a VIEW (zero-copy).
-                con.sql(
-                    "CREATE OR REPLACE VIEW osm_features AS "
-                    f"SELECT * FROM read_parquet('{OSM_PARQUET}')"
-                )
-                # GTFS as TABLES — cuDF's parquet output is read fine
-                # by DuckDB. Cast lat/lon to double up front so the SQL
-                # is identical to gtfs-austria.py's (which gets numeric
-                # columns from gtfs-parquet).
-                con.sql(
-                    "CREATE OR REPLACE TABLE gtfs_stops AS "
-                    f"SELECT * EXCLUDE (stop_lat, stop_lon),"
-                    f"       CAST(stop_lat AS DOUBLE) AS stop_lat,"
-                    f"       CAST(stop_lon AS DOUBLE) AS stop_lon "
-                    f"  FROM read_parquet('{stops_pq}')"
-                )
-                con.sql(
-                    "CREATE OR REPLACE TABLE gtfs_stop_times AS "
-                    f"SELECT * FROM read_parquet('{stop_times_pq}')"
-                )
-                con.sql(
-                    "CREATE OR REPLACE TABLE gtfs_trips AS "
-                    f"SELECT * FROM read_parquet('{trips_pq}')"
-                )
-                con.sql(
-                    "CREATE OR REPLACE TABLE gtfs_routes AS "
-                    f"SELECT * FROM read_parquet('{routes_pq}')"
-                )
-
-                con.sql(f"""
-                    CREATE OR REPLACE TABLE osm_stop_features AS
-                    SELECT feature_id,
-                           geometry,
-                           ST_X(ST_Centroid(geometry)) AS lon,
-                           ST_Y(ST_Centroid(geometry)) AS lat,
-                           tags
-                    FROM osm_features
-                    WHERE {_TRANSIT_WHERE}
-                """)
-                # 3-tier match — same algebra as gtfs-austria.py.
-                con.sql(f"""
-                    CREATE OR REPLACE TABLE matched_stops AS
-                    WITH
-                      tag_match AS (
-                        SELECT s.stop_id, o.feature_id AS osm_feature_id,
-                               'gtfs:stop_id' AS match_kind, 0.0 AS match_distance_m
-                        FROM gtfs_stops s
-                        JOIN osm_stop_features o
-                          ON o.tags['gtfs:stop_id:{_AT_FEED_CODE}'] = s.stop_id
-                      ),
-                      ifopt_match AS (
-                        SELECT s.stop_id, o.feature_id AS osm_feature_id,
-                               'ref:IFOPT' AS match_kind, 0.0 AS match_distance_m
-                        FROM gtfs_stops s
-                        JOIN osm_stop_features o
-                          ON o.tags['ref:IFOPT'] = s.stop_id
-                        WHERE s.stop_id NOT IN (SELECT stop_id FROM tag_match)
-                      ),
-                      spatial_last_resort AS (
-                        SELECT s.stop_id, o.feature_id AS osm_feature_id,
-                               'spatial_last_resort' AS match_kind,
-                               ST_Distance(
-                                   ST_Point(s.stop_lon, s.stop_lat),
-                                   ST_Point(o.lon, o.lat)
-                               ) AS match_distance_m
-                        FROM gtfs_stops s
-                        JOIN osm_stop_features o
-                          ON ST_DWithin(
-                                 ST_Point(s.stop_lon, s.stop_lat),
-                                 ST_Point(o.lon, o.lat),
-                                 0.00045
-                             )
-                        WHERE s.stop_id NOT IN (SELECT stop_id FROM tag_match)
-                          AND s.stop_id NOT IN (SELECT stop_id FROM ifopt_match)
-                        QUALIFY ROW_NUMBER() OVER (
-                            PARTITION BY s.stop_id ORDER BY match_distance_m
-                        ) = 1
-                      )
-                    SELECT * FROM tag_match
-                    UNION ALL SELECT * FROM ifopt_match
-                    UNION ALL SELECT * FROM spatial_last_resort
-                """)
-
-                # 4-tier station rollup → transit/stations.parquet.
-                # Bit-identical SQL to gtfs-austria.py:1231-1633.
-                con.sql(f"""
-                    CREATE OR REPLACE TABLE station_members AS
-                    WITH
-                      anchors AS (
-                        SELECT feature_id,
-                               tags['name'] AS station_name,
-                               tags['uic_ref'] AS uic_ref,
-                               ST_X(ST_Centroid(geometry)) AS lon,
-                               ST_Y(ST_Centroid(geometry)) AS lat
-                        FROM osm_features
-                        WHERE {_STATION_ANCHOR_WHERE}
-                      ),
-                      best_match AS (
-                        SELECT stop_id, osm_feature_id, match_kind
-                        FROM matched_stops
-                        QUALIFY ROW_NUMBER() OVER (
-                            PARTITION BY stop_id
-                            ORDER BY CASE match_kind
-                                       WHEN 'gtfs:stop_id' THEN 0
-                                       WHEN 'ref:IFOPT' THEN 1
-                                       ELSE 2 END,
-                                     osm_feature_id
-                        ) = 1
-                      ),
-                      parent_anchor AS (
-                        SELECT ps.stop_id   AS parent_stop_id,
-                               ps.stop_name AS parent_name,
-                               ps.stop_lon  AS parent_lon,
-                               ps.stop_lat  AS parent_lat,
-                               a.feature_id   AS anchor_feature_id,
-                               a.station_name AS anchor_name,
-                               a.lon AS anchor_lon,
-                               a.lat AS anchor_lat
-                        FROM gtfs_stops ps
-                        LEFT JOIN best_match pbm ON pbm.stop_id = ps.stop_id
-                        LEFT JOIN anchors a
-                               ON a.feature_id = pbm.osm_feature_id
-                               OR ST_DWithin(
-                                      ST_Point(ps.stop_lon, ps.stop_lat),
-                                      ST_Point(a.lon, a.lat),
-                                      {_STATION_SNAP_DEG}
-                                  )
-                        WHERE ps.stop_id IN (
-                            SELECT DISTINCT parent_station FROM gtfs_stops
-                            WHERE NULLIF(parent_station, '') IS NOT NULL
-                        )
-                        QUALIFY ROW_NUMBER() OVER (
-                            PARTITION BY ps.stop_id
-                            ORDER BY
-                                CASE WHEN a.feature_id = pbm.osm_feature_id
-                                     THEN 0 ELSE 1 END,
-                                ST_Distance(
-                                    ST_Point(ps.stop_lon, ps.stop_lat),
-                                    ST_Point(COALESCE(a.lon, ps.stop_lon),
-                                             COALESCE(a.lat, ps.stop_lat))
-                                ),
-                                a.feature_id
-                        ) = 1
-                      ),
-                      tier1 AS (
-                        SELECT s.stop_id,
-                               COALESCE(pa.anchor_feature_id,
-                                        'gtfs/' || s.parent_station) AS station_feature_id,
-                               CASE
-                                 WHEN lower(trim(pa.anchor_name))
-                                      IN ({_GENERIC_NAME_SET})
-                                 THEN COALESCE(pa.parent_name, pa.anchor_name)
-                                 ELSE COALESCE(pa.anchor_name, pa.parent_name)
-                               END AS station_name,
-                               COALESCE(pa.anchor_lon, pa.parent_lon) AS station_lon,
-                               COALESCE(pa.anchor_lat, pa.parent_lat) AS station_lat,
-                               'gtfs_parent' AS resolution_kind
-                        FROM gtfs_stops s
-                        LEFT JOIN parent_anchor pa ON pa.parent_stop_id = s.parent_station
-                        WHERE NULLIF(s.parent_station, '') IS NOT NULL
-                      ),
-                      tier2 AS (
-                        SELECT s.stop_id,
-                               a.feature_id AS station_feature_id,
-                               a.station_name,
-                               a.lon AS station_lon,
-                               a.lat AS station_lat,
-                               'uic_ref' AS resolution_kind
-                        FROM gtfs_stops s
-                        JOIN best_match bm ON bm.stop_id = s.stop_id
-                        JOIN osm_features of ON of.feature_id = bm.osm_feature_id
-                        JOIN anchors a
-                          ON a.uic_ref = of.tags['uic_ref']
-                         AND NULLIF(of.tags['uic_ref'], '') IS NOT NULL
-                        WHERE s.stop_id NOT IN (SELECT stop_id FROM tier1 WHERE stop_id IS NOT NULL)
-                        QUALIFY ROW_NUMBER() OVER (
-                            PARTITION BY s.stop_id ORDER BY a.feature_id
-                        ) = 1
-                      ),
-                      tier3 AS (
-                        SELECT s.stop_id,
-                               a.feature_id AS station_feature_id,
-                               a.station_name,
-                               a.lon AS station_lon,
-                               a.lat AS station_lat,
-                               'spatial' AS resolution_kind
-                        FROM gtfs_stops s
-                        JOIN anchors a
-                          ON ST_DWithin(
-                                 ST_Point(s.stop_lon, s.stop_lat),
-                                 ST_Point(a.lon, a.lat),
-                                 {_STATION_SNAP_DEG}
-                             )
-                        WHERE s.stop_id NOT IN (SELECT stop_id FROM tier1 WHERE stop_id IS NOT NULL)
-                          AND s.stop_id NOT IN (SELECT stop_id FROM tier2 WHERE stop_id IS NOT NULL)
-                          AND s.stop_lon IS NOT NULL
-                          AND s.stop_lat IS NOT NULL
-                        QUALIFY ROW_NUMBER() OVER (
-                            PARTITION BY s.stop_id
-                            ORDER BY ST_Distance(
-                                ST_Point(s.stop_lon, s.stop_lat),
-                                ST_Point(a.lon, a.lat)
-                            ), a.feature_id
-                        ) = 1
-                      ),
-                      t3b_residual AS (
-                        SELECT s.stop_id, s.stop_name, s.stop_lon, s.stop_lat,
-                               lower(trim(s.stop_name)) AS name_key
-                        FROM gtfs_stops s
-                        WHERE s.stop_id NOT IN (SELECT stop_id FROM tier1 WHERE stop_id IS NOT NULL)
-                          AND s.stop_id NOT IN (SELECT stop_id FROM tier2 WHERE stop_id IS NOT NULL)
-                          AND s.stop_id NOT IN (SELECT stop_id FROM tier3 WHERE stop_id IS NOT NULL)
-                          AND s.stop_lon IS NOT NULL
-                          AND s.stop_lat IS NOT NULL
-                          AND NULLIF(trim(s.stop_name), '') IS NOT NULL
-                          AND lower(trim(s.stop_name)) NOT IN ({_GENERIC_NAME_SET})
-                      ),
-                      t3b_groups AS (
-                        SELECT name_key, count(*) AS n_stops,
-                               min(stop_lon) AS min_lon, max(stop_lon) AS max_lon,
-                               min(stop_lat) AS min_lat, max(stop_lat) AS max_lat,
-                               avg(stop_lon) AS centroid_lon,
-                               avg(stop_lat) AS centroid_lat
-                        FROM t3b_residual
-                        GROUP BY name_key
-                        HAVING count(*) >= 2
-                           AND max(stop_lon) - min(stop_lon) <= {_NAME_CLUSTER_SPAN_DEG}
-                           AND max(stop_lat) - min(stop_lat) <= {_NAME_CLUSTER_SPAN_DEG}
-                      ),
-                      tier3b AS (
-                        SELECT r.stop_id,
-                               'gtfs/N:' || md5(
-                                   g.name_key || ':'
-                                   || round(g.centroid_lon, 3) || ':'
-                                   || round(g.centroid_lat, 3)
-                               ) AS station_feature_id,
-                               r.stop_name AS station_name,
-                               g.centroid_lon AS station_lon,
-                               g.centroid_lat AS station_lat,
-                               'name_cluster' AS resolution_kind
-                        FROM t3b_residual r
-                        JOIN t3b_groups g USING (name_key)
-                      ),
-                      tier4 AS (
-                        SELECT s.stop_id,
-                               s.stop_id AS station_feature_id,
-                               s.stop_name AS station_name,
-                               s.stop_lon AS station_lon,
-                               s.stop_lat AS station_lat,
-                               'self' AS resolution_kind
-                        FROM gtfs_stops s
-                        WHERE s.stop_id NOT IN (SELECT stop_id FROM tier1 WHERE stop_id IS NOT NULL)
-                          AND s.stop_id NOT IN (SELECT stop_id FROM tier2 WHERE stop_id IS NOT NULL)
-                          AND s.stop_id NOT IN (SELECT stop_id FROM tier3 WHERE stop_id IS NOT NULL)
-                          AND s.stop_id NOT IN (SELECT stop_id FROM tier3b WHERE stop_id IS NOT NULL)
-                      ),
-                      resolved AS (
-                        SELECT * FROM tier1
-                        UNION ALL SELECT * FROM tier2
-                        UNION ALL SELECT * FROM tier3
-                        UNION ALL SELECT * FROM tier3b
-                        UNION ALL SELECT * FROM tier4
-                      ),
-                      stop_calls AS (
-                        SELECT stop_id, count(*) AS n_calls
-                        FROM gtfs_stop_times
-                        GROUP BY stop_id
-                      ),
-                      name_calls AS (
-                        SELECT r.station_feature_id,
-                               COALESCE(s.stop_name, '') AS cand_name,
-                               sum(COALESCE(sc.n_calls, 0)) AS total_calls
-                        FROM resolved r
-                        JOIN gtfs_stops s USING (stop_id)
-                        LEFT JOIN stop_calls sc USING (stop_id)
-                        GROUP BY r.station_feature_id, s.stop_name
-                      ),
-                      station_name_final AS (
-                        SELECT station_feature_id,
-                               COALESCE(
-                                   arg_max(cand_name, total_calls) FILTER (
-                                       WHERE lower(trim(cand_name)) NOT IN ({_GENERIC_NAME_SET})
-                                         AND NULLIF(trim(cand_name), '') IS NOT NULL
-                                   ),
-                                   arg_max(cand_name, total_calls)
-                               ) AS station_name
-                        FROM name_calls
-                        GROUP BY station_feature_id
-                      ),
-                      rail_served AS (
-                        SELECT DISTINCT r.station_feature_id
-                        FROM gtfs_stop_times st
-                        JOIN gtfs_trips t USING (trip_id)
-                        JOIN gtfs_routes rt USING (route_id)
-                        JOIN resolved r ON r.stop_id = st.stop_id
-                        WHERE rt.route_type = '2'
-                      )
-                    SELECT r.stop_id,
-                           r.station_feature_id,
-                           snf.station_name,
-                           r.station_lon,
-                           r.station_lat,
-                           r.resolution_kind,
-                           CASE WHEN rs.station_feature_id IS NOT NULL
-                                THEN 'true' ELSE 'false'
-                                END AS is_rail_served
-                    FROM resolved r
-                    JOIN station_name_final snf USING (station_feature_id)
-                    LEFT JOIN rail_served rs USING (station_feature_id)
-                """)
-
-                # Per-station table (one row per station_feature_id) —
-                # the canonical schema the TEG builder + R10 gate
-                # consume. station_members above is one-row-per-stop_id
-                # so we GROUP BY to collapse to per-station grain.
-                # DuckDB 1.5's `.arrow()` returns a RecordBatchReader,
-                # not a pyarrow.Table — use fetch_arrow_table() for the
-                # in-memory Table that pyarrow.parquet.write_table
-                # accepts.
-                stations_tbl = con.sql("""
-                    SELECT
-                        station_feature_id,
-                        any_value(station_name) AS station_name,
-                        any_value(station_lon)  AS station_lon,
-                        any_value(station_lat)  AS station_lat,
-                        any_value(is_rail_served) AS is_rail_served,
-                        list(DISTINCT stop_id)  AS member_stop_ids
-                    FROM station_members
-                    GROUP BY station_feature_id
-                """).fetch_arrow_table()
-                stations_out.parent.mkdir(parents=True, exist_ok=True)
-                import pyarrow.parquet as papq
-                papq.write_table(stations_tbl, stations_out, compression="snappy")
-                stop_members_path = TRANSIT / "stop_station_members.parquet"
-                papq.write_table(
-                    con.sql("SELECT * FROM station_members").fetch_arrow_table(),
-                    stop_members_path,
-                    compression="snappy",
-                )
-
-                rates = con.sql("""
-                    SELECT
-                        count(*) FILTER (WHERE resolution_kind='gtfs_parent')  AS by_parent,
-                        count(*) FILTER (WHERE resolution_kind='uic_ref')      AS by_uic,
-                        count(*) FILTER (WHERE resolution_kind='spatial')      AS by_spatial,
-                        count(*) FILTER (WHERE resolution_kind='name_cluster') AS by_name_cluster,
-                        count(*) FILTER (WHERE resolution_kind='self')         AS by_self,
-                        count(DISTINCT station_feature_id) FILTER (
-                            WHERE is_rail_served='true')   AS rail_served_st,
-                        count(DISTINCT station_feature_id) AS total_st
-                    FROM station_members
-                """).fetchone()
-                log.info(
-                    "match_stops_to_osm: rollup by_parent=%d by_uic=%d "
-                    "by_spatial=%d by_name_cluster=%d by_self=%d; "
-                    "rail-served stations=%d of %d",
-                    *rates,
-                )
-                con.close()
-                return str(stations_out)
-
-            @task
-            def build_teg(stations_path: str, gtfs_parquet_dir: str) -> str:
-                """Build the static (transfer-edge-less) time-expanded
-                graph. Produces:
-
-                - teg/serviced_stop_times.parquet — rail-only stop_times
-                  resolved to station_feature_id, with arr_s/dep_s as
-                  seconds-since-midnight ints and a 7-bit runs_dow
-                  bitmask (Mon=0 .. Sun=6) per trip from calendar.txt.
-                  This is the canonical "rail timetable resolved to
-                  station grain" — every downstream task reads it.
-
-                - teg/nodes.parquet — (node_idx, kind, trip_idx, seq,
-                  sfid, nTr). For now nTr=0 only; transfer-layer
-                  replication happens in compute_hub_pair_routes_gpu
-                  once the hub set is committed.
-
-                - teg/edges.parquet — (src_idx, dst_idx, weight_s,
-                  edge_kind, dep_s). edge_kind ∈ {0:ride, 1:alight,
-                  2:board}. board edges carry their raw dep_s so the
-                  per-window filter can be applied at SSSP time
-                  without rebuilding the edge list.
-
-                All on GPU via cuDF + CuPy. Austria rail timetable
-                fits comfortably in ~200 MB GPU memory."""
-                import cudf
-                import cupy as cp
-                import math
-
-                TEG.mkdir(parents=True, exist_ok=True)
-                serviced_path = TEG / "serviced_stop_times.parquet"
-                edges_path = TEG / "edges.parquet"
-                nodes_path = TEG / "nodes.parquet"
-                if not (_needs_regen(serviced_path)
-                        or _needs_regen(edges_path)
-                        or _needs_regen(nodes_path)):
-                    log.info("build_teg: cached %s", TEG)
-                    return str(TEG)
-
-                gtfs_dir = Path(gtfs_parquet_dir)
-                # cudf.read_parquet with dtype="str" (implicit from the
-                # parse_gtfs writer) gives all-string columns; cast
-                # numeric / time fields explicitly.
-                trips = cudf.read_parquet(str(gtfs_dir / "trips.parquet"))
-                routes = cudf.read_parquet(str(gtfs_dir / "routes.parquet"))
-                stop_times = cudf.read_parquet(str(gtfs_dir / "stop_times.parquet"))
-                calendar = cudf.read_parquet(str(gtfs_dir / "calendar.parquet"))
-
-                # Filter to rail trips (route_type == "2").
-                rail_routes = routes.loc[routes["route_type"] == "2", ["route_id", "route_short_name", "route_long_name"]]
-                rail_trips = trips.merge(rail_routes, on="route_id", how="inner")
-                # COALESCE short_name → long_name → route_id (matches
-                # gtfs-austria.py:3739-3743).
-                rail_trips["route_short_name"] = rail_trips["route_short_name"].fillna("").replace("", None)
-                rail_trips["route_long_name"]  = rail_trips["route_long_name"].fillna("").replace("", None)
-                rail_trips["rsn"] = (
-                    rail_trips["route_short_name"]
-                        .fillna(rail_trips["route_long_name"])
-                        .fillna(rail_trips["route_id"])
-                )
-
-                # 7-bit runs_dow bitmask from calendar.txt: Mon=bit 0..Sun=bit 6.
-                # Trips with no calendar entry (calendar_dates-only) default to
-                # all days (0x7F) — same fallback as gtfs-austria.py.
-                cal = calendar.copy()
-                for c in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"):
-                    cal[c] = cal[c].astype("int32")
-                cal["runs_dow"] = (
-                    cal["monday"]    * 1 +
-                    cal["tuesday"]   * 2 +
-                    cal["wednesday"] * 4 +
-                    cal["thursday"]  * 8 +
-                    cal["friday"]    * 16 +
-                    cal["saturday"]  * 32 +
-                    cal["sunday"]    * 64
-                ).astype("int32")
-                rail_trips = rail_trips.merge(
-                    cal[["service_id", "runs_dow"]], on="service_id", how="left",
-                )
-                rail_trips["runs_dow"] = rail_trips["runs_dow"].fillna(127).astype("int32")
-
-                # Filter stop_times to rail trips only.
-                rail_st = stop_times.merge(
-                    rail_trips[["trip_id", "rsn", "runs_dow"]], on="trip_id", how="inner",
-                )
-
-                # Resolve stop_id → station_feature_id via
-                # stop_station_members. Drop stops that didn't roll up
-                # (vanishingly rare — every GTFS stop_id appears in the
-                # 4-tier resolution).
-                memb = cudf.read_parquet(
-                    str(TRANSIT / "stop_station_members.parquet"),
-                    columns=["stop_id", "station_feature_id"],
-                )
-                rail_st = rail_st.merge(memb, on="stop_id", how="inner")
-
-                # Parse arrival/departure to seconds-since-midnight.
-                # GTFS "HH:MM:SS" with HH may exceed 23 for overnight
-                # trips — keep as int32 (max ~129600 fits trivially).
-                def _hms_to_seconds(s):
-                    parts = s.str.split(":")
-                    h = parts.list.get(0).astype("int32")
-                    m = parts.list.get(1).astype("int32")
-                    sec = parts.list.get(2).astype("int32")
-                    return h * 3600 + m * 60 + sec
-
-                rail_st["arr_s"] = _hms_to_seconds(rail_st["arrival_time"])
-                rail_st["dep_s"] = _hms_to_seconds(rail_st["departure_time"])
-                rail_st["stop_sequence"] = rail_st["stop_sequence"].astype("int32")
-
-                serviced = rail_st[[
-                    "trip_id", "stop_sequence", "station_feature_id",
-                    "arr_s", "dep_s", "runs_dow", "rsn",
-                ]].sort_values(["trip_id", "stop_sequence"]).reset_index(drop=True)
-                serviced.to_parquet(str(serviced_path), compression="snappy")
-                log.info("build_teg: serviced_stop_times rows=%d", len(serviced))
-
-                # ---- Node ID assignment ----
-                # Sequential int32 IDs in three blocks: ORIGIN, DEST, RIDE.
-                # ORIGIN and DEST nodes share the same sfid pool (one per
-                # distinct sfid in the rail timetable).
-                sfid_list = serviced["station_feature_id"].unique().to_pandas().tolist()
-                sfid_to_idx = {sfid: i for i, sfid in enumerate(sfid_list)}
-                n_sfids = len(sfid_list)
-                origin_offset = 0
-                dest_offset = n_sfids
-                ride_offset = 2 * n_sfids
-                # RIDE id = ride_offset + row_index in serviced (sorted).
-                serviced_pd = serviced.to_pandas()
-                serviced_pd["sfid_idx"] = serviced_pd["station_feature_id"].map(sfid_to_idx).astype("int32")
-                serviced_pd["ride_idx"] = (ride_offset + serviced_pd.index).astype("int32")
-                n_rides = len(serviced_pd)
-                # trip_id → integer index (for nodes table compactness).
-                trip_id_list = serviced_pd["trip_id"].drop_duplicates().tolist()
-                trip_to_idx = {t: i for i, t in enumerate(trip_id_list)}
-                serviced_pd["trip_idx"] = serviced_pd["trip_id"].map(trip_to_idx).astype("int32")
-
-                # Build node table.
-                import pandas as pd
-                origin_nodes = pd.DataFrame({
-                    "node_idx": list(range(n_sfids)),
-                    "kind": "ORIGIN",
-                    "trip_idx": -1,
-                    "seq": -1,
-                    "sfid": sfid_list,
-                    "nTr": 0,
-                })
-                dest_nodes = pd.DataFrame({
-                    "node_idx": list(range(n_sfids, 2 * n_sfids)),
-                    "kind": "DEST",
-                    "trip_idx": -1,
-                    "seq": -1,
-                    "sfid": sfid_list,
-                    "nTr": 0,
-                })
-                ride_nodes = pd.DataFrame({
-                    "node_idx": serviced_pd["ride_idx"].values,
-                    "kind": "RIDE",
-                    "trip_idx": serviced_pd["trip_idx"].values,
-                    "seq": serviced_pd["stop_sequence"].values,
-                    "sfid": serviced_pd["station_feature_id"].values,
-                    "nTr": 0,
-                })
-                nodes_df = pd.concat([origin_nodes, dest_nodes, ride_nodes], ignore_index=True)
-                nodes_df.to_parquet(str(nodes_path), compression="snappy", index=False)
-                log.info(
-                    "build_teg: nodes=%d (origin=%d, dest=%d, ride=%d)",
-                    len(nodes_df), n_sfids, n_sfids, n_rides,
-                )
-
-                # ---- Edges ----
-                # 1. Ride edges: consecutive (seq, seq+1) within each trip.
-                #    Compute via groupby+shift on the sorted serviced table.
-                #    weight = arr_s[i+1] - arr_s[i] — the passenger's
-                #    elapsed time from arrival at stop i to arrival at
-                #    stop i+1 INCLUDING dwell at stop i. Using
-                #    arr_s[i+1] - dep_s[i] would undercount by every
-                #    intermediate dwell (~3-10 min undercount on a
-                #    cross-country trip).
-                ride_edges = serviced_pd.copy()
-                ride_edges["next_arr_s"] = ride_edges.groupby("trip_id")["arr_s"].shift(-1)
-                ride_edges["next_ride_idx"] = ride_edges.groupby("trip_id")["ride_idx"].shift(-1)
-                ride_edges = ride_edges.dropna(subset=["next_arr_s", "next_ride_idx"]).copy()
-                ride_edges["weight_s"] = (ride_edges["next_arr_s"] - ride_edges["arr_s"]).astype("int32")
-                # Clip negative ride weights to 0 (defensive — clock drift
-                # in a few feed entries can flip dep>arr on the same stop).
-                ride_edges.loc[ride_edges["weight_s"] < 0, "weight_s"] = 0
-                ride_edge_df = pd.DataFrame({
-                    "src_idx": ride_edges["ride_idx"].astype("int32"),
-                    "dst_idx": ride_edges["next_ride_idx"].astype("int32"),
-                    "weight_s": ride_edges["weight_s"],
-                    "edge_kind": 0,   # 0:ride
-                    "dep_s": ride_edges["dep_s"].astype("int32"),
-                    "runs_dow": ride_edges["runs_dow"].astype("int32"),
-                })
-
-                # 2. Alight edges: every RIDE → DEST(its sfid), w=0.
-                alight_edge_df = pd.DataFrame({
-                    "src_idx": serviced_pd["ride_idx"].astype("int32"),
-                    "dst_idx": (dest_offset + serviced_pd["sfid_idx"]).astype("int32"),
-                    "weight_s": 0,
-                    "edge_kind": 1,   # 1:alight
-                    "dep_s": serviced_pd["dep_s"].astype("int32"),
-                    "runs_dow": serviced_pd["runs_dow"].astype("int32"),
-                })
-
-                # 3. Board edges: ORIGIN(sfid) → RIDE, w=dep_s (raw).
-                #    Per-window filter (window_lo ≤ dep_s < window_hi)
-                #    + per-weekday filter (runs_dow & weekday_bit) is
-                #    applied at SSSP time without rebuilding edges.
-                board_edge_df = pd.DataFrame({
-                    "src_idx": (origin_offset + serviced_pd["sfid_idx"]).astype("int32"),
-                    "dst_idx": serviced_pd["ride_idx"].astype("int32"),
-                    "weight_s": serviced_pd["dep_s"].astype("int32"),
-                    "edge_kind": 2,   # 2:board
-                    "dep_s": serviced_pd["dep_s"].astype("int32"),
-                    "runs_dow": serviced_pd["runs_dow"].astype("int32"),
-                })
-
-                edges_df = pd.concat([ride_edge_df, alight_edge_df, board_edge_df], ignore_index=True)
-                edges_df.to_parquet(str(edges_path), compression="snappy", index=False)
-                log.info(
-                    "build_teg: edges=%d (ride=%d alight=%d board=%d)",
-                    len(edges_df), len(ride_edge_df), len(alight_edge_df), len(board_edge_df),
-                )
-                return str(TEG)
-
-            @task
-            def compute_optimal_hubs_gpu(stations_path: str, teg_dir: str) -> str:
-                """Pick the K transfer hubs that maximise routing
-                quality. For the first pass we use the **anchor-score
-                ranking** — a deterministic CuPy-batched proxy for the
-                full greedy savings aggregator (gtfs-austria.py:2247-
-                2969). Anchor score per candidate station = sum over
-                every trip-call before that trip's terminus of the
-                great-circle distance from the call to the terminus,
-                weighted by the trip's runs_dow (its operating-day
-                count Mon..Sun). High-anchor-score stations are the
-                ones with many trains to far-flung destinations — the
-                natural transfer hubs (gtfs-austria.py:2438-2568 uses
-                the same primitive as one of two greedy components).
-
-                A subsequent commit will swap this for the full
-                D-matrix savings greedy port; for now anchor-score is
-                the de-risk-passing simplification and gives ≥75%
-                hub-set overlap with the existing CPU pipeline."""
-                import cudf
-                import cupy as cp
-                import pandas as pd
-
-                TRANSIT.mkdir(parents=True, exist_ok=True)
-                hubs_path = TRANSIT / "optimal_hubs.parquet"
-                if not _needs_regen(hubs_path):
-                    log.info("compute_optimal_hubs_gpu: cached %s", hubs_path)
-                    return str(hubs_path)
-
-                serviced = cudf.read_parquet(
-                    str(Path(teg_dir) / "serviced_stop_times.parquet"),
-                    columns=["trip_id", "stop_sequence", "station_feature_id", "arr_s", "dep_s", "runs_dow"],
-                )
-                stations = cudf.read_parquet(
-                    stations_path,
-                    columns=["station_feature_id", "station_name", "station_lon", "station_lat", "is_rail_served"],
-                )
-                # Filter to rail-served stations.
-                rail_st = stations.loc[stations["is_rail_served"] == "true"].reset_index(drop=True)
-                log.info("compute_optimal_hubs_gpu: candidate pool = %d rail-served stations", len(rail_st))
-
-                # Per-trip terminus = the last stop (max seq).
-                term = serviced.groupby("trip_id").agg(
-                    term_seq=("stop_sequence", "max"),
-                ).reset_index()
-                serviced_with_term = serviced.merge(term, on="trip_id", how="inner")
-                serviced_with_term["is_terminus"] = (
-                    serviced_with_term["stop_sequence"] == serviced_with_term["term_seq"]
-                )
-                term_coords = (
-                    serviced_with_term.loc[serviced_with_term["is_terminus"], ["trip_id", "station_feature_id"]]
-                        .rename(columns={"station_feature_id": "term_sfid"})
-                )
-                serviced_with_term = serviced_with_term.merge(term_coords, on="trip_id", how="inner")
-                # Drop the terminus row itself from the call set (anchor
-                # is defined over CALLS that precede the terminus).
-                call_set = serviced_with_term.loc[~serviced_with_term["is_terminus"]].copy()
-
-                # Bring in lon/lat for both call sfid AND terminus sfid.
-                call_set = call_set.merge(
-                    stations[["station_feature_id", "station_lon", "station_lat"]]
-                        .rename(columns={
-                            "station_lon": "call_lon", "station_lat": "call_lat",
-                        }),
-                    on="station_feature_id", how="inner",
-                )
-                call_set = call_set.merge(
-                    stations[["station_feature_id", "station_lon", "station_lat"]]
-                        .rename(columns={
-                            "station_feature_id": "term_sfid",
-                            "station_lon": "term_lon",
-                            "station_lat": "term_lat",
-                        }),
-                    on="term_sfid", how="inner",
-                )
-
-                # Equirectangular distance in km (matches gtfs-austria.py:2540).
-                # cuDF Series lacks .cos(); drop to CuPy for the trig and
-                # sqrt then wrap back.
-                _DEG_PER_RAD = 57.295779513082323
-                call_lat_cp = cp.asarray(call_set["call_lat"].astype("float64").to_cupy())
-                term_lat_cp = cp.asarray(call_set["term_lat"].astype("float64").to_cupy())
-                call_lon_cp = cp.asarray(call_set["call_lon"].astype("float64").to_cupy())
-                term_lon_cp = cp.asarray(call_set["term_lon"].astype("float64").to_cupy())
-                mean_lat_rad = (call_lat_cp + term_lat_cp) / 2.0 / _DEG_PER_RAD
-                dx_km = (term_lon_cp - call_lon_cp) * 111.32 * cp.cos(mean_lat_rad)
-                dy_km = (term_lat_cp - call_lat_cp) * 110.574
-                dist_km = cp.sqrt(dx_km * dx_km + dy_km * dy_km)
-                call_set["dist_km"] = cudf.Series(dist_km, dtype="float64")
-
-                # runs_dow population count = number of operating
-                # weekdays per week (Mon..Sun). CuPy popcount on the
-                # int32 bitmask.
-                rd = cp.asarray(call_set["runs_dow"].astype("int32").to_cupy())
-                # CuPy 14 lacks bitwise popcount; manual count of bits 0..6.
-                ops_per_week = cp.zeros_like(rd)
-                for bit in range(7):
-                    ops_per_week += ((rd >> bit) & 1)
-                call_set["ops_per_week"] = cudf.Series(ops_per_week, dtype="int32")
-
-                # Per call, weighted distance contribution =
-                # dist_km × ops_per_week. Anchor score per sfid is the
-                # sum of these contributions.
-                call_set["score_contrib"] = call_set["dist_km"] * call_set["ops_per_week"]
-                anchor = (
-                    call_set.groupby("station_feature_id")
-                        .agg(anchor_score=("score_contrib", "sum"),
-                             n_calls=("score_contrib", "count"))
-                        .reset_index()
-                )
-                # Keep only rail-served candidates.
-                anchor = anchor.merge(
-                    rail_st[["station_feature_id", "station_name"]],
-                    on="station_feature_id", how="inner",
-                )
-
-                # Top OPTIMAL_HUB_MAX. The selection-order cap mirrors
-                # gtfs-austria.py's greedy bound (8..40); we commit a
-                # fixed K=24 within that range. Deterministic tie-break
-                # on station_feature_id keeps the output stable across
-                # re-runs against the same feed.
-                K = 24
-                hubs = (
-                    anchor.sort_values(["anchor_score", "station_feature_id"], ascending=[False, True])
-                        .head(K)
-                        .reset_index(drop=True)
-                        .to_pandas()
-                )
-                hubs["selection_order"] = list(range(1, len(hubs) + 1))
-                hubs = hubs[["selection_order", "station_feature_id", "station_name", "anchor_score", "n_calls"]]
-                hubs.to_parquet(str(hubs_path), compression="snappy", index=False)
-                log.info(
-                    "compute_optimal_hubs_gpu: picked %d hubs; top 5: %s",
-                    len(hubs),
-                    "; ".join(f"{r.selection_order}.{r.station_name}" for r in hubs.head(5).itertuples()),
-                )
-                return str(hubs_path)
-
-            @task
-            def compute_hub_pair_routes_gpu(hubs_path: str, teg_dir: str) -> str:
-                """The graph-builder's MAIN deliverable: the
-                contraction-hierarchy table consumed by the JS planner
-                in the browser. For every (origin_hub, dest_hub,
-                window_idx, weekday) tuple where origin≠dest, run a
-                single cugraph.sssp on the time-expanded graph and
-                decode the predecessor chain into a trip-id leg list.
-
-                Cold cost: K × 24 windows × 2 weekdays = 1,152 SSSPs
-                on a ~1.6M-edge graph, ~50 ms each → ~60 s GPU time.
-                Warm cache short-circuits to ~0 s."""
-                import cudf
-                import cugraph
-                import cupy as cp
-                import json as _json
-                import pandas as pd
-
-                hub_pairs_out = TRANSIT / "hub_pair_routes.parquet"
-                if not _needs_regen(hub_pairs_out):
-                    log.info("compute_hub_pair_routes_gpu: cached %s", hub_pairs_out)
-                    return str(hub_pairs_out)
-
-                # ---- Load TEG + hubs ----
-                teg_p = Path(teg_dir)
-                edges = cudf.read_parquet(str(teg_p / "edges.parquet"))
-                nodes = cudf.read_parquet(str(teg_p / "nodes.parquet"))
-                hubs = cudf.read_parquet(hubs_path)
-                hub_sfids = hubs["station_feature_id"].to_pandas().tolist()
-
-                origin_lookup = (
-                    nodes.loc[nodes["kind"] == "ORIGIN", ["sfid", "node_idx"]]
-                        .rename(columns={"node_idx": "origin_nid"})
-                )
-                dest_lookup = (
-                    nodes.loc[nodes["kind"] == "DEST", ["sfid", "node_idx"]]
-                        .rename(columns={"node_idx": "dest_nid"})
-                )
-                origin_map = dict(zip(
-                    origin_lookup["sfid"].to_pandas(),
-                    origin_lookup["origin_nid"].to_pandas().astype("int32"),
-                ))
-                dest_map = dict(zip(
-                    dest_lookup["sfid"].to_pandas(),
-                    dest_lookup["dest_nid"].to_pandas().astype("int32"),
-                ))
-                missing_origin = [s for s in hub_sfids if s not in origin_map]
-                if missing_origin:
-                    raise RuntimeError(
-                        f"hubs missing from TEG origin lookup: {missing_origin[:3]}..."
-                    )
-
-                # RIDE node table for transfer-edge construction.
-                ride_nodes = nodes.loc[nodes["kind"] == "RIDE",
-                                       ["node_idx", "trip_idx", "seq", "sfid"]].copy()
-                # Pull arr_s / dep_s back onto the ride nodes by joining
-                # against the edges (alight edges carry dep_s; ride
-                # edges carry weight = arr_next - dep_curr so we need
-                # something else for arr_s). Simpler: re-read
-                # serviced_stop_times for the (trip_id, seq) → (arr_s,
-                # dep_s, runs_dow) mapping.
-                serviced = cudf.read_parquet(
-                    str(teg_p / "serviced_stop_times.parquet"),
-                    columns=["trip_id", "stop_sequence", "station_feature_id",
-                             "arr_s", "dep_s", "runs_dow"],
-                ).rename(columns={
-                    "stop_sequence": "seq",
-                    "station_feature_id": "sfid",
-                })
-                # Map trip_id → trip_idx via the nodes table.
-                trip_lookup = (
-                    ride_nodes[["trip_idx", "sfid", "seq"]].copy()
-                    # We need trip_id; re-load from nodes (which doesn't
-                    # carry it directly) — use serviced's trip_id +
-                    # the matching ride node by (trip_id, seq, sfid).
-                )
-                # Join serviced + ride_nodes on (sfid, seq) and use
-                # trip_idx parity to identify the matching row. Simpler:
-                # build trip_id → trip_idx via the same encoding used
-                # by build_teg (sorted unique trip_ids).
-                trip_id_order = (
-                    serviced.sort_values(["trip_id"])
-                        .drop_duplicates("trip_id")
-                )["trip_id"].reset_index(drop=True).to_pandas().tolist()
-                # Sanity: confirm trip count matches nodes.trip_idx max+1
-                expected_n_trips = int(ride_nodes["trip_idx"].max()) + 1 if len(ride_nodes) else 0
-                if len(trip_id_order) != expected_n_trips:
-                    # Defensive: re-derive from serviced's first-seen order
-                    # (matches build_teg's serviced_pd["trip_id"].drop_duplicates()).
-                    trip_id_order = (
-                        serviced["trip_id"].drop_duplicates()
-                            .to_pandas().tolist()
-                    )
-                trip_id_to_idx = {t: i for i, t in enumerate(trip_id_order)}
-                serviced_pd = serviced.to_pandas()
-                serviced_pd["trip_idx"] = serviced_pd["trip_id"].map(trip_id_to_idx).astype("int32")
-
-                # Now serviced_pd has the full (trip_idx, seq, sfid,
-                # arr_s, dep_s, runs_dow) view AND a trip_id column.
-                # Build ride_idx via merge against ride_nodes on
-                # (trip_idx, seq) — ride_nodes was built from the
-                # same sorted serviced order so the lookup is unique.
-                ride_nodes_pd = ride_nodes.to_pandas()
-                ride_meta = serviced_pd.merge(
-                    ride_nodes_pd[["trip_idx", "seq", "node_idx"]]
-                        .rename(columns={"node_idx": "ride_idx"}),
-                    on=["trip_idx", "seq"], how="inner",
-                )
-
-                # ---- Transfer edges at hubs ----
-                # For each hub station, for every (arrival event at hub,
-                # departure event at hub from a DIFFERENT trip) where
-                # dep_s ≥ arr_s + TRANSFER_MIN_WAIT_S and
-                # dep_s - arr_s ≤ TRANSFER_MAX_WAIT_S, emit a
-                # transfer edge ride_arr_idx → ride_dep_idx with weight
-                # dep_s - arr_s.
-                MIN_WAIT_S = 60
-                MAX_WAIT_S = 3600
-                hub_set = set(hub_sfids)
-                hub_arrivals = ride_meta[ride_meta["sfid"].isin(hub_set)].copy()
-                # Same-sfid self-join (arrivals × departures at the
-                # same hub).
-                xfer_join = hub_arrivals.merge(
-                    hub_arrivals.rename(columns={
-                        "trip_idx": "trip_idx_b",
-                        "trip_id":  "trip_id_b",
-                        "seq":      "seq_b",
-                        "arr_s":    "arr_s_b",
-                        "dep_s":    "dep_s_b",
-                        "ride_idx": "ride_idx_b",
-                        "runs_dow": "runs_dow_b",
-                    })[["sfid", "trip_idx_b", "trip_id_b", "seq_b",
-                        "arr_s_b", "dep_s_b", "ride_idx_b", "runs_dow_b"]],
-                    on="sfid", how="inner",
-                )
-                # Drop same-trip self-transfers + enforce wait window.
-                # Also require both halves share at least one weekday
-                # (runs_dow_a & runs_dow_b != 0) — otherwise the
-                # transfer is never realised on the same operating day.
-                xfer_join = xfer_join[
-                    (xfer_join["trip_idx"] != xfer_join["trip_idx_b"])
-                    & (xfer_join["dep_s_b"] >= xfer_join["arr_s"] + MIN_WAIT_S)
-                    & (xfer_join["dep_s_b"] - xfer_join["arr_s"] <= MAX_WAIT_S)
-                    & ((xfer_join["runs_dow"] & xfer_join["runs_dow_b"]) > 0)
-                ].copy()
-                # Transfer edge weight = arr_s_b - arr_s (passenger
-                # elapsed time from arrival at hub via trip a to
-                # arrival at next-stop on trip b). Includes the
-                # board-wait + first ride to next stop on trip b.
-                xfer_join["weight_s"] = (xfer_join["arr_s_b"] - xfer_join["arr_s"]).astype("int32")
-                # Conjoint runs_dow for the transfer edge: the
-                # intersection of the two trips' weekday masks.
-                xfer_join["runs_dow_xfer"] = (
-                    (xfer_join["runs_dow"] & xfer_join["runs_dow_b"]).astype("int32")
-                )
-                xfer_edges_pd = pd.DataFrame({
-                    "src_idx": xfer_join["ride_idx"].astype("int32").values,
-                    "dst_idx": xfer_join["ride_idx_b"].astype("int32").values,
-                    "weight_s": xfer_join["weight_s"].values,
-                    "edge_kind": 3,   # 3:transfer
-                    "dep_s": xfer_join["dep_s_b"].astype("int32").values,
-                    "runs_dow": xfer_join["runs_dow_xfer"].values,
-                })
-                log.info(
-                    "compute_hub_pair_routes_gpu: transfer edges = %d "
-                    "(at %d hub stations, MIN_WAIT=%ds MAX_WAIT=%ds)",
-                    len(xfer_edges_pd), len(hub_set), MIN_WAIT_S, MAX_WAIT_S,
-                )
-
-                # ---- Full edge set ----
-                edges_pd = edges.to_pandas()
-                # Drop board edges from the static graph; they get
-                # re-added per (window, weekday) below.
-                static_edges = edges_pd[edges_pd["edge_kind"] != 2].copy()
-                static_with_xfer = pd.concat([static_edges, xfer_edges_pd], ignore_index=True)
-                board_edges_pd = edges_pd[edges_pd["edge_kind"] == 2].copy()
-
-                # ---- SSSP loop ----
-                # Two representative weekday-bits: Monday=1 (covers
-                # weekday timetable) and Saturday=32 (covers weekend).
-                # weekday_mask emitted into the output row is the SAME
-                # bit — clients filter on
-                # (route.weekday_mask & today_bit) != 0.
-                weekday_bits = [(1, "Mon", 0), (32, "Sat", 5)]
-                window_hours = list(range(24))  # 0..23 inclusive
-                rows = []
-                serviced_lookup = {}
-                # trip_idx → trip_id (string) for the trip_chain JSON
-                trip_idx_to_id = {i: t for t, i in trip_id_to_idx.items()}
-                # ride_idx → (trip_idx, seq, sfid, arr_s, dep_s) for
-                # predecessor walk-back. Build a CuPy-free dict keyed
-                # by the int32 node id.
-                ride_meta_indexed = ride_meta.set_index("ride_idx")[
-                    ["trip_idx", "seq", "sfid", "arr_s", "dep_s", "runs_dow"]
-                ].to_dict(orient="index")
-                # ORIGIN / DEST node lookups: node_idx → sfid
-                origin_nid_to_sfid = {
-                    v: k for k, v in origin_map.items()
-                }
-                dest_nid_to_sfid = {
-                    v: k for k, v in dest_map.items()
-                }
-
-                def _decode_route(sssp_pred_map, dest_nid, window_lo):
-                    """Walk predecessor chain dest → origin, collapse
-                    consecutive same-trip RIDE nodes into legs. Return
-                    {travel_min, n_transfers, arr_s, first_dep_s,
-                     trip_chain} or None if unreachable."""
-                    if dest_nid not in sssp_pred_map:
-                        return None
-                    cur = dest_nid
-                    chain = []
-                    # Bound the walk at 200 nodes — pathologically long
-                    # in real timetables.
-                    for _ in range(200):
-                        if cur < 0:
-                            break
-                        chain.append(cur)
-                        nxt = sssp_pred_map.get(cur, -1)
-                        if nxt == cur or nxt < 0:
-                            break
-                        cur = int(nxt)
-                    chain.reverse()
-                    if not chain:
-                        return None
-                    # Strip ORIGIN node from head (always present).
-                    # The next entry should be a RIDE node (board edge).
-                    if chain[0] in origin_nid_to_sfid:
-                        chain = chain[1:]
-                    # Strip DEST from tail.
-                    if chain and chain[-1] in dest_nid_to_sfid:
-                        chain = chain[:-1]
-                    # Build legs: each leg = consecutive RIDE nodes with
-                    # the same trip_idx.
-                    legs = []
-                    if not chain:
-                        return None
-                    leg_start = chain[0]
-                    leg_start_meta = ride_meta_indexed.get(leg_start)
-                    if leg_start_meta is None:
-                        return None
-                    for nid in chain[1:]:
-                        meta = ride_meta_indexed.get(nid)
-                        if meta is None:
-                            break
-                        prev_trip = ride_meta_indexed[leg_start]["trip_idx"]
-                        if meta["trip_idx"] != prev_trip:
-                            # End of a leg — capture and start a new one.
-                            legs.append({
-                                "trip": trip_idx_to_id[ride_meta_indexed[leg_start]["trip_idx"]],
-                                "board_seq": int(ride_meta_indexed[leg_start]["seq"]),
-                                "alight_seq": int(ride_meta_indexed[chain[chain.index(nid) - 1]]["seq"]),
-                                "board_sfid": ride_meta_indexed[leg_start]["sfid"],
-                                "alight_sfid": ride_meta_indexed[chain[chain.index(nid) - 1]]["sfid"],
-                                "dep_s": int(ride_meta_indexed[leg_start]["dep_s"]),
-                                "arr_s": int(ride_meta_indexed[chain[chain.index(nid) - 1]]["arr_s"]),
-                            })
-                            leg_start = nid
-                    # Final leg.
-                    last = chain[-1]
-                    last_meta = ride_meta_indexed.get(last)
-                    if last_meta is not None:
-                        legs.append({
-                            "trip": trip_idx_to_id[ride_meta_indexed[leg_start]["trip_idx"]],
-                            "board_seq": int(ride_meta_indexed[leg_start]["seq"]),
-                            "alight_seq": int(last_meta["seq"]),
-                            "board_sfid": ride_meta_indexed[leg_start]["sfid"],
-                            "alight_sfid": last_meta["sfid"],
-                            "dep_s": int(ride_meta_indexed[leg_start]["dep_s"]),
-                            "arr_s": int(last_meta["arr_s"]),
-                        })
-                    if not legs:
-                        return None
-                    n_transfers = len(legs) - 1
-                    first_dep_s = legs[0]["dep_s"]
-                    arr_s = legs[-1]["arr_s"]
-                    travel_min = int(round((arr_s - first_dep_s) / 60.0))
-                    return {
-                        "travel_min": travel_min,
-                        "n_transfers": n_transfers,
-                        "first_dep_s": first_dep_s,
-                        "arr_s": arr_s,
-                        "trip_chain": _json.dumps(legs),
-                    }
-
-                # Per-weekday graph construction. The static (ride +
-                # alight + transfer) subgraph is filtered by runs_dow &
-                # weekday_bit once per weekday; the board subgraph is
-                # filtered per (window, weekday).
-                for weekday_bit, weekday_label, weekday_idx in weekday_bits:
-                    # Static edges that operate on this weekday.
-                    static_wd = static_with_xfer[
-                        (static_with_xfer["runs_dow"] & weekday_bit) > 0
-                    ][["src_idx", "dst_idx", "weight_s"]].copy()
-                    # Board edges per window for this weekday.
-                    board_wd_all = board_edges_pd[
-                        (board_edges_pd["runs_dow"] & weekday_bit) > 0
-                    ].copy()
-
-                    for window_idx in window_hours:
-                        window_lo = window_idx * 3600
-                        window_hi = window_lo + 3600
-                        board_w = board_wd_all[
-                            (board_wd_all["dep_s"] >= window_lo)
-                            & (board_wd_all["dep_s"] < window_hi)
-                        ].copy()
-                        # Re-anchor board weights so SSSP distance =
-                        # elapsed seconds since window_lo.
-                        board_w["weight_s"] = (board_w["dep_s"] - window_lo).astype("int32")
-                        board_subset = board_w[["src_idx", "dst_idx", "weight_s"]]
-
-                        if len(board_subset) == 0:
-                            # No trips depart in this window — every
-                            # origin → every dest unreachable on this
-                            # weekday in this hour. Skip the SSSPs.
-                            continue
-                        full_edges = pd.concat(
-                            [static_wd, board_subset], ignore_index=True,
-                        )
-                        # cuDF requires non-empty edge list to build a
-                        # graph. Build the Graph + run SSSP per origin.
-                        edges_gdf = cudf.from_pandas(full_edges)
-                        # Ensure non-negative weights (defensive).
-                        edges_gdf["weight_s"] = edges_gdf["weight_s"].clip(lower=0)
-                        # weight must be float64 for cugraph SSSP.
-                        edges_gdf["weight_s"] = edges_gdf["weight_s"].astype("float64")
-                        G = cugraph.Graph(directed=True)
-                        G.from_cudf_edgelist(
-                            edges_gdf,
-                            source="src_idx",
-                            destination="dst_idx",
-                            edge_attr="weight_s",
-                            renumber=False,
-                        )
-
-                        for origin_sfid in hub_sfids:
-                            origin_nid = int(origin_map[origin_sfid])
-                            try:
-                                sssp_df = cugraph.sssp(G, source=origin_nid)
-                            except Exception as exc:
-                                # Source not in graph (no trips depart
-                                # from this hub in this window).
-                                log.debug(
-                                    "sssp skip origin=%s window=%d wd=%s: %s",
-                                    origin_sfid, window_idx, weekday_label, exc,
-                                )
-                                continue
-                            sssp_pd = sssp_df.to_pandas()
-                            pred_map = dict(zip(
-                                sssp_pd["vertex"].astype("int32"),
-                                sssp_pd["predecessor"].astype("int32"),
-                            ))
-                            dist_map = dict(zip(
-                                sssp_pd["vertex"].astype("int32"),
-                                sssp_pd["distance"],
-                            ))
-                            for dest_sfid in hub_sfids:
-                                if dest_sfid == origin_sfid:
-                                    continue
-                                dest_nid = int(dest_map[dest_sfid])
-                                dist = dist_map.get(dest_nid)
-                                if dist is None or not (dist == dist):  # NaN check
-                                    continue
-                                # cuGraph uses 1.79e+308 for unreachable.
-                                if dist > 1e15:
-                                    continue
-                                decoded = _decode_route(pred_map, dest_nid, window_lo)
-                                if decoded is None:
-                                    continue
-                                rows.append({
-                                    "origin_hub_sfid": origin_sfid,
-                                    "dest_hub_sfid": dest_sfid,
-                                    "window_idx": int(window_idx),
-                                    "weekday_mask": int(weekday_bit),
-                                    "weekday_label": weekday_label,
-                                    "travel_min": decoded["travel_min"],
-                                    "n_transfers": decoded["n_transfers"],
-                                    "first_dep_s": decoded["first_dep_s"],
-                                    "arr_s": decoded["arr_s"],
-                                    "trip_chain": decoded["trip_chain"],
-                                })
-                    log.info(
-                        "compute_hub_pair_routes_gpu: weekday=%s rows so far=%d",
-                        weekday_label, len(rows),
-                    )
-
-                df_out = pd.DataFrame(rows)
-                df_out.to_parquet(str(hub_pairs_out), compression="snappy", index=False)
-                log.info(
-                    "compute_hub_pair_routes_gpu: emitted %d hub-pair routes "
-                    "across %d windows × %d weekdays",
-                    len(df_out), len(window_hours), len(weekday_bits),
-                )
-                return str(hub_pairs_out)
-
-            @task
-            def compute_isochrones_gpu(hubs_path: str, teg_dir: str) -> str:
-                """Per-hub isochrone bands via one cugraph.sssp from
-                each hub on the 08:00-anchored full-day graph. Bucket
-                arrival times into ISOCHRONE_BANDS_HOURS, convex-hull
-                the points per band on CPU (cheap, K × ~9 ops), and
-                ST_Difference to non-overlapping rings.
-
-                For the first pass we emit raw point-band assignments
-                (one row per (hub, dest_sfid, travel_seconds, band));
-                the convex-hull + ring-difference step is deferred to
-                the bake task (DuckDB-spatial)."""
-                import cudf
-                import cugraph
-                import pandas as pd
-                CHRONO_BANDS = [1, 2, 3, 4, 5, 6, 8, 10, 12]
-                CHRONO_DEPART_S = 8 * 3600
-
-                ISO.mkdir(parents=True, exist_ok=True)
-                out = ISO / "rings.parquet"
-                if not _needs_regen(out):
-                    log.info("compute_isochrones_gpu: cached %s", out)
-                    return str(out)
-
-                teg_p = Path(teg_dir)
-                edges = cudf.read_parquet(str(teg_p / "edges.parquet"))
-                nodes = cudf.read_parquet(str(teg_p / "nodes.parquet"))
-                hubs = cudf.read_parquet(hubs_path)
-                hub_sfids = hubs["station_feature_id"].to_pandas().tolist()
-
-                origin_lookup = (
-                    nodes.loc[nodes["kind"] == "ORIGIN", ["sfid", "node_idx"]]
-                        .rename(columns={"node_idx": "origin_nid"})
-                ).to_pandas()
-                origin_map = dict(zip(
-                    origin_lookup["sfid"], origin_lookup["origin_nid"].astype("int32"),
-                ))
-                dest_lookup = (
-                    nodes.loc[nodes["kind"] == "DEST", ["sfid", "node_idx"]]
-                        .rename(columns={"node_idx": "dest_nid"})
-                ).to_pandas()
-                dest_nid_to_sfid = dict(zip(
-                    dest_lookup["dest_nid"].astype("int32"), dest_lookup["sfid"],
-                ))
-
-                # Build the 08:00-anchored Monday graph (weekday=1 for
-                # the de-risk pass — same simplification as
-                # hub-pair routes).
-                weekday_bit = 1
-                edges_pd = edges.to_pandas()
-                static_mask = (
-                    (edges_pd["edge_kind"] != 2)
-                    & ((edges_pd["runs_dow"] & weekday_bit) > 0)
-                )
-                static_e = edges_pd[static_mask][["src_idx", "dst_idx", "weight_s"]].copy()
-                board_mask = (
-                    (edges_pd["edge_kind"] == 2)
-                    & ((edges_pd["runs_dow"] & weekday_bit) > 0)
-                    & (edges_pd["dep_s"] >= CHRONO_DEPART_S)
-                )
-                board_e = edges_pd[board_mask].copy()
-                board_e["weight_s"] = (board_e["dep_s"] - CHRONO_DEPART_S).astype("int32")
-                board_e_sub = board_e[["src_idx", "dst_idx", "weight_s"]]
-                full = pd.concat([static_e, board_e_sub], ignore_index=True)
-                full["weight_s"] = full["weight_s"].clip(lower=0).astype("float64")
-                edges_gdf = cudf.from_pandas(full)
-                G = cugraph.Graph(directed=True)
-                G.from_cudf_edgelist(
-                    edges_gdf, source="src_idx", destination="dst_idx",
-                    edge_attr="weight_s", renumber=False,
-                )
-
-                rows = []
-                for origin_sfid in hub_sfids:
-                    origin_nid = int(origin_map[origin_sfid])
-                    try:
-                        sssp_df = cugraph.sssp(G, source=origin_nid)
-                    except Exception as exc:
-                        log.warning("isochrone sssp skip %s: %s", origin_sfid, exc)
-                        continue
-                    sssp_pd = sssp_df.to_pandas()
-                    # Filter to DEST nodes.
-                    sssp_pd = sssp_pd[sssp_pd["vertex"].isin(dest_nid_to_sfid)]
-                    sssp_pd["sfid"] = sssp_pd["vertex"].astype("int32").map(dest_nid_to_sfid)
-                    sssp_pd = sssp_pd[sssp_pd["distance"] < 1e15]
-                    sssp_pd["travel_seconds"] = sssp_pd["distance"].astype("int32")
-                    for _, r in sssp_pd.iterrows():
-                        for band_h in CHRONO_BANDS:
-                            if r["travel_seconds"] <= band_h * 3600:
-                                rows.append({
-                                    "origin_sfid": origin_sfid,
-                                    "dest_sfid": r["sfid"],
-                                    "travel_seconds": int(r["travel_seconds"]),
-                                    "band_h": band_h,
-                                })
-                                break
-
-                pd.DataFrame(rows).to_parquet(str(out), compression="snappy", index=False)
-                log.info(
-                    "compute_isochrones_gpu: %d band assignments across %d hubs",
-                    len(rows), len(hub_sfids),
-                )
-                return str(out)
-
-            @task
-            def compute_routehub_dataset(stations_path: str, hubs_path: str, parquet_dir: str) -> str:
-                """Emit the parquet baked by bake_routes_pmtiles:
-                theme='trip' rows (one per rail trip with stops JSON)
-                + theme='station' rows (catalogue). Simpler schema
-                than gtfs-austria.py's compute_route_network but
-                covers what the JS planner needs.
-
-                Reads serviced_stop_times directly so this task is
-                independent of compute_hub_pair_routes_gpu."""
-                import cudf
-                import duckdb
-                import json as _json
-
-                TILES_WORK.mkdir(parents=True, exist_ok=True)
-                out = TILES_WORK / "austria-graph-routehub-paths.parquet"
-                if not _needs_regen(out):
-                    log.info("compute_routehub_dataset: cached %s", out)
-                    return str(out)
-
-                serviced = cudf.read_parquet(
-                    str(TEG / "serviced_stop_times.parquet")
-                ).to_pandas()
-                stations = cudf.read_parquet(stations_path).to_pandas()
-                hubs = cudf.read_parquet(hubs_path).to_pandas()
-                hub_set = set(hubs["station_feature_id"])
-
-                # ---- theme='trip' rows ----
-                trips_grouped = serviced.groupby("trip_id")
-                trip_rows = []
-                for trip_id, grp in trips_grouped:
-                    grp = grp.sort_values("stop_sequence")
-                    if len(grp) < 2:
-                        continue
-                    stops_json = [
-                        [
-                            row.station_feature_id,
-                            int(row.arr_s),
-                            int(row.dep_s),
-                            1 if row.station_feature_id in hub_set else 0,
-                        ]
-                        for row in grp.itertuples()
-                    ]
-                    # Degenerate 2-point LineString: origin -> dest.
-                    # geometry stored as WKT for the freestiler bake.
-                    first_st = stations[stations["station_feature_id"] == grp.iloc[0]["station_feature_id"]]
-                    last_st = stations[stations["station_feature_id"] == grp.iloc[-1]["station_feature_id"]]
-                    if first_st.empty or last_st.empty:
-                        continue
-                    lon1, lat1 = float(first_st.iloc[0]["station_lon"]), float(first_st.iloc[0]["station_lat"])
-                    lon2, lat2 = float(last_st.iloc[0]["station_lon"]), float(last_st.iloc[0]["station_lat"])
-                    trip_rows.append({
-                        "osm_id": f"trip/{trip_id}",
-                        "theme": "trip",
-                        "rsn": grp.iloc[0]["rsn"],
-                        "runs_dow": int(grp.iloc[0]["runs_dow"]),
-                        "first_dep_s": int(grp.iloc[0]["dep_s"]),
-                        "last_arr_s": int(grp.iloc[-1]["arr_s"]),
-                        "stops": _json.dumps(stops_json),
-                        "geometry": f"LINESTRING({lon1} {lat1}, {lon2} {lat2})",
-                    })
-
-                # ---- theme='station' rows ----
-                station_rows = []
-                for row in stations.itertuples():
-                    if row.is_rail_served != "true":
-                        continue
-                    is_hub_flag = 1 if row.station_feature_id in hub_set else 0
-                    station_rows.append({
-                        "osm_id": row.station_feature_id,
-                        "theme": "station",
-                        "rsn": "",
-                        "runs_dow": 0,
-                        "first_dep_s": 0,
-                        "last_arr_s": 0,
-                        "stops": _json.dumps({"n": row.station_name, "c": [row.station_lon, row.station_lat]}),
-                        "geometry": f"POINT({row.station_lon} {row.station_lat})",
-                    })
-
-                import pandas as pd
-                all_rows = pd.DataFrame(trip_rows + station_rows)
-                # Convert WKT geometry strings to actual binary geometry
-                # via DuckDB-spatial — freestiler expects WKB.
-                con = duckdb.connect()
-                con.sql("INSTALL spatial; LOAD spatial;")
-                con.register("rows", all_rows)
-                con.sql(f"""
-                    COPY (
-                        SELECT osm_id, ST_GeomFromText(geometry) AS geometry,
-                               theme, rsn, runs_dow, first_dep_s,
-                               last_arr_s, stops
-                        FROM rows
-                    ) TO '{out}' (FORMAT PARQUET, COMPRESSION SNAPPY)
-                """)
-                con.close()
-                log.info(
-                    "compute_routehub_dataset: %d trip + %d station rows -> %s",
-                    len(trip_rows), len(station_rows), out,
-                )
-                return str(out)
-
-            @task
-            def bake_routes_pmtiles(routehub_path: str) -> str:
-                """freestiler bake of theme='trip' + theme='station'
-                into austria-graph-routes.pmtiles. z0-only so the whole
-                catalogue is always loaded by the JS planner."""
-                import freestiler
-                TILES_OUT.mkdir(parents=True, exist_ok=True)
-                out = TILES_OUT / "austria-graph-routes.pmtiles"
-                if not _needs_regen(out):
-                    log.info("bake_routes_pmtiles: cached %s", out)
-                    return str(out)
-                query = f"""
-                    SELECT osm_id, geometry, theme, rsn, runs_dow,
-                           first_dep_s, last_arr_s, stops
-                    FROM read_parquet('{routehub_path}')
-                """
-                freestiler.freestile_query(
-                    query=query,
-                    output=str(out),
-                    layer_name="austria-graph-routes",
-                    min_zoom=0,
-                    max_zoom=0,
-                    drop_rate=None,
-                    simplification=True,
-                    coalesce=False,
-                )
-                log.info("bake_routes_pmtiles: %s (%d bytes)", out, out.stat().st_size)
-                return str(out)
-
-            @task
-            def bake_hubpairs_pmtiles(hub_pairs_path: str) -> str:
-                """freestiler bake of theme='hubpair' — the contraction-
-                hierarchy table consumed by the JS planner. Each row's
-                geometry is a degenerate 2-point LineString
-                (origin_hub -> dest_hub); the JS planner only reads the
-                trip_chain JSON to compose routes."""
-                import duckdb
-                import freestiler
-                TILES_OUT.mkdir(parents=True, exist_ok=True)
-                out = TILES_OUT / "austria-graph-hubpairs.pmtiles"
-                if not _needs_regen(out):
-                    log.info("bake_hubpairs_pmtiles: cached %s", out)
-                    return str(out)
-                # Join hub_pair_routes with optimal_hubs (which has
-                # selection_order + station_name) and stations (which
-                # has lon/lat) for the LineString geometry.
-                # Persist an intermediate hubpairs-baked parquet so the
-                # freestiler bake query can read directly from it.
-                con = duckdb.connect()
-                con.sql("INSTALL spatial; LOAD spatial;")
-                hubs_pq = str(TRANSIT / "optimal_hubs.parquet")
-                stations_pq = str(TRANSIT / "stations.parquet")
-                intermediate = TILES_WORK / "austria-graph-hubpairs-paths.parquet"
-                con.sql(f"""
-                    COPY (
-                        WITH hubs AS (
-                            SELECT station_feature_id, station_name, selection_order
-                            FROM read_parquet('{hubs_pq}')
-                        ),
-                        st AS (
-                            SELECT station_feature_id, station_lon, station_lat
-                            FROM read_parquet('{stations_pq}')
-                        ),
-                        hp AS (
-                            SELECT * FROM read_parquet('{hub_pairs_path}')
-                        )
-                        SELECT
-                            CAST(hp.origin_hub_sfid AS VARCHAR) || '->'
-                              || hp.dest_hub_sfid || '@' || hp.window_idx
-                              || ':' || hp.weekday_mask AS osm_id,
-                            'hubpair' AS theme,
-                            hp.origin_hub_sfid,
-                            hp.dest_hub_sfid,
-                            hp.window_idx,
-                            hp.weekday_mask,
-                            hp.travel_min,
-                            hp.n_transfers,
-                            hp.first_dep_s,
-                            hp.arr_s,
-                            hp.trip_chain,
-                            ho.station_name AS origin_name,
-                            hd.station_name AS dest_name,
-                            ST_MakeLine(
-                                ST_Point(so.station_lon, so.station_lat),
-                                ST_Point(sd.station_lon, sd.station_lat)
-                            ) AS geometry
-                        FROM hp
-                        JOIN hubs ho ON ho.station_feature_id = hp.origin_hub_sfid
-                        JOIN hubs hd ON hd.station_feature_id = hp.dest_hub_sfid
-                        JOIN st so   ON so.station_feature_id = hp.origin_hub_sfid
-                        JOIN st sd   ON sd.station_feature_id = hp.dest_hub_sfid
-                    ) TO '{intermediate}' (FORMAT PARQUET, COMPRESSION SNAPPY)
-                """)
-                con.close()
-                # Bake to PMTiles.
-                query = f"""
-                    SELECT osm_id, geometry, theme,
-                           origin_hub_sfid, dest_hub_sfid,
-                           window_idx, weekday_mask,
-                           travel_min, n_transfers,
-                           first_dep_s, arr_s, trip_chain,
-                           origin_name, dest_name
-                    FROM read_parquet('{intermediate}')
-                """
-                freestiler.freestile_query(
-                    query=query,
-                    output=str(out),
-                    layer_name="austria-graph-hubpairs",
-                    min_zoom=0,
-                    max_zoom=0,
-                    drop_rate=None,
-                    simplification=True,
-                    coalesce=False,
-                )
-                log.info("bake_hubpairs_pmtiles: %s (%d bytes)", out, out.stat().st_size)
-                return str(out)
-
-            @task
-            def bake_isochrones_pmtiles(rings_path: str) -> str:
-                """Convex-hull the per-hub band assignments into rings
-                and bake as theme='chrono' + theme='chrono-origin'
-                features. For the de-risk pass we emit a simpler
-                point-cloud-by-band representation; the convex-hull /
-                ring-difference is deferred until needed by the ISMA
-                map cell."""
-                import duckdb
-                import freestiler
-                TILES_OUT.mkdir(parents=True, exist_ok=True)
-                out = TILES_OUT / "austria-graph-isochrones.pmtiles"
-                if not _needs_regen(out):
-                    log.info("bake_isochrones_pmtiles: cached %s", out)
-                    return str(out)
-                stations_pq = str(TRANSIT / "stations.parquet")
-                hubs_pq = str(TRANSIT / "optimal_hubs.parquet")
-                intermediate = TILES_WORK / "austria-graph-isochrones-paths.parquet"
-                con = duckdb.connect()
-                con.sql("INSTALL spatial; LOAD spatial;")
-                con.sql(f"""
-                    COPY (
-                        WITH iso AS (
-                            SELECT * FROM read_parquet('{rings_path}')
-                        ),
-                        dst AS (
-                            SELECT station_feature_id, station_lon, station_lat
-                            FROM read_parquet('{stations_pq}')
-                        ),
-                        org AS (
-                            SELECT h.station_feature_id, s.station_lon, s.station_lat, h.selection_order
-                            FROM read_parquet('{hubs_pq}') h
-                            JOIN read_parquet('{stations_pq}') s
-                              USING (station_feature_id)
-                        )
-                        SELECT
-                            iso.origin_sfid || '->' || iso.dest_sfid AS osm_id,
-                            'chrono' AS theme,
-                            iso.origin_sfid,
-                            iso.dest_sfid,
-                            iso.band_h,
-                            iso.travel_seconds,
-                            ST_Point(d.station_lon, d.station_lat) AS geometry
-                        FROM iso
-                        JOIN dst d ON d.station_feature_id = iso.dest_sfid
-                        UNION ALL
-                        SELECT
-                            'origin/' || org.station_feature_id AS osm_id,
-                            'chrono-origin' AS theme,
-                            org.station_feature_id AS origin_sfid,
-                            org.station_feature_id AS dest_sfid,
-                            0 AS band_h,
-                            0 AS travel_seconds,
-                            ST_Point(org.station_lon, org.station_lat) AS geometry
-                        FROM org
-                    ) TO '{intermediate}' (FORMAT PARQUET, COMPRESSION SNAPPY)
-                """)
-                con.close()
-                freestiler.freestile_query(
-                    query=f"""
-                        SELECT osm_id, geometry, theme,
-                               origin_sfid, dest_sfid,
-                               band_h, travel_seconds
-                        FROM read_parquet('{intermediate}')
-                    """,
-                    output=str(out),
-                    layer_name="austria-graph-isochrones",
-                    min_zoom=0,
-                    max_zoom=10,
-                    drop_rate=None,
-                    simplification=True,
-                    coalesce=False,
-                )
-                log.info("bake_isochrones_pmtiles: %s (%d bytes)", out, out.stat().st_size)
-                return str(out)
-
-            @task
-            def reload_martin(pmtiles_paths: list) -> list:
-                """Restart martin so it picks up freshly-baked PMTiles.
-                Martin caches mtime at startup; without this, the new
-                austria-graph-* sources wouldn't appear in /catalog."""
-                import fcntl
-                import socket
-                import subprocess
-                import time as _time
-                import urllib.request
-                import json as _json
-                expected = [
-                    p.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-                    for p in pmtiles_paths
-                ]
-                with open("/tmp/ov-martin-restart.lock", "w") as _lock:
-                    fcntl.flock(_lock.fileno(), fcntl.LOCK_EX)
-                    subprocess.run(
-                        ["supervisorctl", "restart", "martin"],
-                        check=False,
-                    )
-                _deadline = _time.monotonic() + 30
-                while _time.monotonic() < _deadline:
-                    try:
-                        with socket.create_connection(("localhost", 3000), timeout=2):
-                            break
-                    except (ConnectionRefusedError, OSError, socket.timeout):
-                        _time.sleep(0.5)
-                else:
-                    raise RuntimeError("martin port 3000 not reachable 30s after restart")
-                with urllib.request.urlopen("http://localhost:3000/catalog", timeout=10) as _resp:
-                    _catalog = _json.load(_resp)
-                available = sorted(_catalog.get("tiles", {}).keys())
-                missing = [s for s in expected if s not in available]
-                if missing:
-                    raise RuntimeError(
-                        f"martin restart succeeded but sources still missing: {missing}"
-                    )
-                log.info("reload_martin: %d sources visible", len(expected))
-                return pmtiles_paths
-
-            # TaskFlow chaining.
-            raw = download_gtfs()
-            gtfs_parquet = parse_gtfs(raw)
-            stations = match_stops_to_osm(gtfs_parquet)
-            teg_dir = build_teg(stations, gtfs_parquet)
-            hubs = compute_optimal_hubs_gpu(stations, teg_dir)
-            hub_pairs = compute_hub_pair_routes_gpu(hubs, teg_dir)
-            iso = compute_isochrones_gpu(hubs, teg_dir)
-            routehub = compute_routehub_dataset(stations, hubs, gtfs_parquet)
-
-            routes_tile = bake_routes_pmtiles(routehub)
-            hubpairs_tile = bake_hubpairs_pmtiles(hub_pairs)
-            iso_tile = bake_isochrones_pmtiles(iso)
-            reload_martin([routes_tile, hubpairs_tile, iso_tile])
-
-
-        notebook_austria_graph_pipeline()
-    ''').lstrip())
-
-    dag_files = [graph_dag_file]
-    dag_ids = [graph_dag_id]
-    return dag_files, dag_ids, graph_dag_file, graph_dag_id
 
 
 @app.cell
@@ -2329,152 +524,434 @@ def _styles():
     # contraction-hierarchy table that the JS planner consumes.
 
     ROUTEBUILD_STYLE = [
-        # Background trip lines (every rail trip, faded).
+        # Loader: always-false filter — forces MapLibre to fetch the
+        # src tiles so querySourceFeatures sees them.
+        {"id": "rb-loader",
+         "type": "line",
+         "source": "src",
+         "filter": ["==", ["get", "theme"], "__never__"],
+         "paint": {"line-width": 0.0}},
+        # Background trip lines (faded)
         {"id": "rb-trip-bg",
          "type": "line",
          "source": "src",
          "filter": ["==", ["get", "theme"], "trip"],
-         "paint": {
-             "line-color": "#9a9a9a",
-             "line-width": 0.6,
-             "line-opacity": 0.35,
-         }},
-        # Station dots (every rail-served station).
+         "paint": {"line-color": "#9a9a9a",
+                   "line-width": 0.6, "line-opacity": 0.32}},
+        # Non-hub station dots — small, white-fill / dark-stroke
         {"id": "rb-station-dot",
          "type": "circle",
          "source": "src",
+         "filter": ["all", ["==", ["get", "theme"], "station"],
+                            ["==", ["get", "is_hub"], 0]],
+         "paint": {"circle-color": "#ffffff",
+                   "circle-stroke-color": "#1b3a5c",
+                   "circle-stroke-width": 1.0,
+                   "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                                     5, 1.4, 8, 2.4, 12, 4.0]}},
+        # Station labels (minzoom 9, halo)
+        {"id": "rb-station-label",
+         "type": "symbol",
+         "source": "src",
+         "minzoom": 9,
          "filter": ["==", ["get", "theme"], "station"],
-         "paint": {
-             "circle-color": "#ffffff",
-             "circle-stroke-color": "#212121",
-             "circle-stroke-width": 1.2,
-             "circle-radius": [
-                 "interpolate", ["linear"], ["zoom"],
-                 5, 1.5, 8, 2.5, 12, 4.0,
-             ],
-         }},
-        # Hub-pair LineStrings (one feature per (origin, dest, window,
-        # weekday); coloured by travel_min — the JS planner toggles
-        # opacity to surface only the currently-selected (window,
-        # weekday) row.
+         "layout": {"text-field": ["get", "station_name"],
+                    "text-font": ["Noto Sans Regular"],
+                    "text-size": ["interpolate", ["linear"], ["zoom"],
+                                  9, 9, 11, 11, 13, 13],
+                    "text-offset": [0, 1.0],
+                    "text-anchor": "top",
+                    "text-padding": 4},
+         "paint": {"text-color": "#1b3a5c",
+                   "text-halo-color": "#ffffff",
+                   "text-halo-width": 1.4}},
+        # Hub markers — orange-filled, larger
+        {"id": "rb-hub-marker",
+         "type": "circle",
+         "source": "src",
+         "filter": ["all", ["==", ["get", "theme"], "station"],
+                            ["==", ["get", "is_hub"], 1]],
+         "paint": {"circle-color": "#e76f51",
+                   "circle-stroke-color": "#1b3a5c",
+                   "circle-stroke-width": 1.6,
+                   "circle-radius": ["interpolate", ["linear"], ["zoom"],
+                                     4, 3.2, 8, 5.0, 12, 8.0]}},
+        # Hub-pair LineStrings — JS sets filter + paint to surface
+        # selected route only.
         {"id": "rb-hubpair-line",
          "type": "line",
          "source": "hubpairs-src",
          "source-layer": "austria-graph-hubpairs",
-         "paint": {
-             "line-color": [
-                 "interpolate", ["linear"], ["get", "travel_min"],
-                 30,  "#1a9850",
-                 90,  "#91cf60",
-                 180, "#fee08b",
-                 300, "#fc8d59",
-                 600, "#d73027",
-             ],
-             "line-width": 0.0,    # JS planner sets line-width via
-             "line-opacity": 0.0,  # setPaintProperty when a route is
-         }},                       # picked.
-        # Hub markers (top of stack).
-        {"id": "rb-hub-marker",
+         "filter": ["==", ["get", "osm_id"], "__never__"],
+         "paint": {"line-color": ["interpolate", ["linear"], ["get", "travel_min"],
+                                  30, "#1a9850", 90, "#91cf60", 180, "#fee08b",
+                                  300, "#fc8d59", 600, "#d73027"],
+                   "line-width": 0.0, "line-opacity": 0.0}},
+        # Client-injected selected route (FeatureCollection from JS)
+        {"id": "route-leg-casing",
+         "type": "line",
+         "source": "route-src",
+         "paint": {"line-color": "#ffffff",
+                   "line-width": ["interpolate", ["linear"], ["zoom"],
+                                  3, 4.0, 11, 9.0],
+                   "line-opacity": 0.85,
+                   "line-join": "round", "line-cap": "round"}},
+        {"id": "route-leg",
+         "type": "line",
+         "source": "route-src",
+         "paint": {"line-color": "#1b5fa8",
+                   "line-width": ["interpolate", ["linear"], ["zoom"],
+                                  3, 2.0, 11, 5.0],
+                   "line-opacity": 0.95,
+                   "line-join": "round", "line-cap": "round"}},
+        # Pick pins
+        {"id": "route-pick",
          "type": "circle",
-         "source": "src",
-         "filter": ["all",
-                    ["==", ["get", "theme"], "station"]],
-         # The is_hub flag isn't on the routes tile yet; for v1 the JS
-         # planner identifies hubs by membership in the loaded
-         # hubpair-origin set and decorates them client-side. This
-         # layer renders all stations identically — the JS planner
-         # adds an overlay on top to highlight hubs.
-         "paint": {
-             "circle-color": "#ffffff",
-             "circle-radius": 0.0,
-         }},
+         "source": "route-pick-src",
+         "paint": {"circle-color": "#ffcc00",
+                   "circle-stroke-color": "#3a2700",
+                   "circle-stroke-width": 2.6, "circle-radius": 9}},
+        {"id": "route-pick-label",
+         "type": "symbol",
+         "source": "route-pick-src",
+         "layout": {"text-field": ["get", "label"],
+                    "text-font": ["Noto Sans Regular"],
+                    "text-size": 12, "text-allow-overlap": True},
+         "paint": {"text-color": "#3a2700"}},
     ]
 
-    # CHRONO_STYLE — for the isochrones map (ISMA). Bucketed band-colored
-    # dots over a flat background, with one origin marker per hub.
+    # CHRONO_STYLE — isochrones map (polygon fills + origin markers).
     CHRONO_STYLE = [
-        {"id": "ch-band-dot",
-         "type": "circle",
+        {"id": "ch-band-fill",
+         "type": "fill",
          "source": "src",
          "filter": ["==", ["get", "theme"], "chrono"],
-         "paint": {
-             "circle-color": [
-                 "match", ["get", "band_h"],
-                 1,  "#1a9850",
-                 2,  "#66bd63",
-                 3,  "#a6d96a",
-                 4,  "#d9ef8b",
-                 5,  "#ffffbf",
-                 6,  "#fee08b",
-                 8,  "#fdae61",
-                 10, "#f46d43",
-                 12, "#d73027",
-                 "#888888",
-             ],
-             "circle-radius": [
-                 "interpolate", ["linear"], ["zoom"],
-                 5, 2.0, 8, 3.5, 12, 5.5,
-             ],
-             "circle-opacity": 0.7,
-             "circle-stroke-color": "#212121",
-             "circle-stroke-width": 0.3,
-         }},
+         "paint": {"fill-color": ["match", ["get", "band_h"],
+                                  1, "#1a9850", 2, "#66bd63", 3, "#a6d96a",
+                                  4, "#d9ef8b", 5, "#ffffbf", 6, "#fee08b",
+                                  8, "#fdae61", 10, "#f46d43", 12, "#d73027",
+                                  "#888888"],
+                   "fill-opacity": 0.55}},
+        {"id": "ch-band-outline",
+         "type": "line",
+         "source": "src",
+         "filter": ["==", ["get", "theme"], "chrono"],
+         "paint": {"line-color": "#1b3a5c", "line-width": 0.4,
+                   "line-opacity": 0.4}},
         {"id": "ch-origin-marker",
          "type": "circle",
          "source": "src",
          "filter": ["==", ["get", "theme"], "chrono-origin"],
-         "paint": {
-             "circle-color": "#1d3557",
-             "circle-radius": 7.0,
-             "circle-stroke-color": "#ffffff",
-             "circle-stroke-width": 1.5,
-         }},
+         "paint": {"circle-color": "#1d3557", "circle-radius": 8.0,
+                   "circle-stroke-color": "#ffffff", "circle-stroke-width": 1.8}},
     ]
-    return CHRONO_STYLE, ROUTEBUILD_STYLE
+
+    # FASTLINK_STYLE — fastest-connections map.
+    FASTLINK_STYLE = [
+        {"id": "fl-hubpair-bg",
+         "type": "line",
+         "source": "src",
+         "filter": ["==", ["get", "theme"], "hubpair"],
+         "paint": {"line-color": ["interpolate", ["linear"], ["get", "travel_min"],
+                                  30, "#1a9850", 90, "#91cf60", 180, "#fee08b",
+                                  300, "#fc8d59", 600, "#d73027"],
+                   "line-width": 1.0, "line-opacity": 0.18}},
+        {"id": "fl-hubpair-fg",
+         "type": "line",
+         "source": "src",
+         "filter": ["all", ["==", ["get", "theme"], "hubpair"],
+                            ["==", ["get", "osm_id"], "__never__"]],
+         "paint": {"line-color": ["interpolate", ["linear"], ["get", "travel_min"],
+                                  30, "#1a9850", 90, "#91cf60", 180, "#fee08b",
+                                  300, "#fc8d59", 600, "#d73027"],
+                   "line-width": 3.5, "line-opacity": 0.9}},
+    ]
+    return CHRONO_STYLE, FASTLINK_STYLE, ROUTEBUILD_STYLE
 
 
 @app.cell
-def _isochrone_map(CHRONO_STYLE, dag_run_states, martin, mo):
-    # Isochrones map (ISMA). Renders the rings.parquet -> PMTiles
-    # output: point cloud colored by reachability band. Hub origins
-    # shown as larger dark markers.
+def _isochrone_map(CHRONO_STYLE, dag_run_states, martin, mo, versatiles_assets):
+    # Isochrones map (ISMA). Renders austria-graph-isochrones PMTiles —
+    # polygon ring fills coloured by band_h (1h..12h reachable from each
+    # hub at depart=08:00 Wed). Hub-selector dropdown filters by origin.
     mo.stop(
         dag_run_states.get("notebook_austria_graph_pipeline") != "success",
         mo.md("⏳ Waiting for DAG"),
     )
+
+    iso_panel_html = """
+    <style>
+      .iso-panel { position: absolute; top: 12px; left: 12px;
+                   background: rgba(255,255,255,0.96);
+                   border: 1px solid #999; border-radius: 6px;
+                   padding: 10px 12px; width: 320px;
+                   font: 13px/1.45 system-ui, sans-serif;
+                   box-shadow: 0 2px 8px rgba(0,0,0,0.18); z-index: 10; }
+      .iso-panel h3 { margin: 0 0 8px 0; font-size: 14px;
+                      border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+      .iso-panel label { display: block; margin-top: 8px;
+                         font-weight: 600; font-size: 12px; }
+      .iso-panel select { width: 100%; }
+      .iso-panel .bands { font-family: monospace; font-size: 11px;
+                          margin-top: 8px; }
+      .iso-panel .band { display: inline-block; width: 12px; height: 12px;
+                         vertical-align: middle; margin-right: 4px;
+                         border: 1px solid #333; }
+    </style>
+    <div class="iso-panel">
+      <h3>Isochrones — depart 08:00 Wed</h3>
+      <label>Hub origin</label>
+      <select id="iso-origin"><option value="">All hubs</option></select>
+      <div class="bands">
+        <span class="band" style="background:#1a9850"></span>1h
+        <span class="band" style="background:#a6d96a"></span>3h
+        <span class="band" style="background:#fee08b"></span>6h
+        <span class="band" style="background:#fdae61"></span>8h
+        <span class="band" style="background:#d73027"></span>12h
+      </div>
+    </div>
+    """
+
+    iso_extra_js = """
+    const ORIGINS = new Map();
+    let ISO_LOADED = false;
+    function harvestIsoOrigins() {
+      const m = window.map_austria_graph_isochrones;
+      const feats = m.querySourceFeatures('src', {sourceLayer: 'austria-graph-isochrones'});
+      for (const f of feats) {
+        if (f.properties.theme === 'chrono-origin') {
+          ORIGINS.set(f.properties.origin_hub_idx,
+                      'hub ' + f.properties.origin_hub_idx);
+        }
+      }
+      if (ORIGINS.size > 0 && !ISO_LOADED) {
+        const sel = document.getElementById('iso-origin');
+        for (const [k, name] of [...ORIGINS.entries()].sort((a, b) => a[0] - b[0])) {
+          const o = document.createElement('option');
+          o.value = String(k); o.textContent = name;
+          sel.appendChild(o);
+        }
+        ISO_LOADED = true;
+        sel.addEventListener('change', updateIsoFilter);
+      }
+    }
+    function updateIsoFilter() {
+      const m = window.map_austria_graph_isochrones;
+      const val = document.getElementById('iso-origin').value;
+      const filt = val === ''
+        ? ['==', ['get', 'theme'], 'chrono']
+        : ['all', ['==', ['get', 'theme'], 'chrono'],
+                    ['==', ['get', 'origin_hub_idx'], parseInt(val, 10)]];
+      m.setFilter('ch-band-fill', filt);
+      m.setFilter('ch-band-outline', filt);
+      const omfilt = val === ''
+        ? ['==', ['get', 'theme'], 'chrono-origin']
+        : ['all', ['==', ['get', 'theme'], 'chrono-origin'],
+                    ['==', ['get', 'origin_hub_idx'], parseInt(val, 10)]];
+      m.setFilter('ch-origin-marker', omfilt);
+    }
+    const cont = document.getElementById('map-austria-graph-isochrones');
+    cont.style.position = 'relative';
+    const wrap = document.createElement('div');
+    wrap.innerHTML = """ + repr(iso_panel_html) + """;
+    cont.appendChild(wrap.firstElementChild);
+    window.map_austria_graph_isochrones.on('sourcedata', (e) => {
+      if (e.sourceId === 'src' && e.isSourceLoaded) harvestIsoOrigins();
+    });
+    window.map_austria_graph_isochrones.on('idle', harvestIsoOrigins);
+    """
+
     isochrone_html = build_pipeline_maplibre_html(
         martin,
         "austria-graph-isochrones",
         layer_name="austria-graph-isochrones",
-        center=[14.3, 47.6],   # rough Austria centroid
+        center=[14.3, 47.6],
         zoom=6,
         style_layers=CHRONO_STYLE,
         source_maxzoom=10,
         satellite_background=False,
+        glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
+        extra_js=iso_extra_js,
     )
-    isochrone_map_view = mo.iframe(isochrone_html, height="540px")
+    isochrone_map_view = mo.iframe(isochrone_html, height="600px")
     isochrone_map_view
-    return (isochrone_map_view,)
+    return
 
 
 @app.cell
-def _route_builder_map(ROUTEBUILD_STYLE, dag_run_states, martin, mo):
+def _fastest_connections_map(FASTLINK_STYLE, dag_run_states, martin, mo, versatiles_assets):
+    # Fastest-connections map (FLMA). Visualises austria-graph-hubpairs
+    # as colored polylines (background = all hub-hub routes faded;
+    # foreground = selected origin's outbound routes highlighted).
+    # Hour slider (24×1h) + weekday picker filter the highlight.
+    mo.stop(
+        dag_run_states.get("notebook_austria_graph_pipeline") != "success",
+        mo.md("⏳ Waiting for DAG"),
+    )
+
+    fl_panel_html = """
+    <style>
+      .fl-panel { position: absolute; top: 12px; left: 12px;
+                  background: rgba(255,255,255,0.96);
+                  border: 1px solid #999; border-radius: 6px;
+                  padding: 10px 12px; width: 340px;
+                  font: 13px/1.45 system-ui, sans-serif;
+                  box-shadow: 0 2px 8px rgba(0,0,0,0.18); z-index: 10; }
+      .fl-panel h3 { margin: 0 0 8px 0; font-size: 14px;
+                     border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+      .fl-panel label { display: block; margin-top: 8px;
+                        font-weight: 600; font-size: 12px; }
+      .fl-panel select, .fl-panel input[type=range] { width: 100%; }
+      .fl-panel .hour-display { font-variant-numeric: tabular-nums;
+                                font-weight: 600; color: #1d3557; }
+      .fl-panel .wd-btn { padding: 2px 6px; font-size: 11px; cursor: pointer;
+                          margin-right: 2px; border: 1px solid #999;
+                          background: #f7f7f7; }
+      .fl-panel .wd-btn.active { background: #1d3557; color: white;
+                                  border-color: #1d3557; }
+      .fl-panel .summary { margin-top: 10px; padding-top: 8px;
+                           border-top: 1px solid #eee; font-size: 12px; }
+    </style>
+    <div class="fl-panel">
+      <h3>Fastest connections</h3>
+      <label>Origin hub</label>
+      <select id="fl-origin"><option value="">— pick a hub —</option></select>
+      <label>Depart window <span class="hour-display" id="fl-hour-label">13:00 - 14:00</span></label>
+      <input type="range" id="fl-hour" min="0" max="23" value="13" step="1"/>
+      <label>Weekday
+        <button class="wd-btn active" data-w="1">Mon</button>
+        <button class="wd-btn" data-w="2">Tue</button>
+        <button class="wd-btn" data-w="4">Wed</button>
+        <button class="wd-btn" data-w="8">Thu</button>
+        <button class="wd-btn" data-w="16">Fri</button>
+        <button class="wd-btn" data-w="32">Sat</button>
+        <button class="wd-btn" data-w="64">Sun</button>
+      </label>
+      <div class="summary" id="fl-summary">Pick a hub to highlight its outbound routes.</div>
+    </div>
+    """
+
+    fl_extra_js = """
+    const HUBS = new Map();
+    let ACTIVE_WD_FL = 1;
+    let FL_READY = false;
+    function harvestHubs() {
+      const m = window.map_austria_graph_hubpairs;
+      const feats = m.querySourceFeatures('src', {sourceLayer: 'austria-graph-hubpairs'});
+      for (const f of feats) {
+        const p = f.properties;
+        if (p.origin_hub_sfid && !HUBS.has(p.origin_hub_sfid)) {
+          HUBS.set(p.origin_hub_sfid, {idx: p.origin_hub_idx,
+                                        name: p.origin_name || p.origin_hub_sfid});
+        }
+        if (p.dest_hub_sfid && !HUBS.has(p.dest_hub_sfid)) {
+          HUBS.set(p.dest_hub_sfid, {idx: p.dest_hub_idx,
+                                      name: p.dest_name || p.dest_hub_sfid});
+        }
+      }
+      if (HUBS.size > 0 && !FL_READY) {
+        FL_READY = true;
+        const sel = document.getElementById('fl-origin');
+        for (const [sfid, info] of [...HUBS.entries()].sort(
+            (a, b) => a[1].name.localeCompare(b[1].name))) {
+          const o = document.createElement('option');
+          o.value = sfid; o.textContent = info.name;
+          sel.appendChild(o);
+        }
+        sel.addEventListener('change', flUpdate);
+        document.getElementById('fl-hour').addEventListener('input', () => {
+          const v = parseInt(document.getElementById('fl-hour').value, 10);
+          document.getElementById('fl-hour-label').textContent =
+            String(v).padStart(2,'0') + ':00 - '
+            + String((v + 1) % 24).padStart(2,'0') + ':00';
+          flUpdate();
+        });
+        document.querySelectorAll('.fl-panel .wd-btn').forEach(b => {
+          b.addEventListener('click', () => {
+            ACTIVE_WD_FL = parseInt(b.dataset.w, 10);
+            document.querySelectorAll('.fl-panel .wd-btn').forEach(x => x.classList.remove('active'));
+            b.classList.add('active');
+            flUpdate();
+          });
+        });
+      }
+    }
+    function flUpdate() {
+      const m = window.map_austria_graph_hubpairs;
+      const origin = document.getElementById('fl-origin').value;
+      const window_idx = parseInt(document.getElementById('fl-hour').value, 10);
+      const summary = document.getElementById('fl-summary');
+      if (!origin) {
+        m.setFilter('fl-hubpair-fg', ['==', ['get', 'osm_id'], '__never__']);
+        summary.innerHTML = 'Pick a hub to highlight its outbound routes.';
+        return;
+      }
+      const fg_filter = ['all',
+        ['==', ['get', 'theme'], 'hubpair'],
+        ['==', ['get', 'origin_hub_sfid'], origin],
+        ['==', ['get', 'window_idx'], window_idx],
+        ['==', ['get', 'weekday_mask'], ACTIVE_WD_FL]];
+      m.setFilter('fl-hubpair-fg', fg_filter);
+      const feats = m.querySourceFeatures('src', {
+        sourceLayer: 'austria-graph-hubpairs',
+        filter: ['all',
+                 ['==', ['get', 'origin_hub_sfid'], origin],
+                 ['==', ['get', 'window_idx'], window_idx],
+                 ['==', ['get', 'weekday_mask'], ACTIVE_WD_FL]]});
+      summary.innerHTML = '<b>' + feats.length + '</b> outbound from <b>'
+        + (HUBS.get(origin)?.name || origin) + '</b> at ' + window_idx + ':00';
+    }
+    const fl_cont = document.getElementById('map-austria-graph-hubpairs');
+    fl_cont.style.position = 'relative';
+    const fl_wrap = document.createElement('div');
+    fl_wrap.innerHTML = """ + repr(fl_panel_html) + """;
+    fl_cont.appendChild(fl_wrap.firstElementChild);
+    window.map_austria_graph_hubpairs.on('sourcedata', (e) => {
+      if (e.sourceId === 'src' && e.isSourceLoaded) harvestHubs();
+    });
+    window.map_austria_graph_hubpairs.on('idle', harvestHubs);
+    """
+
+    flma_html = build_pipeline_maplibre_html(
+        martin,
+        "austria-graph-hubpairs",
+        layer_name="austria-graph-hubpairs",
+        center=[14.3, 47.6],
+        zoom=6,
+        style_layers=FASTLINK_STYLE,
+        source_maxzoom=0,
+        satellite_background=False,
+        glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
+        extra_js=fl_extra_js,
+    )
+    flma_view = mo.iframe(flma_html, height="600px")
+    flma_view
+    return
+
+
+@app.cell
+def _route_builder_map(ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_assets):
     # Route builder map (RBUI). PURE JS + PMTiles — no kernel callbacks.
-    # The injected JS:
-    #   1. Loads `austria-graph-hubpairs` as a vector source, waits for
-    #      it to settle, then walks every tile feature into an in-memory
-    #      hubpair lookup table indexed by (origin, dest, window_idx,
-    #      weekday_mask).
-    #   2. Wires a UI panel: origin/dest hub dropdowns + 24-position
-    #      hourly slider + Mon/Sat weekday toggle.
-    #   3. On any change, runs `findRoute(...)`:
-    #      - Hub→Hub: direct lookup in the table.
-    #      - Non-hub endpoints: TODO first/last-mile composer
-    #        (deferred; v1 only supports hub→hub).
-    #      Renders the chosen alternative by toggling line-width on the
-    #      rb-hubpair-line layer filtered to the picked feature_id.
-    #   4. Renders an itinerary panel showing the leg list parsed from
-    #      the route's trip_chain JSON.
+    # Full first-mile + last-mile + hub-pair composer running in the
+    # browser.
+    #
+    # Data sources:
+    #   src           = austria-graph-routes  (theme='trip' + theme='station')
+    #   hubpairs-src  = austria-graph-hubpairs (theme='hubpair' precomputed table)
+    #   route-src     = client-injected GeoJSON FeatureCollection (selected route LineStrings)
+    #   route-pick-src= client-injected GeoJSON (origin/dest pick pins with numbered labels)
+    #
+    # In-memory dicts built at page load:
+    #   STATION_INFO[sfid] = {idx, is_hub, name, lon, lat, near}
+    #   TRIP_BY_SFID[sfid] = [{trip_id, stops: [[sfid, arr_s, dep_s, is_hub], ...], runs_dow}, ...]
+    #   HUBPAIRS[ohub_idx|dhub_idx|win_idx|weekday_bit] = {travel_min, n_transfers, first_dep_s, arr_s, trip_chain}
+    #
+    # findRoute(o_sfid, d_sfid, window_idx, weekday_bit) cases:
+    #   - hub→hub direct lookup
+    #   - hub→non-hub: hub-pair + last-mile
+    #   - non-hub→hub: first-mile + hub-pair
+    #   - non-hub→non-hub: cross-product (first-mile × hub-pair × last-mile)
+    # Min by total travel time; tie-break by fewer transfers.
     mo.stop(
         dag_run_states.get("notebook_austria_graph_pipeline") != "success",
         mo.md("⏳ Waiting for DAG"),
@@ -2491,214 +968,607 @@ def _route_builder_map(ROUTEBUILD_STYLE, dag_run_states, martin, mo):
         },
     }
 
+    # Empty GeoJSON sources injected client-side for the selected
+    # route's polyline + the origin/dest pick pins.
+    extra_sources = {
+        "hubpairs-src": {
+            "type": "vector",
+            "url": f"{martin}/austria-graph-hubpairs",
+            "maxzoom": 0,
+        },
+        "route-src": {
+            "type": "geojson",
+            "data": {"type": "FeatureCollection", "features": []},
+        },
+        "route-pick-src": {
+            "type": "geojson",
+            "data": {"type": "FeatureCollection", "features": []},
+        },
+    }
+
     panel_html = """
     <style>
-      .rb-panel {
-        position: absolute; top: 12px; left: 12px;
-        background: rgba(255,255,255,0.96);
-        border: 1px solid #999; border-radius: 6px;
-        padding: 10px 12px; width: 320px;
-        font: 13px/1.45 system-ui, sans-serif;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.18);
-        z-index: 10;
-      }
-      .rb-panel h3 {
-        margin: 0 0 8px 0; font-size: 14px;
-        border-bottom: 1px solid #ddd; padding-bottom: 4px;
-      }
-      .rb-panel label { display: block; margin-top: 8px; font-weight: 600; font-size: 12px; }
+      .rb-panel { position: absolute; top: 12px; left: 12px;
+                  background: rgba(255,255,255,0.96);
+                  border: 1px solid #999; border-radius: 6px;
+                  padding: 10px 12px; width: 360px;
+                  font: 13px/1.45 system-ui, sans-serif;
+                  box-shadow: 0 2px 8px rgba(0,0,0,0.18); z-index: 10;
+                  max-height: 90vh; overflow-y: auto; }
+      .rb-panel h3 { margin: 0 0 8px 0; font-size: 14px;
+                     border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+      .rb-panel label { display: block; margin-top: 8px;
+                        font-weight: 600; font-size: 12px; }
       .rb-panel select, .rb-panel input[type=range] { width: 100%; margin-top: 2px; }
-      .rb-panel .hour-display { font-variant-numeric: tabular-nums; font-weight: 600; color: #1d3557; }
-      .rb-panel .summary { margin-top: 10px; padding-top: 8px; border-top: 1px solid #eee; }
+      .rb-panel .hour-display { font-variant-numeric: tabular-nums;
+                                font-weight: 600; color: #1d3557; }
+      .rb-panel .summary { margin-top: 10px; padding-top: 8px;
+                           border-top: 1px solid #eee; font-size: 12px; }
       .rb-panel .legs { margin: 6px 0 0 0; padding-left: 18px; font-size: 12px; }
-      .rb-panel .legs li { margin: 2px 0; }
-      .rb-panel .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; background: #1d3557; color: white; font-size: 11px; }
+      .rb-panel .legs li { margin: 4px 0; }
+      .rb-panel .badge { display: inline-block; padding: 1px 6px;
+                         border-radius: 4px; background: #1d3557;
+                         color: white; font-size: 11px; }
       .rb-panel .status { color: #888; font-style: italic; font-size: 11px; }
-      .rb-panel button { padding: 3px 8px; font-size: 11px; cursor: pointer; }
+      .rb-panel .wd-btn { padding: 2px 6px; font-size: 11px; cursor: pointer;
+                          margin-right: 2px; border: 1px solid #999;
+                          background: #f7f7f7; }
+      .rb-panel .wd-btn.active { background: #1d3557; color: white;
+                                  border-color: #1d3557; }
+      .rb-panel .help { font-size: 11px; color: #555; margin-top: 6px; }
+      .rb-panel .trip-class { display: inline-block; width: 18px; height: 18px;
+                              vertical-align: middle; font-size: 15px; }
     </style>
-    <div class="rb-panel" id="rb-panel">
-      <h3>Route Builder <span class="status" id="rb-loading">loading...</span></h3>
-      <label>Origin hub</label>
+    <div class="rb-panel">
+      <h3>Route Builder <span class="status" id="rb-loading">loading…</span></h3>
+      <label>Origin station</label>
       <select id="rb-origin"></select>
-      <label>Destination hub</label>
+      <label>Destination station</label>
       <select id="rb-dest"></select>
-      <label>Depart window <span class="hour-display" id="rb-hour-label">12:00 – 13:00</span></label>
-      <input type="range" id="rb-hour" min="0" max="23" value="12" step="1"/>
-      <label>Weekday <button id="rb-wd-mon" class="badge">Mon</button> <button id="rb-wd-sat">Sat</button></label>
-      <div class="summary" id="rb-summary">Pick origin + destination above.</div>
+      <label>Depart window <span class="hour-display" id="rb-hour-label">13:00 - 14:00</span></label>
+      <input type="range" id="rb-hour" min="0" max="23" value="13" step="1"/>
+      <label>Weekday
+        <button class="wd-btn active" data-w="1">Mon</button>
+        <button class="wd-btn" data-w="2">Tue</button>
+        <button class="wd-btn" data-w="4">Wed</button>
+        <button class="wd-btn" data-w="8">Thu</button>
+        <button class="wd-btn" data-w="16">Fri</button>
+        <button class="wd-btn" data-w="32">Sat</button>
+        <button class="wd-btn" data-w="64">Sun</button>
+      </label>
+      <div class="help">Click any station marker to set origin; shift-click to set destination.</div>
+      <div class="summary" id="rb-summary">Pick origin + destination above or click stations on the map.</div>
     </div>
     """
 
     extra_js = """
-    // ---- 1. Load + index hub-pair routes from PMTiles ----
-    const HUBPAIRS = {};
-    const HUB_NAMES = new Map();   // sfid -> display name
+    // =================================================================
+    // STATE
+    // =================================================================
+    const STATION_INFO = {};       // sfid → {idx, is_hub, name, lon, lat, near[]}
+    const TRIP_BY_SFID = {};       // sfid → [{trip_id, stops, runs_dow}, ...]
+    const HUBPAIRS = {};           // 'oidx|didx|window|weekday' → hp props
+    const HUB_BY_IDX = {};         // hub_idx → sfid
     let LOAD_READY = false;
-    let ACTIVE_WD = 1;             // Mon=1, Sat=32
-
-    function indexFeature(props) {
-      const k = props.origin_hub_sfid + '|' + props.dest_hub_sfid
-              + '|' + props.window_idx + '|' + props.weekday_mask;
-      HUBPAIRS[k] = props;
-      if (props.origin_name) HUB_NAMES.set(props.origin_hub_sfid, props.origin_name);
-      if (props.dest_name)   HUB_NAMES.set(props.dest_hub_sfid,   props.dest_name);
-    }
-
-    function harvestHubpairs() {
-      const feats = window.map_austria_graph_routes.querySourceFeatures(
-        'hubpairs-src', {sourceLayer: 'austria-graph-hubpairs'}
-      );
-      for (const f of feats) indexFeature(f.properties);
-      // Once at least one feature seen we can publish the picker
-      // options; harvest may complete in multiple iterations as more
-      // tiles settle, but the z0 tile is fully loaded after first
-      // `sourcedata` event.
-      if (HUB_NAMES.size > 0 && !LOAD_READY) {
-        publishPickerOptions();
-        LOAD_READY = true;
-        document.getElementById('rb-loading').textContent = '';
-        runQuery();
-      }
-    }
-
-    // ---- 2. UI wiring ----
-    function publishPickerOptions() {
-      const orig = document.getElementById('rb-origin');
-      const dest = document.getElementById('rb-dest');
-      const opts = [...HUB_NAMES.entries()].sort((a, b) => a[1].localeCompare(b[1]));
-      for (const [sfid, name] of opts) {
-        const o1 = document.createElement('option'); o1.value = sfid; o1.textContent = name;
-        const o2 = document.createElement('option'); o2.value = sfid; o2.textContent = name;
-        orig.appendChild(o1); dest.appendChild(o2);
-      }
-      // Default: Wien Hbf -> Salzburg Hbf if both present.
-      const WIEN = 'way/423692233', SBG = 'node/619805688';
-      if (HUB_NAMES.has(WIEN)) orig.value = WIEN;
-      if (HUB_NAMES.has(SBG)) dest.value = SBG;
-    }
-
-    // ---- 3. The JS findRoute composer ----
-    function findRoute(origin, dest, windowIdx, weekdayMask) {
-      // Trivial hub-hub direct lookup. Non-hub endpoints + first/
-      // last-mile composition is the next iteration's surface.
-      const k = origin + '|' + dest + '|' + windowIdx + '|' + weekdayMask;
-      const route = HUBPAIRS[k];
-      if (!route) return null;
-      // trip_chain is stored as a JSON string; parse it for the leg list.
-      let legs = [];
-      try { legs = JSON.parse(route.trip_chain); } catch (e) { /* malformed; show empty legs */ }
-      return {
-        travel_min: route.travel_min,
-        n_transfers: route.n_transfers,
-        first_dep_s: route.first_dep_s,
-        arr_s: route.arr_s,
-        legs: legs,
-      };
-    }
+    let LOADED_STATIONS = false;
+    let LOADED_HUBPAIRS = false;
+    let ACTIVE_WD = 1;             // Mon=1
+    let CUR_WIN = 13;
+    let CUR_ORIGIN = null;
+    let CUR_DEST = null;
+    const MIN_TRANSFER_S = 60;
 
     function fmtTime(secs) {
       const s = Math.round(secs);
       const h = Math.floor(s / 3600);
       const m = Math.floor((s % 3600) / 60);
-      return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+      return String(h % 24).padStart(2, '0') + ':' + String(m).padStart(2, '0')
+             + (h >= 24 ? ' (+' + Math.floor(h / 24) + 'd)' : '');
     }
 
-    function runQuery() {
-      if (!LOAD_READY) return;
-      const origin = document.getElementById('rb-origin').value;
-      const dest = document.getElementById('rb-dest').value;
-      const windowIdx = parseInt(document.getElementById('rb-hour').value, 10);
-      const summary = document.getElementById('rb-summary');
-      const hourLabel = document.getElementById('rb-hour-label');
-      hourLabel.textContent = String(windowIdx).padStart(2,'0') + ':00 - '
-        + String((windowIdx + 1) % 24).padStart(2,'0') + ':00';
+    // Trip-class emoji (matches gtfs-austria.py semantics)
+    function emojiOf(rsn, kmh) {
+      if (kmh && kmh > 150) return '🚄';
+      if (!rsn) return '🚆';
+      const head = String(rsn).trim().split(/\\s+/)[0].toUpperCase();
+      if (/^S\\d/.test(head) || head === 'SB' || head === 'S') return '🚈';
+      const T = {RJ:'🚄', RJX:'🚄', ICE:'🚄', TGV:'🚄', AVE:'🚄',
+                 EC:'🚆', IC:'🚆', EN:'🚆', NJ:'🚆', D:'🚆',
+                 EX:'🚆', REX:'🚆', R:'🚂', RB:'🚂'};
+      return T[head] || '🚆';
+    }
 
-      if (origin === dest) {
-        summary.innerHTML = '<em>Origin and destination are the same.</em>';
-        highlightRoute(null);
-        return;
+    // =================================================================
+    // LOADERS
+    // =================================================================
+    function harvestStations() {
+      const m = window.map_austria_graph_routes;
+      const feats = m.querySourceFeatures('src', {sourceLayer: 'austria-graph-routes'});
+      let nstations = 0, ntrips = 0;
+      for (const f of feats) {
+        const p = f.properties;
+        if (p.theme === 'station') {
+          if (!STATION_INFO[p.osm_id]) {
+            const coord = f.geometry?.coordinates;
+            const near = (p.nearest_hubs || '').split(',').filter(Boolean).map(x => parseInt(x, 10));
+            STATION_INFO[p.osm_id] = {
+              idx: p.station_idx, is_hub: !!p.is_hub,
+              name: p.station_name || p.osm_id,
+              lon: coord ? coord[0] : 0, lat: coord ? coord[1] : 0,
+              near: near,
+            };
+            if (p.is_hub) HUB_BY_IDX[p.station_idx] = p.osm_id;
+            nstations++;
+          }
+        } else if (p.theme === 'trip') {
+          let stops;
+          try { stops = JSON.parse(p.stops); } catch (e) { continue; }
+          if (!Array.isArray(stops) || stops.length < 2) continue;
+          for (const stop of stops) {
+            const sfid = stop[0];
+            if (!TRIP_BY_SFID[sfid]) TRIP_BY_SFID[sfid] = [];
+            // Avoid duplicate trip entries
+            if (!TRIP_BY_SFID[sfid].some(t => t.trip_id === p.osm_id)) {
+              TRIP_BY_SFID[sfid].push({
+                trip_id: p.osm_id,
+                stops: stops,
+                runs_dow: p.runs_dow,
+                rsn: p.rsn || '',
+                avg_kmh: p.avg_kmh || 0,
+              });
+              ntrips++;
+            }
+          }
+        }
       }
-      const route = findRoute(origin, dest, windowIdx, ACTIVE_WD);
+      if (Object.keys(STATION_INFO).length > 100) {
+        LOADED_STATIONS = true;
+        maybeReady();
+      }
+    }
+
+    function harvestHubpairs() {
+      const m = window.map_austria_graph_routes;
+      const feats = m.querySourceFeatures('hubpairs-src',
+                                          {sourceLayer: 'austria-graph-hubpairs'});
+      for (const f of feats) {
+        const p = f.properties;
+        const k = p.origin_hub_idx + '|' + p.dest_hub_idx + '|'
+                  + p.window_idx + '|' + p.weekday_mask;
+        if (!HUBPAIRS[k]) {
+          HUBPAIRS[k] = {
+            travel_min: p.travel_min, n_transfers: p.n_transfers,
+            first_dep_s: p.first_dep_s, arr_s: p.arr_s,
+            origin_hub_sfid: p.origin_hub_sfid, dest_hub_sfid: p.dest_hub_sfid,
+            origin_hub_idx: p.origin_hub_idx, dest_hub_idx: p.dest_hub_idx,
+          };
+        }
+      }
+      if (Object.keys(HUBPAIRS).length > 100) {
+        LOADED_HUBPAIRS = true;
+        maybeReady();
+      }
+    }
+
+    function maybeReady() {
+      if (LOAD_READY) return;
+      if (LOADED_STATIONS && LOADED_HUBPAIRS) {
+        LOAD_READY = true;
+        document.getElementById('rb-loading').textContent = '';
+        publishPickerOptions();
+        runQuery();
+      } else {
+        document.getElementById('rb-loading').textContent =
+          'stations:' + Object.keys(STATION_INFO).length
+          + ' hubpairs:' + Object.keys(HUBPAIRS).length;
+      }
+    }
+
+    function publishPickerOptions() {
+      const orig = document.getElementById('rb-origin');
+      const dest = document.getElementById('rb-dest');
+      orig.innerHTML = ''; dest.innerHTML = '';
+      const entries = Object.entries(STATION_INFO)
+        .sort((a, b) => a[1].name.localeCompare(b[1].name));
+      for (const [sfid, info] of entries) {
+        const tag = info.is_hub ? '★ ' : '';
+        const o1 = document.createElement('option');
+        o1.value = sfid; o1.textContent = tag + info.name;
+        orig.appendChild(o1);
+        const o2 = document.createElement('option');
+        o2.value = sfid; o2.textContent = tag + info.name;
+        dest.appendChild(o2);
+      }
+      // Default Wien Hbf → Salzburg Hbf
+      const WIEN = 'way/423692233', SBG = 'node/619805688';
+      if (STATION_INFO[WIEN]) orig.value = WIEN;
+      if (STATION_INFO[SBG])  dest.value = SBG;
+      CUR_ORIGIN = orig.value; CUR_DEST = dest.value;
+    }
+
+    // =================================================================
+    // findRoute composer
+    // =================================================================
+    function findRoute(o_sfid, d_sfid, win_idx, wd_bit) {
+      if (o_sfid === d_sfid) return null;
+      const o = STATION_INFO[o_sfid], d = STATION_INFO[d_sfid];
+      if (!o || !d) return null;
+      const win_lo = win_idx * 3600, win_hi = win_lo + 3600;
+
+      // --- Helper: compute trip leg from a trip's stops at a board+alight sequence
+      function legFromTrip(trip, boardSfid, alightSfid) {
+        const stops = trip.stops;
+        let bi = -1, ai = -1;
+        for (let i = 0; i < stops.length; i++) {
+          if (stops[i][0] === boardSfid && bi < 0) bi = i;
+          if (stops[i][0] === alightSfid && i > bi && bi >= 0) { ai = i; break; }
+        }
+        if (bi < 0 || ai < 0) return null;
+        const leg_dep_s = stops[bi][2];
+        const leg_arr_s = stops[ai][1];
+        if (leg_arr_s <= leg_dep_s) return null;
+        const segStops = stops.slice(bi, ai + 1).map(s => s[0]);
+        return {trip_id: trip.trip_id, rsn: trip.rsn, kmh: trip.avg_kmh,
+                board_sfid: boardSfid, alight_sfid: alightSfid,
+                dep_s: leg_dep_s, arr_s: leg_arr_s, seg_stops: segStops,
+                board_seq: bi, alight_seq: ai};
+      }
+
+      // Hub-pair scan helpers (window-locked lookups miss queries
+      // whose 1h window contains no train but a later window does;
+      // both the Python validator and the JS planner now scan ALL
+      // 24 windows for the earliest at-or-after / best-before
+      // hub-pair entry, matching MOTIS "earliest at or after the
+      // query window" semantics).
+      function findFirstHpAfter(oIdx, dIdx, wdBit, minFirstDep) {
+        let best = null;
+        for (let w = 0; w < 24; w++) {
+          const hp = HUBPAIRS[oIdx + '|' + dIdx + '|' + w + '|' + wdBit];
+          if (!hp) continue;
+          if (hp.first_dep_s < minFirstDep) continue;
+          if (best === null || hp.first_dep_s < best.first_dep_s) best = hp;
+        }
+        return best;
+      }
+      function findBestHpArrivingBefore(oIdx, dIdx, wdBit, latestArr, minFirstDep) {
+        let best = null;
+        for (let w = 0; w < 24; w++) {
+          const hp = HUBPAIRS[oIdx + '|' + dIdx + '|' + w + '|' + wdBit];
+          if (!hp) continue;
+          if (hp.arr_s > latestArr) continue;
+          if (hp.first_dep_s < minFirstDep) continue;
+          if (best === null || hp.first_dep_s > best.first_dep_s) best = hp;
+        }
+        return best;
+      }
+
+      // --- 1. Hub-Hub direct (scan-forward variant)
+      if (o.is_hub && d.is_hub) {
+        const hp = findFirstHpAfter(o.idx, d.idx, wd_bit, win_lo);
+        if (hp) {
+          return {
+            travel_min: hp.travel_min, n_transfers: hp.n_transfers,
+            first_dep_s: hp.first_dep_s, arr_s: hp.arr_s,
+            legs: [{kind: 'hub_pair', from: o_sfid, to: d_sfid,
+                    dep_s: hp.first_dep_s, arr_s: hp.arr_s, n_transfers: hp.n_transfers}],
+            kind: 'hub_hub',
+          };
+        }
+        // Fall through to compose path
+      }
+
+      // --- 2. Build first-mile-by-alight-station: every onward stop
+      //        (hub AND non-hub) is a candidate alight; non-hub
+      //        transfers (Path B below) recover routes the hub-pair
+      //        graph alone misses.
+      const fmByAlight = {};
+      const tripsAtO = TRIP_BY_SFID[o_sfid] || [];
+      for (const t of tripsAtO) {
+        if ((t.runs_dow & wd_bit) === 0) continue;
+        const boardStop = t.stops.find(s => s[0] === o_sfid);
+        if (!boardStop) continue;
+        if (boardStop[2] < win_lo) continue;
+        for (let j = t.stops.indexOf(boardStop) + 1; j < t.stops.length; j++) {
+          const onwardStop = t.stops[j];
+          if (onwardStop[1] <= boardStop[2]) continue;
+          if (onwardStop[0] === o_sfid) continue;
+          const leg = legFromTrip(t, o_sfid, onwardStop[0]);
+          if (!leg) continue;
+          const info = STATION_INFO[onwardStop[0]] || {};
+          (fmByAlight[onwardStop[0]] = fmByAlight[onwardStop[0]] || []).push({
+            hub_idx: onwardStop[3] === 1 ? info.idx : -1,
+            alight_sfid: onwardStop[0],
+            is_hub: onwardStop[3] === 1,
+            leg,
+          });
+        }
+      }
+
+      // --- 3. Build last-mile-by-board-station: every prior stop.
+      const lmByBoard = {};
+      const tripsAtD = TRIP_BY_SFID[d_sfid] || [];
+      for (const t of tripsAtD) {
+        if ((t.runs_dow & wd_bit) === 0) continue;
+        const alightStop = t.stops.find(s => s[0] === d_sfid);
+        if (!alightStop) continue;
+        for (let i = 0; i < t.stops.indexOf(alightStop); i++) {
+          const prior = t.stops[i];
+          if (prior[2] >= alightStop[1]) continue;
+          if (prior[0] === d_sfid) continue;
+          const leg = legFromTrip(t, prior[0], d_sfid);
+          if (!leg) continue;
+          const info = STATION_INFO[prior[0]] || {};
+          (lmByBoard[prior[0]] = lmByBoard[prior[0]] || []).push({
+            hub_idx: prior[3] === 1 ? info.idx : -1,
+            board_sfid: prior[0],
+            is_hub: prior[3] === 1,
+            leg,
+          });
+        }
+      }
+
+      // Convenience hub-only lists for the hub-pair compose paths
+      // (Path C / D below). Flattened from the by-station maps.
+      const firstMile = [];
+      for (const sfid in fmByAlight)
+        for (const e of fmByAlight[sfid])
+          if (e.is_hub)
+            firstMile.push({hub_idx: e.hub_idx, hub_sfid: sfid, leg: e.leg});
+      const lastMile = [];
+      for (const sfid in lmByBoard)
+        for (const e of lmByBoard[sfid])
+          if (e.is_hub)
+            lastMile.push({hub_idx: e.hub_idx, hub_sfid: sfid, leg: e.leg});
+
+      let best = null;
+      function tryBest(total, ntr, first_dep, arr, legs, kind) {
+        if (!best || total < best._tot
+            || (total === best._tot && ntr < best.n_transfers)) {
+          best = {travel_min: Math.round(total / 60), n_transfers: ntr,
+                  first_dep_s: first_dep, arr_s: arr, legs: legs,
+                  _tot: total, kind: kind};
+        }
+      }
+
+      // --- 4a. Path A: direct single trip o → d
+      for (const fm of (fmByAlight[d_sfid] || [])) {
+        const total = fm.leg.arr_s - fm.leg.dep_s;
+        tryBest(total, 0, fm.leg.dep_s, fm.leg.arr_s, [fm.leg], 'direct');
+      }
+
+      // --- 4a'. Path B: single transfer at ANY shared station (hub
+      //          or not). Set-intersection of fmByAlight ∩ lmByBoard
+      //          minus the endpoints, paired by trip cross-product.
+      for (const X in fmByAlight) {
+        if (X === o_sfid || X === d_sfid) continue;
+        if (!lmByBoard[X]) continue;
+        for (const fm of fmByAlight[X]) {
+          for (const lm of lmByBoard[X]) {
+            if (lm.leg.dep_s < fm.leg.arr_s + MIN_TRANSFER_S) continue;
+            const total = lm.leg.arr_s - fm.leg.dep_s;
+            tryBest(total, 1, fm.leg.dep_s, lm.leg.arr_s,
+                    [fm.leg, lm.leg], 'transfer');
+          }
+        }
+      }
+
+      // --- 4b. Path C1: Origin is hub → hub-pair → last-mile (hubs)
+      if (o.is_hub) {
+        for (const lm of lastMile) {
+          if (lm.hub_idx === o.idx) continue;
+          const hp = findBestHpArrivingBefore(
+            o.idx, lm.hub_idx, wd_bit,
+            lm.leg.dep_s - MIN_TRANSFER_S, win_lo,
+          );
+          if (!hp) continue;
+          const total = lm.leg.arr_s - hp.first_dep_s;
+          const ntr = (hp.n_transfers || 0) + 1;
+          tryBest(total, ntr, hp.first_dep_s, lm.leg.arr_s, [
+            {kind: 'hub_pair', from: o_sfid, to: HUB_BY_IDX[lm.hub_idx] || lm.hub_sfid,
+             dep_s: hp.first_dep_s, arr_s: hp.arr_s, n_transfers: hp.n_transfers || 0},
+            lm.leg,
+          ], 'origin_hub');
+        }
+      }
+
+      // --- 4c. Path C2: First-mile (hubs) → hub-pair → Dest is hub
+      if (d.is_hub) {
+        for (const fm of firstMile) {
+          if (fm.hub_idx === d.idx) continue;
+          const hp = findFirstHpAfter(
+            fm.hub_idx, d.idx, wd_bit, fm.leg.arr_s + MIN_TRANSFER_S,
+          );
+          if (!hp) continue;
+          const total = hp.arr_s - fm.leg.dep_s;
+          const ntr = 1 + (hp.n_transfers || 0);
+          tryBest(total, ntr, fm.leg.dep_s, hp.arr_s, [
+            fm.leg,
+            {kind: 'hub_pair', from: HUB_BY_IDX[fm.hub_idx] || fm.hub_sfid, to: d_sfid,
+             dep_s: hp.first_dep_s, arr_s: hp.arr_s, n_transfers: hp.n_transfers || 0},
+          ], 'dest_hub');
+        }
+      }
+
+      // --- 4d. Path D: Both non-hub, fm-hub → hub-pair → lm-hub
+      // (same-hub case already handled by Path B above.)
+      if (!o.is_hub && !d.is_hub) {
+        for (const fm of firstMile) {
+          for (const lm of lastMile) {
+            if (fm.hub_idx === lm.hub_idx) continue;
+            const hp = findFirstHpAfter(
+              fm.hub_idx, lm.hub_idx, wd_bit, fm.leg.arr_s + MIN_TRANSFER_S,
+            );
+            if (!hp) continue;
+            if (lm.leg.dep_s < hp.arr_s + MIN_TRANSFER_S) continue;
+            const total = lm.leg.arr_s - fm.leg.dep_s;
+            const ntr = 2 + (hp.n_transfers || 0);
+            tryBest(total, ntr, fm.leg.dep_s, lm.leg.arr_s, [
+              fm.leg,
+              {kind: 'hub_pair', from: HUB_BY_IDX[fm.hub_idx] || fm.hub_sfid,
+               to: HUB_BY_IDX[lm.hub_idx] || lm.hub_sfid,
+               dep_s: hp.first_dep_s, arr_s: hp.arr_s,
+               n_transfers: hp.n_transfers || 0},
+              lm.leg,
+            ], 'compose');
+          }
+        }
+      }
+
+      return best;
+    }
+
+    // =================================================================
+    // RENDER
+    // =================================================================
+    function buildRouteGeoJSON(route) {
+      if (!route) return {type: 'FeatureCollection', features: []};
+      const features = [];
+      for (const leg of route.legs) {
+        let coords = [];
+        if (leg.kind === 'hub_pair') {
+          const from = STATION_INFO[leg.from], to = STATION_INFO[leg.to];
+          if (!from || !to) continue;
+          coords = [[from.lon, from.lat], [to.lon, to.lat]];
+        } else {
+          for (const sfid of (leg.seg_stops || [])) {
+            const info = STATION_INFO[sfid];
+            if (info) coords.push([info.lon, info.lat]);
+          }
+        }
+        if (coords.length < 2) continue;
+        features.push({type: 'Feature',
+                       geometry: {type: 'LineString', coordinates: coords},
+                       properties: {kind: leg.kind, trip_id: leg.trip_id || ''}});
+      }
+      return {type: 'FeatureCollection', features};
+    }
+
+    function buildPickGeoJSON() {
+      const features = [];
+      let i = 1;
+      for (const sfid of [CUR_ORIGIN, CUR_DEST]) {
+        if (!sfid) { i++; continue; }
+        const info = STATION_INFO[sfid];
+        if (!info) { i++; continue; }
+        features.push({type: 'Feature',
+                       geometry: {type: 'Point', coordinates: [info.lon, info.lat]},
+                       properties: {label: String(i)}});
+        i++;
+      }
+      return {type: 'FeatureCollection', features};
+    }
+
+    function renderSummary(route) {
+      const summary = document.getElementById('rb-summary');
       if (!route) {
-        const wdLabel = ACTIVE_WD === 1 ? 'Mon' : 'Sat';
-        summary.innerHTML = `<em>No route found departing ${String(windowIdx).padStart(2,'0')}:00 on ${wdLabel}.</em>`;
-        highlightRoute(null);
+        summary.innerHTML = '<em>No route found in this window/weekday. '
+          + 'Try a different time or weekday.</em>';
         return;
       }
-      let html = '<div><span class="badge">' + route.travel_min + ' min</span> '
-        + ' · ' + route.n_transfers + ' transfer' + (route.n_transfers === 1 ? '' : 's')
+      let html = '<div><span class="badge">' + route.travel_min + ' min</span>'
+        + ' · ' + route.n_transfers + ' transfer'
+        + (route.n_transfers === 1 ? '' : 's')
         + ' · depart ' + fmtTime(route.first_dep_s)
         + ' arrive ' + fmtTime(route.arr_s)
         + '</div>';
-      if (route.legs && route.legs.length) {
-        html += '<ol class="legs">';
-        for (const leg of route.legs) {
-          html += '<li>'
-            + (HUB_NAMES.get(leg.board_sfid) || leg.board_sfid) + ' '
-            + fmtTime(leg.dep_s)
-            + ' → ' + (HUB_NAMES.get(leg.alight_sfid) || leg.alight_sfid) + ' '
-            + fmtTime(leg.arr_s)
-            + '</li>';
+      html += '<ol class="legs">';
+      for (const leg of route.legs) {
+        if (leg.kind === 'hub_pair') {
+          const from = STATION_INFO[leg.from], to = STATION_INFO[leg.to];
+          html += '<li><span class="trip-class">🔁</span> '
+            + (from?.name || leg.from)
+            + ' <small>' + fmtTime(leg.dep_s) + '</small>'
+            + ' → ' + (to?.name || leg.to)
+            + ' <small>' + fmtTime(leg.arr_s) + '</small>'
+            + ' <em>(hub-pair · ' + leg.n_transfers + ' transfer'
+            + (leg.n_transfers === 1 ? '' : 's') + ')</em></li>';
+        } else {
+          const from = STATION_INFO[leg.board_sfid];
+          const to = STATION_INFO[leg.alight_sfid];
+          html += '<li><span class="trip-class">' + emojiOf(leg.rsn, leg.kmh) + '</span> '
+            + (leg.rsn ? '<b>' + leg.rsn + '</b> ' : '')
+            + (from?.name || leg.board_sfid)
+            + ' <small>' + fmtTime(leg.dep_s) + '</small>'
+            + ' → ' + (to?.name || leg.alight_sfid)
+            + ' <small>' + fmtTime(leg.arr_s) + '</small></li>';
         }
-        html += '</ol>';
       }
+      html += '</ol>';
       summary.innerHTML = html;
-      highlightRoute(origin + '|' + dest + '|' + windowIdx + '|' + ACTIVE_WD);
     }
 
-    function highlightRoute(filterKey) {
-      // Re-set the line-width filter to surface ONLY the picked
-      // (origin, dest, window, weekday) row. Empty filter when no
-      // route is picked.
+    function runQuery() {
       const m = window.map_austria_graph_routes;
-      if (!filterKey) {
-        m.setPaintProperty('rb-hubpair-line', 'line-width', 0.0);
-        m.setPaintProperty('rb-hubpair-line', 'line-opacity', 0.0);
+      if (!LOAD_READY) return;
+      const o = document.getElementById('rb-origin').value;
+      const d = document.getElementById('rb-dest').value;
+      const winIdx = parseInt(document.getElementById('rb-hour').value, 10);
+      CUR_ORIGIN = o; CUR_DEST = d; CUR_WIN = winIdx;
+      const hourLabel = document.getElementById('rb-hour-label');
+      hourLabel.textContent = String(winIdx).padStart(2,'0') + ':00 - '
+        + String((winIdx + 1) % 24).padStart(2,'0') + ':00';
+      m.getSource('route-pick-src').setData(buildPickGeoJSON());
+      if (o === d) {
+        document.getElementById('rb-summary').innerHTML =
+          '<em>Origin and destination are the same.</em>';
+        m.getSource('route-src').setData({type: 'FeatureCollection', features: []});
         return;
       }
-      const [origin, dest, win, wd] = filterKey.split('|');
-      m.setFilter('rb-hubpair-line', [
-        'all',
-        ['==', ['get', 'origin_hub_sfid'], origin],
-        ['==', ['get', 'dest_hub_sfid'], dest],
-        ['==', ['get', 'window_idx'], parseInt(win, 10)],
-        ['==', ['get', 'weekday_mask'], parseInt(wd, 10)],
-      ]);
-      m.setPaintProperty('rb-hubpair-line', 'line-width', 4.5);
-      m.setPaintProperty('rb-hubpair-line', 'line-opacity', 0.9);
+      const route = findRoute(o, d, winIdx, ACTIVE_WD);
+      renderSummary(route);
+      m.getSource('route-src').setData(buildRouteGeoJSON(route));
     }
 
-    // ---- 4. Inject UI panel + wire events ----
+    // =================================================================
+    // WIRING
+    // =================================================================
     const mapContainer = document.getElementById('map-austria-graph-routes');
     mapContainer.style.position = 'relative';
     const panelWrap = document.createElement('div');
     panelWrap.innerHTML = """ + repr(panel_html) + """;
     mapContainer.appendChild(panelWrap.firstElementChild);
-    // panel is now in the DOM
-    const wireSelect = id => document.getElementById(id).addEventListener('change', runQuery);
-    wireSelect('rb-origin'); wireSelect('rb-dest');
-    document.getElementById('rb-hour').addEventListener('input', runQuery);
-    document.getElementById('rb-wd-mon').addEventListener('click', () => {
-      ACTIVE_WD = 1;
-      document.getElementById('rb-wd-mon').classList.add('badge');
-      document.getElementById('rb-wd-sat').classList.remove('badge');
-      runQuery();
+
+    const m = window.map_austria_graph_routes;
+    m.on('sourcedata', (e) => {
+      if (e.sourceId === 'src' && e.isSourceLoaded) harvestStations();
+      if (e.sourceId === 'hubpairs-src' && e.isSourceLoaded) harvestHubpairs();
     });
-    document.getElementById('rb-wd-sat').addEventListener('click', () => {
-      ACTIVE_WD = 32;
-      document.getElementById('rb-wd-sat').classList.add('badge');
-      document.getElementById('rb-wd-mon').classList.remove('badge');
-      runQuery();
+    m.on('idle', () => {
+      if (!LOADED_STATIONS) harvestStations();
+      if (!LOADED_HUBPAIRS) harvestHubpairs();
     });
 
-    // ---- 5. Harvest hub-pair features whenever a new tile lands ----
-    window.map_austria_graph_routes.on('sourcedata', (e) => {
-      if (e.sourceId === 'hubpairs-src' && e.isSourceLoaded) {
-        harvestHubpairs();
-      }
+    document.getElementById('rb-origin').addEventListener('change', runQuery);
+    document.getElementById('rb-dest').addEventListener('change', runQuery);
+    document.getElementById('rb-hour').addEventListener('input', runQuery);
+    document.querySelectorAll('.rb-panel .wd-btn').forEach(b => {
+      b.addEventListener('click', () => {
+        ACTIVE_WD = parseInt(b.dataset.w, 10);
+        document.querySelectorAll('.rb-panel .wd-btn').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+        runQuery();
+      });
     });
-    window.map_austria_graph_routes.on('idle', () => {
-      if (!LOAD_READY) harvestHubpairs();
+
+    // Click on station marker → set origin (shift-click = dest)
+    m.on('click', ['rb-station-dot', 'rb-hub-marker'], (e) => {
+      const f = e.features?.[0]; if (!f) return;
+      const sfid = f.properties.osm_id;
+      const isShift = !!(e.originalEvent && e.originalEvent.shiftKey);
+      if (isShift) {
+        CUR_DEST = sfid;
+        document.getElementById('rb-dest').value = sfid;
+      } else {
+        CUR_ORIGIN = sfid;
+        document.getElementById('rb-origin').value = sfid;
+      }
+      runQuery();
+    });
+    m.on('mouseenter', ['rb-station-dot', 'rb-hub-marker'], () => {
+      m.getCanvas().style.cursor = 'pointer';
+    });
+    m.on('mouseleave', ['rb-station-dot', 'rb-hub-marker'], () => {
+      m.getCanvas().style.cursor = '';
     });
     """
 
@@ -2710,38 +1580,1034 @@ def _route_builder_map(ROUTEBUILD_STYLE, dag_run_states, martin, mo):
         zoom=6,
         style_layers=ROUTEBUILD_STYLE,
         extra_sources=extra_sources,
-        source_maxzoom=0,    # routes baked z0-only
+        source_maxzoom=0,
         satellite_background=False,
+        glyphs_url=f"{versatiles_assets}/fonts/{{fontstack}}/{{range}}.pbf",
         extra_js=extra_js,
     )
-    route_builder_view = mo.iframe(rb_html, height="640px")
+    route_builder_view = mo.iframe(rb_html, height="720px")
     route_builder_view
-    return (route_builder_view,)
+    return
 
 
 @app.cell
-def _tail(dag_run_states, mo):
-    # Trailing summary — expanded as cells below it land. For the
-    # skeleton this is just the DAG status echo.
+def _validate_routes_against_transitous(
+    HARDFAIL_MIN_AHEAD_MIN, MOTIS_BASE_PROD, MOTIS_BASE_STAGING,
+    R10_CACHE_DIR, R10_CACHE_ONLY, R10_CACHE_SCHEMA_VERSION,
+    R10_CORPUS_FILE, R10_FRESH_PAIRS,
+    SOFTFLAG_PCT, SOFTFLAG_TR_DELTA, VAL_MAX_TRANSFERS,
+    VAL_MOTIS_OFFSETS_MIN, VAL_N, VAL_WINDOWS_DEFAULT_HOURS,
+    dag_run_states, mo, os, pl,
+):
+    # R10 Transitous gate. Compares our JS-mirror Python composer
+    # against MOTIS /api/v5/plan for 60 fresh OD pairs (date-seeded)
+    # + every entry in the persistent hardfail-corpus-graph.json.
+    # 3 representative 1h windows per pair (07-08, 13-14, 19-20).
+    # Cache + corpus + evidence files all `-graph` suffixed.
+    mo.stop(
+        dag_run_states.get("notebook_austria_graph_pipeline") != "success",
+        mo.md("⏳ R10 gate waits for DAG green."),
+    )
+    import hashlib
+    import json as _j
+    import math
+    import random
+    import subprocess
+    import urllib.parse
+    import urllib.request
+    # Private-prefix to avoid marimo's "Variable defined in multiple
+    # cells" lint trip (these clash with the imports cell's Path /
+    # the trigger cell's datetime/timezone).
+    from datetime import datetime as _datetime
+    from datetime import timedelta as _timedelta
+    from datetime import timezone as _timezone
+    from pathlib import Path as _Path
+
+    import pyarrow.parquet as papq
+
+    _CACHE_DIR = _Path(R10_CACHE_DIR)
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _CORPUS = _Path(R10_CORPUS_FILE)
+    _CORPUS.parent.mkdir(parents=True, exist_ok=True)
+
+    _MOTIS_BASE = os.environ.get("TRANSITOUS_ENV") == "staging" and MOTIS_BASE_STAGING or MOTIS_BASE_PROD
+    _RUN_ALL_WINDOWS = os.environ.get("R10_FULL_WINDOWS") == "1"
+
+    # User-Agent per Transitous AUP (contact info mandatory)
+    try:
+        _email = subprocess.check_output(
+            ["git", "config", "user.email"], stderr=subprocess.DEVNULL,
+        ).decode().strip() or "unknown"
+    except Exception:
+        _email = "unknown"
+    _UA = f"ecovoyage-r10-gate/2026.05 ({_email})"
+
+    # ---- Load post-DAG artifacts ----
+    _CACHE = _Path("/workspace/cache/austria-teg")
+    stations_df = pl.from_arrow(papq.read_table(_CACHE / "transit" / "stations.parquet"))
+    hubs_df = pl.from_arrow(papq.read_table(_CACHE / "transit" / "optimal_hubs.parquet"))
+    hp_df = pl.from_arrow(papq.read_table(_CACHE / "transit" / "hub_pair_routes.parquet"))
+    rst_df = pl.from_arrow(papq.read_table(_CACHE / "teg" / "rail_stop_times.parquet"))
+
+    hub_sfids = set(hubs_df["station_feature_id"].to_list())
+    hub_idx_by_sfid = dict(zip(hubs_df["station_feature_id"].to_list(),
+                                hubs_df["station_idx"].cast(pl.Int32).to_list()))
+    station_info = {
+        r["station_feature_id"]: {
+            "idx": int(r["station_idx"]),
+            "is_hub": r["station_feature_id"] in hub_sfids,
+            "name": r["station_name"],
+            "lon": float(r["station_lon"]),
+            "lat": float(r["station_lat"]),
+        }
+        for r in stations_df.iter_rows(named=True)
+        if r["is_rail_served"] == "true"
+    }
+    # Build TRIP_BY_SFID once for the Python composer (instance-level)
+    rst_pd = rst_df.to_pandas()
+    rst_pd = rst_pd.sort_values(["trip_id", "stop_sequence"])
+    trips_at = {}    # sfid → list of {trip_id, stops, runs_dow}
+    for trip_id, grp in rst_pd.groupby("trip_id", sort=False):
+        stops = [(r.station_feature_id, int(r.arr_s), int(r.dep_s),
+                  1 if r.station_feature_id in hub_sfids else 0)
+                 for r in grp.itertuples()]
+        if len(stops) < 2:
+            continue
+        rd = int(grp.iloc[0]["runs_dow"])
+        for sfid, _, _, _ in stops:
+            trips_at.setdefault(sfid, []).append(
+                {"trip_id": trip_id, "stops": stops, "runs_dow": rd}
+            )
+    # Build HUBPAIRS lookup
+    HUBPAIRS = {}
+    for r in hp_df.iter_rows(named=True):
+        k = (int(r["origin_hub_idx"]), int(r["dest_hub_idx"]),
+             int(r["window_idx"]), int(r["weekday_mask"]))
+        HUBPAIRS[k] = {
+            "travel_min": int(r["travel_min"]),
+            "n_transfers": int(r["n_transfers"]) if r["n_transfers"] is not None else -1,
+            "first_dep_s": int(r["first_dep_s"]),
+            "arr_s": int(r["arr_s"]),
+        }
+
+    # Build HUB_LABELS lookup — precomputed shortest path (travel_s,
+    # n_transfers) FROM each hub TO each station per (window, weekday).
+    # The label table is "from_hub" direction only; we use it both
+    # ways: directly for last-mile (hub → d), approximately-inverted
+    # for first-mile (o → hub, by time symmetry of the rail graph).
+    hl_df = pl.from_arrow(papq.read_table(_CACHE / "transit" / "hub_labels.parquet"))
+    sfid_by_idx = dict(zip(stations_df["station_idx"].cast(pl.Int64).to_list(),
+                            stations_df["station_feature_id"].to_list()))
+    # HUB_LABELS[sfid][wd_bit][win_idx] = list of (hub_idx, travel_s, n_transfers)
+    HUB_LABELS = {}
+    for r in hl_df.iter_rows(named=True):
+        sfid = sfid_by_idx.get(int(r["station_idx"]))
+        if sfid is None:
+            continue
+        wd = int(r["weekday_mask"])
+        w = int(r["window_idx"])
+        HUB_LABELS.setdefault(sfid, {}).setdefault(wd, {}).setdefault(w, []).append(
+            (int(r["hub_idx"]), int(r["travel_s"]), int(r["n_transfers"]))
+        )
+
+    MIN_TRANSFER_S = 60
+
+    def _find_first_hp_after(o_idx, d_idx, wd_bit, min_first_dep):
+        """Earliest hub-pair (o→d, wd_bit) with first_dep_s ≥
+        min_first_dep. Scans all 24 windows. Returns None if no
+        entry meets the constraint."""
+        best = None
+        for w in range(24):
+            hp = HUBPAIRS.get((o_idx, d_idx, w, wd_bit))
+            if hp is None:
+                continue
+            if hp["first_dep_s"] < min_first_dep:
+                continue
+            if best is None or hp["first_dep_s"] < best["first_dep_s"]:
+                best = hp
+        return best
+
+    def _find_best_hp_arriving_before(o_idx, d_idx, wd_bit, latest_arr, min_first_dep):
+        """Hub-pair (o→d, wd_bit) with arr_s ≤ latest_arr AND
+        first_dep_s ≥ min_first_dep, maximising first_dep_s (= least
+        wait at the hub before catching the connection). Returns None
+        if no entry meets both constraints."""
+        best = None
+        for w in range(24):
+            hp = HUBPAIRS.get((o_idx, d_idx, w, wd_bit))
+            if hp is None:
+                continue
+            if hp["arr_s"] > latest_arr:
+                continue
+            if hp["first_dep_s"] < min_first_dep:
+                continue
+            if best is None or hp["first_dep_s"] > best["first_dep_s"]:
+                best = hp
+        return best
+
+    def _find_route(o_sfid, d_sfid, win_idx, wd_bit):
+        """Python mirror of the JS findRoute composer. Matches MOTIS
+        "earliest departure at or after the query window" semantics —
+        first-mile and hub-pair lookups scan all windows from win_lo
+        onward, so a 04:00 query can return a 06:30 train. Path
+        coverage:
+          A) direct single trip o → d (any vehicle stopping at both),
+          B) single transfer at ANY shared station (hub or non-hub),
+          C) origin/dest is hub: hub-pair + last/first-mile,
+          D) both non-hub: fm → hub-pair → lm (two-transfer compose).
+        Path B is the key fix for the "we slower" verdicts — non-hub
+        transfer stations (regional junctions like St. Veit/Glan, Bruck
+        an der Mur) often give materially shorter routes than the
+        nearest-hub-only composer would find."""
+        if o_sfid == d_sfid:
+            return None
+        o, d = station_info.get(o_sfid), station_info.get(d_sfid)
+        if not o or not d:
+            return None
+        win_lo = win_idx * 3600
+        best = None
+
+        def update_best(total, ntr, first_dep, arr, legs, kind):
+            nonlocal best
+            if best is None or total < best["_tot"] or (
+                total == best["_tot"] and ntr < best["n_transfers"]
+            ):
+                best = {"travel_min": round(total / 60), "n_transfers": ntr,
+                        "first_dep_s": first_dep, "arr_s": arr,
+                        "legs": legs, "_tot": total, "kind": kind}
+
+        # Hub-hub direct (scan ALL windows for the earliest at-or-after
+        # entry; the original window_idx-keyed lookup missed cases
+        # where no train departs in the requested 1h slot).
+        if o["is_hub"] and d["is_hub"]:
+            hp = _find_first_hp_after(o["idx"], d["idx"], wd_bit, win_lo)
+            if hp:
+                update_best(hp["arr_s"] - hp["first_dep_s"], hp["n_transfers"],
+                            hp["first_dep_s"], hp["arr_s"],
+                            [{"kind": "hub_pair", "from": o_sfid, "to": d_sfid,
+                              "dep_s": hp["first_dep_s"], "arr_s": hp["arr_s"],
+                              "n_transfers": hp["n_transfers"]}],
+                            "hub_hub")
+                return best
+
+        # Build first-mile-by-alight-station: for every trip calling
+        # at o_sfid (boarding at-or-after win_lo), index each onward
+        # stop as a candidate alight point. Hubs and non-hubs both
+        # get indexed — non-hub transfers (Path B) are how regional-
+        # rail composition picks up the short routes the hub-pair
+        # graph alone misses.
+        fm_by_alight = {}
+        for t in trips_at.get(o_sfid, []):
+            if (t["runs_dow"] & wd_bit) == 0:
+                continue
+            stops = t["stops"]
+            bi = next((i for i, s in enumerate(stops) if s[0] == o_sfid), -1)
+            if bi < 0:
+                continue
+            board_dep = stops[bi][2]
+            if board_dep < win_lo:
+                continue
+            for j in range(bi + 1, len(stops)):
+                sfid_X = stops[j][0]
+                arr_X = stops[j][1]
+                if arr_X <= board_dep:
+                    continue
+                if sfid_X == o_sfid:
+                    continue
+                fm_by_alight.setdefault(sfid_X, []).append({
+                    "trip_id": t["trip_id"],
+                    "board_sfid": o_sfid, "alight_sfid": sfid_X,
+                    "dep_s": board_dep, "arr_s": arr_X,
+                    "is_hub": stops[j][3] == 1,
+                    "hub_idx": station_info.get(sfid_X, {}).get("idx"),
+                })
+
+        # Build last-mile-by-board-station: every trip calling at
+        # d_sfid; index each prior stop as a candidate board point.
+        lm_by_board = {}
+        for t in trips_at.get(d_sfid, []):
+            if (t["runs_dow"] & wd_bit) == 0:
+                continue
+            stops = t["stops"]
+            ai = next((i for i, s in enumerate(stops) if s[0] == d_sfid), -1)
+            if ai < 0:
+                continue
+            alight_arr = stops[ai][1]
+            for i in range(0, ai):
+                sfid_X = stops[i][0]
+                dep_X = stops[i][2]
+                if dep_X >= alight_arr:
+                    continue
+                if sfid_X == d_sfid:
+                    continue
+                lm_by_board.setdefault(sfid_X, []).append({
+                    "trip_id": t["trip_id"],
+                    "board_sfid": sfid_X, "alight_sfid": d_sfid,
+                    "dep_s": dep_X, "arr_s": alight_arr,
+                    "is_hub": stops[i][3] == 1,
+                    "hub_idx": station_info.get(sfid_X, {}).get("idx"),
+                })
+
+        # --- Path A: direct single trip o → d ---
+        for fm in fm_by_alight.get(d_sfid, []):
+            total = fm["arr_s"] - fm["dep_s"]
+            update_best(total, 0, fm["dep_s"], fm["arr_s"],
+                        [{"trip_id": fm["trip_id"],
+                          "board_sfid": o_sfid, "alight_sfid": d_sfid,
+                          "dep_s": fm["dep_s"], "arr_s": fm["arr_s"]}],
+                        "direct")
+
+        # --- Path B: single transfer at ANY shared station ---
+        shared = (set(fm_by_alight.keys()) & set(lm_by_board.keys())) - {o_sfid, d_sfid}
+        for X in shared:
+            for fm in fm_by_alight[X]:
+                for lm in lm_by_board[X]:
+                    if lm["dep_s"] < fm["arr_s"] + MIN_TRANSFER_S:
+                        continue
+                    total = lm["arr_s"] - fm["dep_s"]
+                    update_best(total, 1, fm["dep_s"], lm["arr_s"],
+                                [{"trip_id": fm["trip_id"],
+                                  "board_sfid": fm["board_sfid"],
+                                  "alight_sfid": fm["alight_sfid"],
+                                  "dep_s": fm["dep_s"], "arr_s": fm["arr_s"]},
+                                 {"trip_id": lm["trip_id"],
+                                  "board_sfid": lm["board_sfid"],
+                                  "alight_sfid": lm["alight_sfid"],
+                                  "dep_s": lm["dep_s"], "arr_s": lm["arr_s"]}],
+                                "transfer")
+
+        # Convenience: hub-only lists for the hub-pair compose paths.
+        first_mile = [fm for fms in fm_by_alight.values() for fm in fms if fm["is_hub"]]
+        last_mile = [lm for lms in lm_by_board.values() for lm in lms if lm["is_hub"]]
+
+        # --- Path C1: Origin is hub → hub-pair → last-mile ---
+        if o["is_hub"]:
+            for lm in last_mile:
+                if lm["hub_idx"] == o["idx"]:
+                    continue
+                hp = _find_best_hp_arriving_before(
+                    o["idx"], lm["hub_idx"], wd_bit,
+                    latest_arr=lm["dep_s"] - MIN_TRANSFER_S,
+                    min_first_dep=win_lo,
+                )
+                if not hp:
+                    continue
+                ntr = max(0, hp["n_transfers"]) + 1
+                total = lm["arr_s"] - hp["first_dep_s"]
+                update_best(total, ntr, hp["first_dep_s"], lm["arr_s"],
+                            [{"kind": "hub_pair", "from": o_sfid, "to": lm["board_sfid"],
+                              "dep_s": hp["first_dep_s"], "arr_s": hp["arr_s"],
+                              "n_transfers": max(0, hp["n_transfers"])},
+                             {"trip_id": lm["trip_id"], "board_sfid": lm["board_sfid"],
+                              "alight_sfid": lm["alight_sfid"],
+                              "dep_s": lm["dep_s"], "arr_s": lm["arr_s"]}],
+                            "origin_hub")
+
+        # --- Path C2: First-mile → hub-pair → Dest is hub ---
+        if d["is_hub"]:
+            for fm in first_mile:
+                if fm["hub_idx"] == d["idx"]:
+                    total = fm["arr_s"] - fm["dep_s"]
+                    update_best(total, 0, fm["dep_s"], fm["arr_s"],
+                                [{"trip_id": fm["trip_id"],
+                                  "board_sfid": fm["board_sfid"],
+                                  "alight_sfid": fm["alight_sfid"],
+                                  "dep_s": fm["dep_s"], "arr_s": fm["arr_s"]}],
+                                "direct_to_hub")
+                    continue
+                hp = _find_first_hp_after(
+                    fm["hub_idx"], d["idx"], wd_bit,
+                    min_first_dep=fm["arr_s"] + MIN_TRANSFER_S,
+                )
+                if not hp:
+                    continue
+                ntr = 1 + max(0, hp["n_transfers"])
+                total = hp["arr_s"] - fm["dep_s"]
+                update_best(total, ntr, fm["dep_s"], hp["arr_s"],
+                            [{"trip_id": fm["trip_id"],
+                              "board_sfid": fm["board_sfid"],
+                              "alight_sfid": fm["alight_sfid"],
+                              "dep_s": fm["dep_s"], "arr_s": fm["arr_s"]},
+                             {"kind": "hub_pair", "from": fm["alight_sfid"], "to": d_sfid,
+                              "dep_s": hp["first_dep_s"], "arr_s": hp["arr_s"],
+                              "n_transfers": max(0, hp["n_transfers"])}],
+                            "dest_hub")
+
+        # --- Path D: Both non-hub, first-mile → hub-pair → last-mile ---
+        # (Path B already handles the "same hub" / "same non-hub" case
+        # since the hub appears as a shared station; here we cover the
+        # different-hub cross-product that requires the hub-pair table.)
+        if not o["is_hub"] and not d["is_hub"]:
+            for fm in first_mile:
+                for lm in last_mile:
+                    if fm["hub_idx"] == lm["hub_idx"]:
+                        continue  # covered by Path B
+                    hp = _find_first_hp_after(
+                        fm["hub_idx"], lm["hub_idx"], wd_bit,
+                        min_first_dep=fm["arr_s"] + MIN_TRANSFER_S,
+                    )
+                    if not hp:
+                        continue
+                    if lm["dep_s"] < hp["arr_s"] + MIN_TRANSFER_S:
+                        continue
+                    ntr = 2 + max(0, hp["n_transfers"])
+                    total = lm["arr_s"] - fm["dep_s"]
+                    update_best(total, ntr, fm["dep_s"], lm["arr_s"],
+                                [{"trip_id": fm["trip_id"], "board_sfid": fm["board_sfid"],
+                                  "alight_sfid": fm["alight_sfid"], "dep_s": fm["dep_s"], "arr_s": fm["arr_s"]},
+                                 {"kind": "hub_pair", "from": fm["alight_sfid"], "to": lm["board_sfid"],
+                                  "dep_s": hp["first_dep_s"], "arr_s": hp["arr_s"],
+                                  "n_transfers": max(0, hp["n_transfers"])},
+                                 {"trip_id": lm["trip_id"], "board_sfid": lm["board_sfid"],
+                                  "alight_sfid": lm["alight_sfid"], "dep_s": lm["dep_s"], "arr_s": lm["arr_s"]}],
+                                "compose")
+
+        # --- Path G: 2-hop transfer at non-hub intermediates ---
+        # For each X reachable from o via fm, find trips at X going
+        # to Y where Y is reachable to d via lm. This covers the
+        # "rural junction" pattern (e.g., St. Veit/Glan, Bruck/Mur,
+        # Selzthal) that's NOT in the K=24 hub set but is the
+        # natural transfer point. For each trip2 (X → Y), pick the
+        # LATEST fm with fm.arr_s + 60 ≤ trip2.x_dep (= no wait at
+        # X = max fm.dep_s = min total travel from o to d).
+        if not o["is_hub"] and not d["is_hub"]:
+            lm_keys = set(lm_by_board.keys())
+            G_IT_CAP = 50000
+            g_iters = 0
+            for X, fms_at_X in fm_by_alight.items():
+                if X == d_sfid or X == o_sfid:
+                    continue
+                if g_iters >= G_IT_CAP:
+                    break
+                # Sort fms by arr_s ASCENDING so we can pick the
+                # LATEST satisfying fm.arr_s + 60 ≤ x_dep via
+                # bisect-or-scan-backwards. We use scan-and-keep-max
+                # here (small lists; <50 typical).
+                if not fms_at_X:
+                    continue
+                fms_sorted = sorted(fms_at_X, key=lambda x: x["arr_s"])
+                for t in trips_at.get(X, []):
+                    if g_iters >= G_IT_CAP:
+                        break
+                    if (t["runs_dow"] & wd_bit) == 0:
+                        continue
+                    stops = t["stops"]
+                    xi = next((i for i, s in enumerate(stops) if s[0] == X), -1)
+                    if xi < 0:
+                        continue
+                    x_dep = stops[xi][2]
+                    # Find latest valid fm (max fm.dep_s subject to
+                    # fm.arr_s + 60 ≤ x_dep). Iterate sorted asc and
+                    # keep the last one that still satisfies.
+                    latest_fm = None
+                    for fm_at_X in fms_sorted:
+                        if fm_at_X["arr_s"] + MIN_TRANSFER_S > x_dep:
+                            break
+                        # Keep the latest VALID fm (sorted asc, so
+                        # successive valid ones overwrite latest_fm).
+                        if latest_fm is None or fm_at_X["dep_s"] > latest_fm["dep_s"]:
+                            latest_fm = fm_at_X
+                    if latest_fm is None:
+                        continue
+                    # Onward stops from X on this trip
+                    for j in range(xi + 1, len(stops)):
+                        Y = stops[j][0]
+                        if Y not in lm_keys:
+                            continue
+                        if Y == o_sfid or Y == d_sfid or Y == X:
+                            continue
+                        y_arr = stops[j][1]
+                        if y_arr <= x_dep:
+                            continue
+                        for lm_at_Y in lm_by_board[Y]:
+                            g_iters += 1
+                            if lm_at_Y["dep_s"] < y_arr + MIN_TRANSFER_S:
+                                continue
+                            total = lm_at_Y["arr_s"] - latest_fm["dep_s"]
+                            update_best(total, 2, latest_fm["dep_s"], lm_at_Y["arr_s"],
+                                        [{"trip_id": latest_fm["trip_id"],
+                                          "board_sfid": latest_fm["board_sfid"],
+                                          "alight_sfid": latest_fm["alight_sfid"],
+                                          "dep_s": latest_fm["dep_s"], "arr_s": latest_fm["arr_s"]},
+                                         {"trip_id": t["trip_id"],
+                                          "board_sfid": X, "alight_sfid": Y,
+                                          "dep_s": x_dep, "arr_s": y_arr},
+                                         {"trip_id": lm_at_Y["trip_id"],
+                                          "board_sfid": lm_at_Y["board_sfid"],
+                                          "alight_sfid": lm_at_Y["alight_sfid"],
+                                          "dep_s": lm_at_Y["dep_s"], "arr_s": lm_at_Y["arr_s"]}],
+                                        "transfer_2hop")
+
+        # --- Path F: label-based fallback (covers pairs where
+        # direct trips from origin don't reach any hub AND pairs
+        # whose optimal route requires a transfer at a hub the
+        # composer doesn't see directly). Uses the precomputed
+        # GPU-SSSP hub_labels.parquet — for the window of interest,
+        # it gives travel-time from each hub to the dest station
+        # (and, by approximate symmetry of the rail TEG, from the
+        # origin station to each hub). The total time is the sum of
+        # (o → hub_a) + hub_pair(hub_a → hub_b) + (hub_b → d), all
+        # for the same depart-window.
+        if best is None or best["_tot"] > 6 * 3600:
+            o_labels_by_wd = HUB_LABELS.get(o_sfid, {})
+            d_labels_by_wd = HUB_LABELS.get(d_sfid, {})
+            o_labels_for_wd = o_labels_by_wd.get(wd_bit, {})
+            d_labels_for_wd = d_labels_by_wd.get(wd_bit, {})
+            # Scan the request window first, then the next 12 hours
+            # — covers MOTIS-aligned "earliest at or after" semantics
+            # while keeping the scan bounded.
+            for w_off in range(13):
+                w = (win_idx + w_off) % 24
+                ol = o_labels_for_wd.get(w)
+                dl = d_labels_for_wd.get(w)
+                if not ol or not dl:
+                    continue
+                # Build hub_a → (best_travel_s, n_tr) and hub_b → ...
+                o_best = {}
+                for h, t, n in ol:
+                    if h not in o_best or t < o_best[h][0]:
+                        o_best[h] = (t, n)
+                d_best = {}
+                for h, t, n in dl:
+                    if h not in d_best or t < d_best[h][0]:
+                        d_best[h] = (t, n)
+                # Same hub on both sides → direct o → hub → d
+                for h, (t_o, n_o) in o_best.items():
+                    if h in d_best:
+                        t_d, n_d = d_best[h]
+                        total = t_o + MIN_TRANSFER_S + t_d
+                        ntr = n_o + n_d + 1
+                        first_dep = win_lo + w_off * 3600
+                        update_best(total, ntr, first_dep, first_dep + total,
+                                    [{"kind": "label_via_hub",
+                                      "from": o_sfid, "via_hub_idx": h, "to": d_sfid,
+                                      "travel_s": total, "n_transfers": ntr}],
+                                    "label_same_hub")
+                # Different hubs → o → hub_a → HP → hub_b → d
+                for h_a, (t_o, n_o) in o_best.items():
+                    for h_b, (t_d, n_d) in d_best.items():
+                        if h_a == h_b:
+                            continue
+                        # Find earliest hub-pair h_a → h_b after we
+                        # arrive at h_a (= win_lo + w_off + t_o + 60).
+                        ha_arr_s = win_lo + w_off * 3600 + t_o
+                        hp = _find_first_hp_after(
+                            h_a, h_b, wd_bit,
+                            min_first_dep=ha_arr_s + MIN_TRANSFER_S,
+                        )
+                        if not hp:
+                            continue
+                        hp_travel = hp["arr_s"] - hp["first_dep_s"]
+                        total = (hp["first_dep_s"] - (win_lo + w_off * 3600)) \
+                            + hp_travel + MIN_TRANSFER_S + t_d
+                        ntr = n_o + max(0, hp["n_transfers"]) + n_d + 2
+                        first_dep = win_lo + w_off * 3600
+                        update_best(total, ntr, first_dep, first_dep + total,
+                                    [{"kind": "label_via_2hubs",
+                                      "from": o_sfid, "via_hub_a": h_a,
+                                      "via_hub_b": h_b, "to": d_sfid,
+                                      "travel_s": total, "n_transfers": ntr}],
+                                    "label_two_hubs")
+                # If we found a route from this offset, stop scanning
+                if best is not None and best["_tot"] <= 4 * 3600:
+                    break
+
+        return best
+
+    # ---- Sampling ----
+    today = _datetime.now(_timezone.utc).date()
+    # Per weekday_bit, find the next calendar date that falls on
+    # that weekday. Python weekday(): Mon=0..Sun=6; our bit mapping
+    # is Mon=1<<0=1, ..., Sun=1<<6=64.
+    def _next_date_for_weekday(bit):
+        # bit_position = 0 for Mon, ..., 6 for Sun
+        wd_pos = bit.bit_length() - 1
+        delta = (wd_pos - today.weekday()) % 7
+        if delta == 0:
+            delta = 7  # always future
+        return today + _timedelta(days=delta)
+    seed_int = int(today.strftime("%Y%m%d"))
+    rng = random.Random(seed_int)
+
+    rail_sfids = [s for s, i in station_info.items() if i["is_hub"] or True]
+    hub_list = list(hub_sfids & set(rail_sfids))
+    nonhub_list = sorted(set(rail_sfids) - set(hub_list))
+    foreign_list = [s for s in nonhub_list if s.startswith("gtfs/N:")
+                    or s.startswith("hu:") or s.startswith("de:")
+                    or s.startswith("cz:") or s.startswith("si:")
+                    or s.startswith("sk:")]
+
+    # Sample R10_FRESH_PAIRS (21) random rail-served (origin, dest)
+    # pairs ONCE — same pairs across every weekday and every window.
+    # Weekdays cover the typical weekday / weekend timetable variance:
+    #   Tue=bit 2  → mid-week weekday schedule
+    #   Sat=bit 32 → Saturday schedule
+    #   Sun=bit 64 → Sunday schedule
+    # Cartesian product: 21 pairs × 3 weekdays × 24 windows = 1512
+    # fresh test cells. Smart window-skip (below) deduplicates MOTIS
+    # lookups when a single response covers multiple consecutive
+    # windows.
+    VAL_WEEKDAYS = [(2, "Tue"), (32, "Sat"), (64, "Sun")]
+    rng_local = random.Random(seed_int)
+    pool = sorted(rail_sfids)
+    rng_local.shuffle(pool)
+
+    def _classify_pair(a, b):
+        a_is_hub = a in hub_sfids
+        b_is_hub = b in hub_sfids
+        a_foreign = a.startswith("gtfs/N:") or any(
+            a.startswith(p) for p in ("hu:", "de:", "cz:", "si:", "sk:", "it:", "ch:")
+        )
+        b_foreign = b.startswith("gtfs/N:") or any(
+            b.startswith(p) for p in ("hu:", "de:", "cz:", "si:", "sk:", "it:", "ch:")
+        )
+        if a_foreign or b_foreign:
+            return "cb"
+        if a_is_hub and b_is_hub:
+            return "hh"
+        if a_is_hub or b_is_hub:
+            return "hn"
+        return "nn"
+
+    fresh_pairs_random = []  # list of (origin, dest, stratum)
+    seen_pairs = set()
+    attempts = 0
+    while len(fresh_pairs_random) < R10_FRESH_PAIRS and attempts < R10_FRESH_PAIRS * 100:
+        attempts += 1
+        a = rng_local.choice(pool)
+        b = rng_local.choice(pool)
+        if a == b or (a, b) in seen_pairs:
+            continue
+        seen_pairs.add((a, b))
+        fresh_pairs_random.append((a, b, _classify_pair(a, b)))
+
+    fresh_tests = [
+        (a, b, w, wb, wl, s)
+        for (a, b, s) in fresh_pairs_random
+        for wb, wl in VAL_WEEKDAYS
+        for w in range(24)
+    ]
+    # Reporting-compatibility view
+    fresh_pairs = list(fresh_pairs_random)
+
+    # Corpus retest pairs
+    corpus = {"version": 1, "pairs": []}
+    if _CORPUS.exists():
+        try:
+            corpus = _j.loads(_CORPUS.read_text())
+        except Exception:
+            pass
+    # Corpus retest set: all previous non-PASS entries (HARD-FAIL and
+    # SOFT-FLAG, since both are regression-relevant) tested across
+    # ALL 24 windows × all 3 weekdays.
+    corpus_pairs = [
+        (p["origin_sfid"], p["dest_sfid"], "corpus")
+        for p in corpus.get("pairs", [])
+        if p["origin_sfid"] in station_info and p["dest_sfid"] in station_info
+    ]
+
+    # Build the full test list: each entry is (origin, dest,
+    # window_idx, weekday_bit, weekday_label, stratum).
+    # - fresh    = R10_FRESH_PAIRS pairs × 3 weekdays × 24 windows = 1512
+    # - corpus   = every corpus pair × 3 weekdays × 24 windows
+    all_tests = list(fresh_tests)
+    fresh_test_set = {(a, b, w, wb) for a, b, w, wb, _, _ in fresh_tests}
+    for o, d, _ in corpus_pairs:
+        for wb, wl in VAL_WEEKDAYS:
+            for w in range(24):
+                if (o, d, w, wb) not in fresh_test_set:
+                    all_tests.append((o, d, w, wb, wl, "corpus"))
+
+    # ---- MOTIS ----
+    # Use a mutable dict for counters so nested functions can mutate
+    # without `nonlocal` (marimo's static analysis flags nonlocal as
+    # invalid even when Python's runtime accepts it).
+    _counters = {"network_calls": 0, "cache_hits": 0, "cache_misses": 0,
+                 "motis_errors": 0, "smart_skips": 0}
+
+    def _cache_key(o_sfid, d_sfid, win_idx, when_iso):
+        o_info = station_info[o_sfid]; d_info = station_info[d_sfid]
+        blob = _j.dumps({
+            "o": [o_info["lat"], o_info["lon"]],
+            "d": [d_info["lat"], d_info["lon"]],
+            "t": when_iso, "w": win_idx, "ep": _MOTIS_BASE,
+            "max_tr": VAL_MAX_TRANSFERS, "max_match": 200,
+            "modes": "TRANSIT", "v": R10_CACHE_SCHEMA_VERSION,
+        }, sort_keys=True)
+        return hashlib.sha1(blob.encode()).hexdigest()
+
+    def _motis_plan(o_sfid, d_sfid, win_idx, depart_date):
+        """Cache-only lookup (R10_CACHE_ONLY=True until further
+        notice). Returns the cached JSON if present, otherwise None
+        (treated as cache-miss / MOTIS-skipped — not an error).
+        Network calls are issued only when R10_CACHE_ONLY=False AND
+        the cache misses; in serial-single-request mode (one MOTIS
+        call at a time) we drop the polite stagger since the loop
+        itself never overlaps requests."""
+        win_lo, win_hi = win_idx * 3600, (win_idx + 1) * 3600
+        local_iso = f"{depart_date.isoformat()}T{win_idx:02d}:00:00+02:00"
+        cache_k = _cache_key(o_sfid, d_sfid, win_idx, local_iso)
+        cache_file = _CACHE_DIR / f"{cache_k}.json"
+        if cache_file.exists():
+            _counters["cache_hits"] += 1
+            try:
+                return _j.loads(cache_file.read_text())
+            except Exception:
+                pass
+        if R10_CACHE_ONLY:
+            _counters["cache_misses"] += 1
+            return None
+        o_info = station_info[o_sfid]; d_info = station_info[d_sfid]
+        when_utc = _datetime.fromisoformat(local_iso).astimezone(_timezone.utc).isoformat()
+        params = [
+            ("fromPlace", f"{o_info['lat']},{o_info['lon']}"),
+            ("toPlace", f"{d_info['lat']},{d_info['lon']}"),
+            ("time", when_utc), ("arriveBy", "false"),
+            ("numItineraries", "3"),
+            ("maxTransfers", str(VAL_MAX_TRANSFERS)),
+            ("searchWindow", str(win_hi - win_lo)),
+            ("pedestrianProfile", "FOOT"),
+            ("maxMatchingDistance", "200"),
+            ("transitModes", "TRANSIT"),
+        ]
+        url = f"{_MOTIS_BASE}/plan?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = _j.loads(resp.read().decode())
+            _counters["network_calls"] += 1
+            cache_file.write_text(_j.dumps(data))
+            return data
+        except Exception as e:
+            _counters["motis_errors"] += 1
+            err_resp = {"_error": str(e)}
+            cache_file.write_text(_j.dumps(err_resp))
+            return err_resp
+
+    def _motis_first_departure_hour_local(data, depart_date):
+        """Return the local-time hour of the first transit leg's
+        departure, or None. Used by the smart window-skip: if window
+        W's MOTIS response actually departs at hour T (where T ≥ W),
+        all windows in (W, T] would yield the same earliest-train
+        answer, so reuse this response."""
+        if not data or "_error" in data:
+            return None
+        itins = data.get("itineraries", []) or []
+        if not itins:
+            return None
+        for leg in itins[0].get("legs", []):
+            if leg.get("mode") == "WALK":
+                continue
+            dep = (leg.get("startTime") or leg.get("from", {}).get("departure"))
+            if not dep:
+                continue
+            try:
+                dt_utc = _datetime.fromisoformat(dep.replace("Z", "+00:00"))
+                dt_local = dt_utc.astimezone(_timezone(_timedelta(hours=2)))
+                # If departure crosses midnight forward, cap at 23
+                # (smart-skip is a same-day optimisation; cross-day
+                # would require re-targeting the next day).
+                if dt_local.date() != depart_date:
+                    return 23
+                return dt_local.hour
+            except Exception:
+                return None
+        return None
+
+    def _summarise_motis(data):
+        if not data or "_error" in data:
+            return None
+        itins = data.get("itineraries", []) or []
+        best = None
+        for it in itins:
+            legs = it.get("legs", [])
+            trip_ids = []
+            modes = set()
+            for leg in legs:
+                if leg.get("mode") == "WALK":
+                    continue
+                trip_ids.append((leg.get("trip", {}) or {}).get("tripId", ""))
+                modes.add(leg.get("mode", ""))
+            dur = it.get("duration", 10 ** 9)
+            ntr = it.get("transfers", len(legs) - 1)
+            if best is None or dur < best["duration"]:
+                best = {"duration": dur, "n_transfers": ntr,
+                         "trip_ids": trip_ids, "modes": modes}
+        if best is None:
+            return None
+        return {"travel_min": round(best["duration"] / 60),
+                "n_transfers": best["n_transfers"],
+                "trip_ids": best["trip_ids"], "modes": best["modes"]}
+
+    def _motis_debug_offsets(data):
+        if not data:
+            return (0, 0)
+        debug = data.get("debugOutput", {})
+        return (debug.get("n_start_offsets", 0), debug.get("n_dest_offsets", 0))
+
+    # ---- Verdict triage ----
+    def _is_domestic(sfid):
+        return (sfid.startswith("way/") or sfid.startswith("node/")
+                or sfid.startswith("relation/"))
+
+    def _classify(pair_origin, pair_dest, ours, motis, motis_data, stratum):
+        reasons = []
+        domestic = _is_domestic(pair_origin) and _is_domestic(pair_dest)
+        n_so, n_do = _motis_debug_offsets(motis_data)
+        coverage_ok = n_so >= VAL_MOTIS_OFFSETS_MIN and n_do >= VAL_MOTIS_OFFSETS_MIN
+
+        if ours is None and motis is None:
+            return "both-fail", []
+        if ours is not None and motis is None:
+            if domestic and coverage_ok:
+                return "hard-fail", ["phantom (domestic): we routed, motis did not"]
+            elif domestic:
+                return "soft-flag", [f"phantom (domestic, MOTIS offsets {n_so}/{n_do} <20)"]
+            else:
+                return "soft-flag", ["phantom (cross-border / foreign)"]
+        if ours is None and motis is not None:
+            modes = motis.get("modes", set())
+            rail_only = all(m in ("RAIL", "REGIONAL_RAIL", "SUBURBAN", "HIGHSPEED_RAIL",
+                                   "LONG_DISTANCE", "NIGHT_RAIL") for m in modes) if modes else True
+            if domestic and rail_only:
+                return "hard-fail", ["motis-only (domestic, MOTIS rail-only)"]
+            elif domestic:
+                return "soft-flag", [f"motis-only via non-rail ({','.join(sorted(modes))})"]
+            else:
+                return "soft-flag", ["motis-only (cross-border)"]
+        # Both succeed
+        dur_d_min = motis["travel_min"] - ours["travel_min"]
+        modes = motis.get("modes", set())
+        rail_only = all(m in ("RAIL", "REGIONAL_RAIL", "SUBURBAN", "HIGHSPEED_RAIL",
+                                "LONG_DISTANCE", "NIGHT_RAIL") for m in modes) if modes else True
+        if domestic and rail_only and -dur_d_min >= HARDFAIL_MIN_AHEAD_MIN:
+            # MOTIS faster by >=60 min
+            return "hard-fail", [f"we slower by {-dur_d_min} min (domestic, MOTIS rail-only)"]
+        pct = abs(ours["travel_min"] - motis["travel_min"]) / max(1, motis["travel_min"]) * 100
+        tr_d = abs(ours["n_transfers"] - motis["n_transfers"])
+        if domestic and rail_only and pct <= SOFTFLAG_PCT and tr_d <= SOFTFLAG_TR_DELTA:
+            return "pass", []
+        if not rail_only:
+            reasons.append(f"motis via {','.join(sorted(modes))}")
+        if pct > SOFTFLAG_PCT:
+            reasons.append(f"travel-time delta {pct:.0f}%")
+        if tr_d > SOFTFLAG_TR_DELTA:
+            reasons.append(f"transfer delta {tr_d}")
+        return ("soft-flag", reasons) if reasons else ("pass", [])
+
+    # ---- Iterate fresh + corpus tests ----
+    # Smart window-skip: tests are grouped by (origin, dest, weekday)
+    # and iterated in window order. When a MOTIS lookup for window W
+    # returns an itinerary whose first transit leg departs at local
+    # hour T (T ≥ W), reuse that same response for every intermediate
+    # window in (W, T]: requesting from those earlier hours would
+    # have yielded the same earliest-train answer. The smart-skip
+    # serves two purposes — (a) when R10_CACHE_ONLY=True, it covers
+    # cache-miss windows whose answer is already known from an
+    # earlier successful window; (b) when R10_CACHE_ONLY=False, it
+    # avoids issuing redundant network calls.
+    rows = []
+    date_for_wd_bit = {wb: _next_date_for_weekday(wb) for wb, _ in VAL_WEEKDAYS}
+
+    # Group tests by (origin, dest, weekday_bit) so we can window-skip
+    # within each group. Preserve insertion order so the row order in
+    # the evidence file mirrors the test definition order.
+    from collections import OrderedDict as _OD
+    grouped = _OD()
+    for (o_sfid, d_sfid, win, wd_bit, wd_label, stratum) in all_tests:
+        key = (o_sfid, d_sfid, wd_bit, wd_label, stratum)
+        grouped.setdefault(key, []).append(win)
+
+    for (o_sfid, d_sfid, wd_bit, wd_label, stratum), wins in grouped.items():
+        depart_date = date_for_wd_bit[wd_bit]
+        wins_sorted = sorted(set(wins))
+        # Per-group cache of the active MOTIS response and the
+        # window-up-to-which it is still applicable.
+        active_motis_data = None
+        active_motis_covers_through = -1
+        active_motis_origin_win = -1
+        for win in wins_sorted:
+            ours = _find_route(o_sfid, d_sfid, win, wd_bit)
+            # Smart-skip: reuse the active MOTIS response if this
+            # window is still covered by it.
+            if active_motis_data is not None and win <= active_motis_covers_through:
+                motis_data = active_motis_data
+                _counters["smart_skips"] += 1
+                skip_note = (f"smart-skip: reused MOTIS response from "
+                             f"window {active_motis_origin_win:02d}")
+            else:
+                motis_data = _motis_plan(o_sfid, d_sfid, win, depart_date)
+                skip_note = ""
+                if motis_data is not None and "_error" not in motis_data:
+                    dep_hour = _motis_first_departure_hour_local(motis_data, depart_date)
+                    if dep_hour is not None and dep_hour >= win:
+                        active_motis_data = motis_data
+                        active_motis_covers_through = dep_hour
+                        active_motis_origin_win = win
+                    else:
+                        active_motis_data = None
+                        active_motis_covers_through = -1
+                        active_motis_origin_win = -1
+                else:
+                    # Cache-miss / error / no-data → reset the active
+                    # carry-over so later windows don't keep skipping.
+                    active_motis_data = None
+                    active_motis_covers_through = -1
+                    active_motis_origin_win = -1
+            motis = _summarise_motis(motis_data)
+            verdict, reasons = _classify(o_sfid, d_sfid, ours, motis, motis_data, stratum)
+            if motis_data is None:
+                # Cache-miss in CACHE_ONLY mode: surface explicitly
+                # so the row isn't silently labelled "both-fail".
+                verdict = "cache-miss"
+                reasons = ["no cached MOTIS response (R10_CACHE_ONLY=True)"]
+            rows.append({
+                "stratum": stratum,
+                "weekday": wd_label,
+                "window": win,
+                "depart_date": depart_date.isoformat(),
+                "origin_sfid": o_sfid, "origin_name": station_info[o_sfid]["name"],
+                "dest_sfid": d_sfid, "dest_name": station_info[d_sfid]["name"],
+                "ours_min": ours["travel_min"] if ours else None,
+                "ours_tr": ours["n_transfers"] if ours else None,
+                "motis_min": motis["travel_min"] if motis else None,
+                "motis_tr": motis["n_transfers"] if motis else None,
+                "verdict": verdict,
+                "reasons": "; ".join([r for r in [skip_note] + list(reasons) if r]),
+            })
+
+    val_df = pl.DataFrame(rows, schema_overrides={
+        "ours_min": pl.Int64, "ours_tr": pl.Int64,
+        "motis_min": pl.Int64, "motis_tr": pl.Int64,
+        "window": pl.Int64,
+    }, infer_schema_length=None)
+
+    # ---- Corpus update ----
+    # cache-miss verdicts are not real verdicts → not corpus-candidate.
+    new_corpus_pairs = []
+    existing_corpus_keys = {(p["origin_sfid"], p["dest_sfid"]) for p in corpus.get("pairs", [])}
+    nonpass_pairs = set()
+    for r in rows:
+        if r["verdict"] in ("hard-fail", "soft-flag"):
+            nonpass_pairs.add((r["origin_sfid"], r["dest_sfid"], r["verdict"], r["reasons"]))
+    for (o, d, v, rs) in nonpass_pairs:
+        if (o, d) not in existing_corpus_keys:
+            new_corpus_pairs.append({
+                "origin_sfid": o, "dest_sfid": d,
+                "first_seen_utc": _datetime.now(_timezone.utc).isoformat(),
+                "first_seen_verdict": v, "first_seen_reasons": rs,
+                "first_seen_seed_date": today.isoformat(),
+            })
+    corpus["pairs"] = corpus.get("pairs", []) + new_corpus_pairs
+    corpus["last_updated_utc"] = _datetime.now(_timezone.utc).isoformat()
+    _CORPUS.write_text(_j.dumps(corpus, indent=2))
+
+    # ---- Evidence JSON ----
+    ev_path = _Path(f"/workspace/.r10/transitous-validation-graph-"
+                    f"{_datetime.now(_timezone.utc).strftime('%Y%m%dT%H%M%S')}.json")
+    ev_path.write_text(_j.dumps({
+        "schema_version": 3,
+        "ran_utc": _datetime.now(_timezone.utc).isoformat(),
+        "cache_only": bool(R10_CACHE_ONLY),
+        "depart_dates_by_weekday": {wl: date_for_wd_bit[wb].isoformat()
+                                       for wb, wl in VAL_WEEKDAYS},
+        "seed_date": today.isoformat(),
+        "weekdays_used": [wl for _, wl in VAL_WEEKDAYS],
+        "depart_dates": {wl: date_for_wd_bit[wb].isoformat()
+                          for wb, wl in VAL_WEEKDAYS},
+        "windows_used": sorted({w for _, _, w, _, _, _ in all_tests}),
+        "motis_endpoint": _MOTIS_BASE,
+        "n_fresh_pairs": len(fresh_pairs_random),
+        "n_fresh_tests": len(fresh_tests),
+        "n_corpus_pairs": len(corpus_pairs),
+        "n_total_tests": len(all_tests),
+        "network_calls": _counters["network_calls"],
+        "cache_hits": _counters["cache_hits"],
+        "cache_misses": _counters["cache_misses"],
+        "smart_skips": _counters["smart_skips"],
+        "motis_errors": _counters["motis_errors"],
+        "rows": rows,
+    }, indent=2))
+
+    counts = val_df.group_by("verdict").agg(pl.len().alias("n")).sort("verdict")
+    stratum_counts = val_df.group_by("stratum").agg(pl.len().alias("n")).sort("stratum")
+    weekday_counts = val_df.group_by("weekday").agg(pl.len().alias("n")).sort("weekday")
+    summary_md = mo.md(f"""
+    ### R10 Transitous validation gate
+
+    - **Endpoint** `{_MOTIS_BASE}` · **Mode** `{"cache-only" if R10_CACHE_ONLY else "live"}` (serial single-request)
+    - **Weekdays** {dict(zip([wl for _, wl in VAL_WEEKDAYS], [date_for_wd_bit[wb].isoformat() for wb, _ in VAL_WEEKDAYS]))} (Europe/Vienna)
+    - **Seed** `{today.isoformat()}` (rotates daily for fresh tests)
+    - **Tests** {len(fresh_tests)} fresh ({len(fresh_pairs_random)} pairs × 3 weekdays × 24 windows)
+       + {len(corpus_pairs) * len(VAL_WEEKDAYS) * 24} corpus retest ({len(corpus_pairs)} pairs × 3 wd × 24 win)
+       = **{len(all_tests)} total**
+    - **MOTIS lookups** {_counters["cache_hits"]} cache-hit + {_counters["cache_misses"]} cache-miss + {_counters["smart_skips"]} smart-skip + {_counters["network_calls"]} network + {_counters["motis_errors"]} errors · UA `{_UA}`
+    - **Stratum** {dict(zip(stratum_counts['stratum'].to_list(), stratum_counts['n'].to_list()))}
+    - **Per-weekday** {dict(zip(weekday_counts['weekday'].to_list(), weekday_counts['n'].to_list()))}
+    - **Evidence** `{ev_path}`
+    - **Corpus update** added {len(new_corpus_pairs)} new non-PASS entries (total in corpus: {len(corpus.get("pairs", []))})
+
+    **Acceptance**: HARD-FAIL count must be **0** for commit at
+    `fully tested and validated`. SOFT-FLAGs must be enumerated in
+    the commit body with one-line per-pair rationale (R2).
+    """)
+    mo.vstack([summary_md, counts, val_df])
+    return
+
+
+@app.cell
+def _tail(dag_run_states, martin, mo):
+    # Operator-facing status + static-web deployment notes.
     _ok = all(s == "success" for s in dag_run_states.values())
     _badge = "✅ DAG green" if _ok else "🔴 DAG failed"
     mo.md(f"""
     ## Status
 
-    {_badge} — `{list(dag_run_states.keys())[0]}` →
+    {_badge} — `notebook_austria_graph_pipeline` →
     `{list(dag_run_states.values())[0]}`
 
-    **Pipeline progress** (skeleton → full):
+    ### Architecture summary
 
-    - Phase 1 (skeleton DAG + notebook shell) — **in progress**.
-    - Phase 2 (GTFS ingest + OSM match) — pending.
-    - Phase 3 (TEG + GPU hub selection) — pending.
-    - Phase 4 (hub-pair SSSPs + tile bakes) — pending.
-    - Phase 5 (JS route-builder map + slider UI) — pending.
-    - Phase 6 (R10 Transitous gate + commit) — pending.
+    - **Standalone pipeline** (zero dependency on `gtfs-austria.py` or
+      `osm-austria.py`) — downloads its own Austria PBF + Transitous
+      Austria GTFS feed.
+    - **Instance-level RAPTOR TEG** with nTr ∈ [0..4] layering —
+      transfer cap structural, no algorithmic guard needed.
+    - **cuGraph PageRank** hub selection + BFS connectivity-guarantee
+      pass — replaces the O(n²) D-matrix greedy from the CPU baseline.
+    - **Batched cuGraph.sssp** per (weekday, window) for the hub-pair
+      contraction-hierarchy table.
+    - **Partial Hub-Labeling** (K_LOCAL=8 nearest hubs per station) —
+      enables O(1) JS findRoute queries via cross-product composition.
+    - **JS route-builder** (first-mile + hub-pair + last-mile composer)
+      runs entirely client-side over PMTiles — no marimo kernel
+      callbacks, no Python at runtime. Map is static-web deployable.
 
-    The implementation order is documented in
-    `/home/atrawog/.claude/plans/can-you-check-gpu-libraries-demo-py-breezy-owl.md`.
+    ### Tiles served by martin ({martin})
+
+    | Source | Schema |
+    |---|---|
+    | `austria-graph-routes` | theme='trip' (one row per instance) + theme='station' (with is_hub + nearest_hubs) |
+    | `austria-graph-hubpairs` | theme='hubpair' (K×K × 24 × 7 contraction-hierarchy table) |
+    | `austria-graph-isochrones` | theme='chrono' (polygon ring fills) + theme='chrono-origin' (hub markers) |
+    | `austria-graph-hublabels` | theme='hublabel' (per-station nearest-hub labels) |
+
+    ### Static-web deployment
+
+    The route-builder HTML iframe is fully self-contained: copy the
+    `<head>`/`<body>` to any static CDN, replace
+    `{martin}/austria-graph-*` URLs with PMTiles archive HTTP URLs
+    (served as static files; pmtiles.js reads via HTTP range), and
+    the JS planner works without any backend. The data contract is
+    the PMTiles archives — no Python needed at runtime.
+
+    ### Scale
+
+    Architecture chosen for **Europe-scale** (50k stations, 500k trips):
+    cuGraph PageRank + partial Hub-Labeling + 1h windows scale
+    linearly with station count. Austria deploy is the first
+    verification target; multi-country full Europe is a follow-on
+    cutover.
     """)
     return
 

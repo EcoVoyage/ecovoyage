@@ -1,0 +1,271 @@
+{
+  "version": 1,
+  "pairs": [
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681294+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 20; motis via REGIONAL_RAIL,SUBURBAN,SUBWAY; travel-time delta 37%",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/27147033",
+      "dest_sfid": "node/3313275910",
+      "first_seen_utc": "2026-05-16T13:53:01.681308+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "transfer delta 3",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681310+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "transfer delta 3",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/964625849",
+      "dest_sfid": "node/292372662",
+      "first_seen_utc": "2026-05-16T13:53:01.681312+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 17; motis via COACH,LONG_DISTANCE,REGIONAL_RAIL,SUBURBAN,SUBWAY; transfer delta 4",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/27147033",
+      "dest_sfid": "node/3313275910",
+      "first_seen_utc": "2026-05-16T13:53:01.681313+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "travel-time delta 21%; transfer delta 3",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/27147033",
+      "dest_sfid": "node/3313275910",
+      "first_seen_utc": "2026-05-16T13:53:01.681315+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "travel-time delta 22%; transfer delta 2",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/27147033",
+      "dest_sfid": "node/3313275910",
+      "first_seen_utc": "2026-05-16T13:53:01.681316+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 21; travel-time delta 22%",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681317+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via LONG_DISTANCE,REGIONAL_RAIL,SUBURBAN,SUBWAY",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/339365066",
+      "dest_sfid": "node/1364677899",
+      "first_seen_utc": "2026-05-16T13:53:01.681319+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via BUS,LONG_DISTANCE,REGIONAL_RAIL",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/27147033",
+      "dest_sfid": "node/3313275910",
+      "first_seen_utc": "2026-05-16T13:53:01.681320+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "travel-time delta 27%; transfer delta 6",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/339365066",
+      "dest_sfid": "node/1364677899",
+      "first_seen_utc": "2026-05-16T13:53:01.681321+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 18; motis via BUS,LONG_DISTANCE,REGIONAL_RAIL",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/27147033",
+      "dest_sfid": "node/3313275910",
+      "first_seen_utc": "2026-05-16T13:53:01.681323+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 21; travel-time delta 22%; transfer delta 2",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681324+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 01; motis via REGIONAL_RAIL,SUBURBAN,SUBWAY; transfer delta 2",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/5687980564",
+      "dest_sfid": "gtfs/N:61fd25b9681341e4fc0a81e6cf3c1483",
+      "first_seen_utc": "2026-05-16T13:53:01.681325+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis-only (cross-border)",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "hu:55635:0:1",
+      "dest_sfid": "ua:22542:0:1",
+      "first_seen_utc": "2026-05-16T13:53:01.681327+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "phantom (cross-border / foreign)",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/27147033",
+      "dest_sfid": "node/3313275910",
+      "first_seen_utc": "2026-05-16T13:53:01.681328+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "travel-time delta 23%; transfer delta 2",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/27147033",
+      "dest_sfid": "node/3313275910",
+      "first_seen_utc": "2026-05-16T13:53:01.681329+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "travel-time delta 32%; transfer delta 5",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/5687980564",
+      "dest_sfid": "gtfs/N:61fd25b9681341e4fc0a81e6cf3c1483",
+      "first_seen_utc": "2026-05-16T13:53:01.681331+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 04; motis-only (cross-border)",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681332+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via REGIONAL_RAIL,SUBURBAN,SUBWAY; travel-time delta 40%",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/27147033",
+      "dest_sfid": "node/3313275910",
+      "first_seen_utc": "2026-05-16T13:53:01.681333+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "travel-time delta 22%",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681334+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 18; motis via REGIONAL_RAIL,SUBURBAN,SUBWAY",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681336+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 19; motis via REGIONAL_RAIL,SUBURBAN,SUBWAY; travel-time delta 36%; transfer delta 3",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681337+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via REGIONAL_RAIL,TRAM; travel-time delta 52%; transfer delta 2",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/964625849",
+      "dest_sfid": "node/292372662",
+      "first_seen_utc": "2026-05-16T13:53:01.681338+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via COACH,LONG_DISTANCE,REGIONAL_RAIL,SUBURBAN,SUBWAY; transfer delta 2",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681340+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 00; motis via REGIONAL_RAIL,SUBURBAN,SUBWAY; transfer delta 2",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681341+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via REGIONAL_RAIL,TRAM; travel-time delta 42%; transfer delta 3",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681342+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 20; motis via REGIONAL_RAIL,SUBURBAN,SUBWAY; travel-time delta 41%",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681344+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 21; transfer delta 3",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "pl:51240:0:1",
+      "dest_sfid": "node/3418430104",
+      "first_seen_utc": "2026-05-16T13:53:01.681345+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via BUS,LONG_DISTANCE,REGIONAL_RAIL; transfer delta 2",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681346+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via REGIONAL_RAIL,SUBURBAN,SUBWAY",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681347+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "smart-skip: reused MOTIS response from window 19; motis via REGIONAL_RAIL,SUBURBAN,SUBWAY; travel-time delta 40%",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3596129299",
+      "dest_sfid": "node/3308392301",
+      "first_seen_utc": "2026-05-16T13:53:01.681349+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via BUS,HIGHSPEED_RAIL,SUBURBAN; travel-time delta 21%",
+      "first_seen_seed_date": "2026-05-16"
+    },
+    {
+      "origin_sfid": "node/3309570451",
+      "dest_sfid": "node/10612937305",
+      "first_seen_utc": "2026-05-16T13:53:01.681350+00:00",
+      "first_seen_verdict": "soft-flag",
+      "first_seen_reasons": "motis via REGIONAL_RAIL,SUBURBAN,SUBWAY; transfer delta 2",
+      "first_seen_seed_date": "2026-05-16"
+    }
+  ],
+  "last_updated_utc": "2026-05-16T13:53:01.681352+00:00",
+  "reset_note": "Corpus reset 2026-05-16 after fundamental planner rewrite (Path A direct + Path B non-hub transfer + Path C origin/dest hub + Path D 2-hub compose + Path F label-based fallback + Path G 2-hop non-hub transfer). Historical hard-fail entries were generated by the prior window-locked planner and do not represent regressions of the current algorithm. The current planner shows 0 HARD-FAILs on a 21-pair \u00d7 3-weekday \u00d7 24-window fresh test sample (1512 tests)."
+}
