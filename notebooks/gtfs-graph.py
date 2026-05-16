@@ -591,19 +591,19 @@ def _styles():
         {"id": "route-leg-casing",
          "type": "line",
          "source": "route-src",
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {"line-color": "#ffffff",
                    "line-width": ["interpolate", ["linear"], ["zoom"],
                                   3, 4.0, 11, 9.0],
-                   "line-opacity": 0.85,
-                   "line-join": "round", "line-cap": "round"}},
+                   "line-opacity": 0.85}},
         {"id": "route-leg",
          "type": "line",
          "source": "route-src",
+         "layout": {"line-join": "round", "line-cap": "round"},
          "paint": {"line-color": "#1b5fa8",
                    "line-width": ["interpolate", ["linear"], ["zoom"],
                                   3, 2.0, 11, 5.0],
-                   "line-opacity": 0.95,
-                   "line-join": "round", "line-cap": "round"}},
+                   "line-opacity": 0.95}},
         # Pick pins
         {"id": "route-pick",
          "type": "circle",
@@ -754,7 +754,7 @@ def _isochrone_map(CHRONO_STYLE, dag_run_states, martin, mo, versatiles_assets):
     cont.style.position = 'relative';
     const wrap = document.createElement('div');
     wrap.innerHTML = """ + repr(iso_panel_html) + """;
-    cont.appendChild(wrap.firstElementChild);
+    while (wrap.firstChild) cont.appendChild(wrap.firstChild);
     window.map_austria_graph_isochrones.on('sourcedata', (e) => {
       if (e.sourceId === 'src' && e.isSourceLoaded) harvestIsoOrigins();
     });
@@ -905,7 +905,7 @@ def _fastest_connections_map(FASTLINK_STYLE, dag_run_states, martin, mo, versati
     fl_cont.style.position = 'relative';
     const fl_wrap = document.createElement('div');
     fl_wrap.innerHTML = """ + repr(fl_panel_html) + """;
-    fl_cont.appendChild(fl_wrap.firstElementChild);
+    while (fl_wrap.firstChild) fl_cont.appendChild(fl_wrap.firstChild);
     window.map_austria_graph_hubpairs.on('sourcedata', (e) => {
       if (e.sourceId === 'src' && e.isSourceLoaded) harvestHubs();
     });
@@ -1414,6 +1414,60 @@ def _route_builder_map(ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_
         }
       }
 
+      // --- 4e. Path G: 2-hop transfer at non-hub intermediates.
+      // o -> X -> Y -> d, where X and Y are different (possibly
+      // non-hub) stations. Mirrors the Python Path G — picks the
+      // LATEST fm with fm.arr_s + 60 <= trip2.x_dep (= no wait at
+      // X = max fm.dep_s = min total travel).
+      if (!o.is_hub && !d.is_hub) {
+        const lm_keys = new Set(Object.keys(lmByBoard));
+        const G_IT_CAP = 50000;
+        let g_iters = 0;
+        for (const X in fmByAlight) {
+          if (X === d_sfid || X === o_sfid) continue;
+          if (g_iters >= G_IT_CAP) break;
+          const fms_at_X = fmByAlight[X];
+          if (!fms_at_X || !fms_at_X.length) continue;
+          const fms_sorted = [...fms_at_X].sort((a, b) => a.leg.arr_s - b.leg.arr_s);
+          const trips_at_X = TRIP_BY_SFID[X] || [];
+          for (const t of trips_at_X) {
+            if (g_iters >= G_IT_CAP) break;
+            if ((t.runs_dow & wd_bit) === 0) continue;
+            const stops = t.stops;
+            const xi = stops.findIndex(s => s[0] === X);
+            if (xi < 0) continue;
+            const x_dep = stops[xi][2];
+            let latest_fm = null;
+            for (const fm_at_X of fms_sorted) {
+              if (fm_at_X.leg.arr_s + MIN_TRANSFER_S > x_dep) break;
+              if (latest_fm === null || fm_at_X.leg.dep_s > latest_fm.leg.dep_s) {
+                latest_fm = fm_at_X;
+              }
+            }
+            if (latest_fm === null) continue;
+            for (let j = xi + 1; j < stops.length; j++) {
+              const Y = stops[j][0];
+              if (!lm_keys.has(Y)) continue;
+              if (Y === o_sfid || Y === d_sfid || Y === X) continue;
+              const y_arr = stops[j][1];
+              if (y_arr <= x_dep) continue;
+              for (const lm_at_Y of lmByBoard[Y]) {
+                g_iters++;
+                if (lm_at_Y.leg.dep_s < y_arr + MIN_TRANSFER_S) continue;
+                const total = lm_at_Y.leg.arr_s - latest_fm.leg.dep_s;
+                tryBest(total, 2, latest_fm.leg.dep_s, lm_at_Y.leg.arr_s, [
+                  latest_fm.leg,
+                  {trip_id: t.trip_id, board_sfid: X, alight_sfid: Y,
+                   dep_s: x_dep, arr_s: y_arr,
+                   seg_stops: stops.slice(xi, j + 1).map(s => s[0])},
+                  lm_at_Y.leg,
+                ], 'transfer_2hop');
+              }
+            }
+          }
+        }
+      }
+
       return best;
     }
 
@@ -1526,7 +1580,9 @@ def _route_builder_map(ROUTEBUILD_STYLE, dag_run_states, martin, mo, versatiles_
     mapContainer.style.position = 'relative';
     const panelWrap = document.createElement('div');
     panelWrap.innerHTML = """ + repr(panel_html) + """;
-    mapContainer.appendChild(panelWrap.firstElementChild);
+    // Append ALL children (the panel HTML contains both <style> and
+    // <div class="rb-panel">, not just one root element).
+    while (panelWrap.firstChild) mapContainer.appendChild(panelWrap.firstChild);
 
     const m = window.map_austria_graph_routes;
     m.on('sourcedata', (e) => {
